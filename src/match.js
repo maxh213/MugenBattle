@@ -86,41 +86,52 @@ export function parseMugenResult(stdout) {
 
 /**
  * Parse Ikemen GO log file output.
- * The log uses f_printTable format. Key fields:
- *   ["WinSide"] => 0      (0 = P1 wins, 1 = P2 wins, -1 = draw)
- *   ["Wins"] => table {
- *     [1] => 2             (P1 round wins)
- *     [2] => 1             (P2 round wins)
- *   }
- * Note: WinSide is zero-indexed unlike MUGEN's 1-indexed winningteam.
+ * v0.99.0+ emits an f_printTable dump with flat summary keys:
+ *   [p1wins] => 2     (P1 round wins)
+ *   [p2wins] => 1     (P2 round wins)
+ *   [draws]  => 0
+ *   [winTeam] => 0    (0 = P1, 1 = P2)
+ * Older releases used ["WinSide"] / ["Wins"] table form — still handled as fallback.
  */
 export function parseIkemenResult(logContents) {
   let fighter1Rounds = 0;
   let fighter2Rounds = 0;
 
-  // Try the Wins table first for round-level detail
-  const winsMatch = logContents.match(/\["Wins"\]\s*=>\s*table[^{]*\{([^}]+)\}/);
-  if (winsMatch) {
-    const winsBlock = winsMatch[1];
-    const p1Wins = winsBlock.match(/\[1\]\s*=>\s*(\d+)/);
-    const p2Wins = winsBlock.match(/\[2\]\s*=>\s*(\d+)/);
-    if (p1Wins) fighter1Rounds = parseInt(p1Wins[1], 10);
-    if (p2Wins) fighter2Rounds = parseInt(p2Wins[1], 10);
+  const p1wins = logContents.match(/\[p1wins\]\s*=>\s*(\d+)/);
+  const p2wins = logContents.match(/\[p2wins\]\s*=>\s*(\d+)/);
+  if (p1wins) fighter1Rounds = parseInt(p1wins[1], 10);
+  if (p2wins) fighter2Rounds = parseInt(p2wins[1], 10);
+
+  if (fighter1Rounds === 0 && fighter2Rounds === 0) {
+    const draws = logContents.match(/\[draws\]\s*=>\s*(\d+)/);
+    const winTeam = logContents.match(/\[winTeam\]\s*=>\s*(-?\d+)/);
+    if (winTeam && (!draws || parseInt(draws[1], 10) === 0)) {
+      const team = parseInt(winTeam[1], 10);
+      if (team === 0) fighter1Rounds = 1;
+      else if (team === 1) fighter2Rounds = 1;
+    }
   }
 
-  // If Wins table wasn't found or was all zeros, fall back to WinSide
+  if (fighter1Rounds === 0 && fighter2Rounds === 0) {
+    const winsMatch = logContents.match(/\["Wins"\]\s*=>\s*table[^{]*\{([^}]+)\}/);
+    if (winsMatch) {
+      const winsBlock = winsMatch[1];
+      const p1 = winsBlock.match(/\[1\]\s*=>\s*(\d+)/);
+      const p2 = winsBlock.match(/\[2\]\s*=>\s*(\d+)/);
+      if (p1) fighter1Rounds = parseInt(p1[1], 10);
+      if (p2) fighter2Rounds = parseInt(p2[1], 10);
+    }
+  }
+
   if (fighter1Rounds === 0 && fighter2Rounds === 0) {
     const winSideMatch = logContents.match(/\["WinSide"\]\s*=>\s*(-?\d+)/);
     if (winSideMatch) {
       const side = parseInt(winSideMatch[1], 10);
-      // WinSide: 0 = P1, 1 = P2, -1 = draw
       if (side === 0) fighter1Rounds = 1;
       else if (side === 1) fighter2Rounds = 1;
-      // side === -1 means draw, both stay 0
     }
   }
 
-  // Last resort: check for classic MUGEN-style "winningteam" lines
   if (fighter1Rounds === 0 && fighter2Rounds === 0) {
     return parseMugenResult(logContents);
   }
