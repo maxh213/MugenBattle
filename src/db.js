@@ -48,6 +48,18 @@ function migrate(db) {
       fought_at TEXT DEFAULT (datetime('now'))
     );
   `);
+
+  addColumnIfMissing(db, 'fighter', 'author', 'TEXT');
+  addColumnIfMissing(db, 'fighter', 'source_url', 'TEXT');
+  addColumnIfMissing(db, 'stage', 'author', 'TEXT');
+  addColumnIfMissing(db, 'stage', 'source_url', 'TEXT');
+}
+
+function addColumnIfMissing(db, table, column, type) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
 }
 
 export function closeDb() {

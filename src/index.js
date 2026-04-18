@@ -11,6 +11,7 @@ import {
   getStats,
   getHistory,
   runSingleMatch,
+  backfillAuthors,
 } from './tournament.js';
 import { closeDb } from './db.js';
 
@@ -50,12 +51,15 @@ fighters
       console.log('No fighters yet. Add some with: mugenbattle fighters add <name>');
       return;
     }
-    console.log(`\n${'Name'.padEnd(25)} ${'W'.padStart(5)} ${'L'.padStart(5)} ${'D'.padStart(5)} Active`);
-    console.log('-'.repeat(55));
+    console.log(
+      `\n${'Name'.padEnd(25)} ${'Author'.padEnd(22)} ${'W'.padStart(4)} ${'L'.padStart(4)} ${'D'.padStart(4)} Active`
+    );
+    console.log('-'.repeat(75));
     for (const f of rows) {
       const active = f.active ? 'yes' : 'no';
+      const author = (f.author || '').slice(0, 22);
       console.log(
-        `${f.file_name.padEnd(25)} ${String(f.matches_won).padStart(5)} ${String(f.matches_lost).padStart(5)} ${String(f.matches_drawn).padStart(5)} ${active}`
+        `${f.file_name.padEnd(25)} ${author.padEnd(22)} ${String(f.matches_won).padStart(4)} ${String(f.matches_lost).padStart(4)} ${String(f.matches_drawn).padStart(4)} ${active}`
       );
     }
   });
@@ -64,9 +68,11 @@ fighters
   .command('add <name>')
   .description('Add a fighter (use the MUGEN character folder name)')
   .option('-d, --display <name>', 'display name')
+  .option('-a, --author <name>', 'author/creator name (defaults to .def [Info] author)')
+  .option('-s, --source <url>', 'source URL where the character was obtained')
   .action((name, opts) => {
     try {
-      addFighter(name, opts.display);
+      addFighter(name, { displayName: opts.display, author: opts.author, sourceUrl: opts.source });
       console.log(`Added fighter: ${name}`);
     } catch (err) {
       if (err.message.includes('UNIQUE')) {
@@ -75,6 +81,14 @@ fighters
         throw err;
       }
     }
+  });
+
+fighters
+  .command('backfill-authors')
+  .description('Read author + displayname from each character\'s .def file and populate the DB')
+  .action(() => {
+    const count = backfillAuthors();
+    console.log(`Backfilled ${count} row(s) from .def metadata.`);
   });
 
 fighters
@@ -101,11 +115,12 @@ stages
       console.log('No stages yet. Add some with: mugenbattle stages add <name>');
       return;
     }
-    console.log(`\n${'Name'.padEnd(30)} ${'Used'.padStart(6)} Active`);
-    console.log('-'.repeat(50));
+    console.log(`\n${'Name'.padEnd(25)} ${'Author'.padEnd(22)} ${'Used'.padStart(5)} Active`);
+    console.log('-'.repeat(65));
     for (const s of rows) {
       const active = s.active ? 'yes' : 'no';
-      console.log(`${s.file_name.padEnd(30)} ${String(s.times_used).padStart(6)} ${active}`);
+      const author = (s.author || '').slice(0, 22);
+      console.log(`${s.file_name.padEnd(25)} ${author.padEnd(22)} ${String(s.times_used).padStart(5)} ${active}`);
     }
   });
 
@@ -113,9 +128,11 @@ stages
   .command('add <name>')
   .description('Add a stage (use the MUGEN stage folder name)')
   .option('-d, --display <name>', 'display name')
+  .option('-a, --author <name>', 'author/creator name (defaults to .def [Info] author)')
+  .option('-s, --source <url>', 'source URL where the stage was obtained')
   .action((name, opts) => {
     try {
-      addStage(name, opts.display);
+      addStage(name, { displayName: opts.display, author: opts.author, sourceUrl: opts.source });
       console.log(`Added stage: ${name}`);
     } catch (err) {
       if (err.message.includes('UNIQUE')) {

@@ -1,20 +1,96 @@
+import { readFileSync, readdirSync, statSync } from 'fs';
+import { resolve, dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { getDb } from './db.js';
 import { runMatch } from './match.js';
 
-export function addFighter(fileName, displayName) {
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CHARS_DIR = resolve(__dirname, '..', 'engine', 'chars');
+const STAGES_DIR = resolve(__dirname, '..', 'engine', 'stages');
+
+export function addFighter(fileName, { displayName, author, sourceUrl } = {}) {
   const db = getDb();
-  db.prepare('INSERT INTO fighter (file_name, display_name) VALUES (?, ?)').run(
+  const meta = readCharDefMetadata(fileName);
+  db.prepare(
+    'INSERT INTO fighter (file_name, display_name, author, source_url) VALUES (?, ?, ?, ?)'
+  ).run(
     fileName,
-    displayName || fileName
+    displayName || meta.displayName || fileName,
+    author ?? meta.author ?? null,
+    sourceUrl ?? null
   );
 }
 
-export function addStage(fileName, displayName) {
+export function addStage(fileName, { displayName, author, sourceUrl } = {}) {
   const db = getDb();
-  db.prepare('INSERT INTO stage (file_name, display_name) VALUES (?, ?)').run(
+  const meta = readStageDefMetadata(fileName);
+  db.prepare(
+    'INSERT INTO stage (file_name, display_name, author, source_url) VALUES (?, ?, ?, ?)'
+  ).run(
     fileName,
-    displayName || fileName
+    displayName || meta.displayName || fileName,
+    author ?? meta.author ?? null,
+    sourceUrl ?? null
   );
+}
+
+function parseInfoSection(text) {
+  const out = {};
+  const keys = ['name', 'displayname', 'author'];
+  for (const key of keys) {
+    const re = new RegExp(`^\\s*${key}\\s*=\\s*"?([^";\\r\\n]*)"?`, 'im');
+    const m = text.match(re);
+    if (m) out[key] = m[1].trim();
+  }
+  return { displayName: out.displayname || out.name, author: out.author };
+}
+
+function readCharDefMetadata(fileName) {
+  try {
+    const defPath = join(CHARS_DIR, fileName, `${fileName}.def`);
+    const text = readFileSync(defPath, 'utf-8');
+    return parseInfoSection(text);
+  } catch {
+    return {};
+  }
+}
+
+function readStageDefMetadata(fileName) {
+  try {
+    const defPath = join(STAGES_DIR, `${fileName}.def`);
+    const text = readFileSync(defPath, 'utf-8');
+    return parseInfoSection(text);
+  } catch {
+    return {};
+  }
+}
+
+export function backfillAuthors() {
+  const db = getDb();
+  const update = db.prepare(
+    'UPDATE fighter SET author = COALESCE(author, ?), display_name = COALESCE(display_name, ?) WHERE file_name = ?'
+  );
+  const rows = db.prepare('SELECT file_name FROM fighter').all();
+  let updated = 0;
+  for (const { file_name } of rows) {
+    const meta = readCharDefMetadata(file_name);
+    if (meta.author || meta.displayName) {
+      update.run(meta.author ?? null, meta.displayName ?? null, file_name);
+      updated++;
+    }
+  }
+  const stageUpdate = db.prepare(
+    'UPDATE stage SET author = COALESCE(author, ?), display_name = COALESCE(display_name, ?) WHERE file_name = ?'
+  );
+  const stages = db.prepare('SELECT file_name FROM stage').all();
+  for (const { file_name } of stages) {
+    const meta = readStageDefMetadata(file_name);
+    if (meta.author || meta.displayName) {
+      stageUpdate.run(meta.author ?? null, meta.displayName ?? null, file_name);
+      updated++;
+    }
+  }
+  return updated;
 }
 
 export function listFighters() {
