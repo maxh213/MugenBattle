@@ -36,6 +36,7 @@ import { getTeamForUser, getTeamById, setLineup } from './teams.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 import { StreamWorker } from './streamWorker.js';
 import { getLiveLeagueContext } from './leagues.js';
+import { marketListings, buyUnclaimedMaster } from './market.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -531,10 +532,180 @@ async function authLogout() {
 refreshAuth();
 </script>`;
 
+const MARKET_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Market · MugenBattle</title>
+<style>${COMMON_CSS}
+  .wallet { display: flex; align-items: center; gap: 14px; padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 16px; }
+  .wallet .label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .wallet .balance { font-size: 22px; font-weight: 600; color: #3fb950; font-variant-numeric: tabular-nums; }
+  .wallet .hint { color: #6e7681; font-size: 12px; margin-left: auto; }
+  .market-controls { display: flex; gap: 10px; margin-bottom: 12px; align-items: center; }
+  .market-controls input { flex: 1; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+  .market-controls .count { color: #8b949e; font-size: 12px; }
+  .market-controls select { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+  .market-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .market-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; display: flex; gap: 10px; }
+  .market-card .port { width: 56px; height: 56px; background: #0d1117; border-radius: 6px; image-rendering: pixelated; object-fit: contain; border: 1px solid #30363d; }
+  .market-card .body { flex: 1; min-width: 0; }
+  .market-card .name { font-size: 14px; font-weight: 600; color: #c9d1d9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .market-card .author { color: #8b949e; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .market-card .record { color: #8b949e; font-size: 11px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .market-card .foot { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 8px; }
+  .market-card .price { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; color: #f0ae3c; }
+  .market-card .price.free { color: #3fb950; }
+  .market-card button { background: #238636; color: white; border: 1px solid #2ea043; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+  .market-card button:hover { background: #2ea043; }
+  .market-card button:disabled { background: #21262d; border-color: #30363d; color: #6e7681; cursor: not-allowed; }
+  .market-card.bought { opacity: 0.5; pointer-events: none; }
+  .market-msg { font-size: 11px; margin-top: 4px; }
+  .market-msg.ok { color: #3fb950; }
+  .market-msg.err { color: #f85149; }
+  .empty-state { text-align: center; padding: 40px 20px; color: #8b949e; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
+</style></head>
+<body style="position:relative">
+${AUTH_BAR_HTML}
+<h1>🛒 Market</h1>
+<nav>
+  <a href="/">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/team">My Team</a>
+  <a href="/market" class="active">Market</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+
+<div class="wallet" id="wallet-authed" style="display:none">
+  <span class="label">Balance</span>
+  <span class="balance" id="wallet-balance">—</span>
+  <span class="hint">Prize money: 50¢ per fixture win · 25¢ per draw</span>
+</div>
+<div class="empty-state" id="signed-out" style="display:none">
+  <h2>Sign in to buy fighters</h2>
+  <p>Use the "Sign in" button in the top right. You can still browse the market below.</p>
+</div>
+
+<div class="market-controls">
+  <input type="search" id="q" placeholder="Search by name or author…">
+  <select id="sort">
+    <option value="price_asc">Price ↑</option>
+    <option value="price_desc">Price ↓</option>
+    <option value="wins_desc">Wins ↓</option>
+    <option value="name">Name</option>
+  </select>
+  <span class="count" id="count">—</span>
+</div>
+<div class="market-grid" id="grid"></div>
+
+${AUTH_MODAL_HTML}
+${AUTH_JS}
+<script>
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
+function cents(n){return n === 0 ? 'Free' : '$' + (n/100).toFixed(2)}
+let all = [];
+let me = null;
+
+window.onAuthStateChange = async (state) => {
+  me = state;
+  document.getElementById('signed-out').style.display = state.authenticated ? 'none' : '';
+  if (state.authenticated && !state.needs_username) {
+    await refreshWallet();
+    document.getElementById('wallet-authed').style.display = '';
+  } else {
+    document.getElementById('wallet-authed').style.display = 'none';
+  }
+  render();
+};
+
+async function refreshWallet() {
+  const r = await fetch('/api/me/wallet');
+  if (!r.ok) return;
+  const w = await r.json();
+  document.getElementById('wallet-balance').textContent = cents(w.balance_cents);
+}
+
+async function loadMarket() {
+  const r = await fetch('/api/market?limit=500');
+  all = await r.json();
+  render();
+}
+
+function render() {
+  const q = document.getElementById('q').value.trim().toLowerCase();
+  const sort = document.getElementById('sort').value;
+  let rows = all.slice();
+  if (q) {
+    rows = rows.filter(m => (m.display_name || '').toLowerCase().includes(q) ||
+                            (m.file_name || '').toLowerCase().includes(q) ||
+                            (m.author || '').toLowerCase().includes(q));
+  }
+  rows.sort((a, b) => {
+    if (sort === 'price_asc') return a.price_cents - b.price_cents || (a.display_name||'').localeCompare(b.display_name||'');
+    if (sort === 'price_desc') return b.price_cents - a.price_cents;
+    if (sort === 'wins_desc') return b.matches_won - a.matches_won;
+    return (a.display_name || a.file_name || '').localeCompare(b.display_name || b.file_name || '');
+  });
+  document.getElementById('count').textContent = rows.length + ' available';
+  document.getElementById('grid').innerHTML = rows.slice(0, 400).map(cardHtml).join('');
+}
+
+function cardHtml(m) {
+  const canBuy = !!(me && me.authenticated && !me.needs_username);
+  return '<div class="market-card" data-id="' + m.id + '">' +
+    '<img class="port" src="/portrait/' + encodeURIComponent(m.file_name) + '.png" onerror="this.style.visibility=\\'hidden\\'">' +
+    '<div class="body">' +
+      '<div class="name">' + esc(m.display_name || m.file_name) + '</div>' +
+      '<div class="author">' + esc(m.author || 'unknown') + '</div>' +
+      '<div class="record">' + m.matches_won + 'W · ' + m.matches_lost + 'L · ' + m.matches_drawn + 'D</div>' +
+      '<div class="foot">' +
+        '<span class="price ' + (m.price_cents === 0 ? 'free' : '') + '">' + cents(m.price_cents) + '</span>' +
+        (canBuy
+          ? '<button onclick="buy(' + m.id + ', this)">Buy</button>'
+          : '<button disabled>Sign in</button>') +
+      '</div>' +
+      '<div class="market-msg" id="msg-' + m.id + '"></div>' +
+    '</div></div>';
+}
+
+async function buy(masterId, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  const msg = document.getElementById('msg-' + masterId);
+  msg.className = 'market-msg';
+  const r = await fetch('/api/market/buy', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ master_fighter_id: masterId }),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    msg.className = 'market-msg ok';
+    msg.textContent = 'Added to bench · paid ' + cents(body.price_cents);
+    const card = btn.closest('.market-card');
+    card.classList.add('bought');
+    // drop from local list so re-sort doesn't show it again
+    all = all.filter(m => m.id !== masterId);
+    await refreshWallet();
+  } else {
+    msg.className = 'market-msg err';
+    const extra = body.need != null ? ' (need ' + cents(body.need) + ', have ' + cents(body.have) + ')' : '';
+    msg.textContent = 'Failed: ' + (body.error || 'unknown') + extra;
+    btn.disabled = false; btn.textContent = 'Buy';
+  }
+}
+
+document.getElementById('q').addEventListener('input', render);
+document.getElementById('sort').addEventListener('change', render);
+loadMarket();
+</script>
+</body></html>`;
+
 const TEAM_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><title>My Team · MugenBattle</title>
 <style>${COMMON_CSS}
+  .wallet-row { display: flex; gap: 18px; align-items: center; padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 14px; }
+  .wallet-row .label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .wallet-row .balance { font-size: 20px; font-weight: 600; color: #3fb950; font-variant-numeric: tabular-nums; }
+  .wallet-row .market-link { margin-left: auto; background: transparent; color: #58a6ff; border: 1px solid #58a6ff; padding: 6px 14px; border-radius: 6px; font-size: 13px; text-decoration: none; }
+  .wallet-row .market-link:hover { background: #58a6ff; color: #0d1117; }
   .team-header { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; padding: 14px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
   .team-header label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
   .team-header input { flex: 1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 16px; font-weight: 600; }
@@ -578,6 +749,7 @@ ${AUTH_BAR_HTML}
   <a href="/">Live</a>
   <a href="/leagues">Leagues</a>
   <a href="/team" class="active">My Team</a>
+  <a href="/market">Market</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -587,6 +759,11 @@ ${AUTH_BAR_HTML}
 </div>
 
 <div id="team-root" style="display:none">
+  <div class="wallet-row">
+    <span class="label">Wallet</span>
+    <span class="balance" id="wallet-balance">—</span>
+    <a class="market-link" href="/market">Browse market →</a>
+  </div>
   <div class="team-header">
     <label>Team</label>
     <input type="text" id="team-name" maxlength="40">
@@ -632,6 +809,8 @@ window.onAuthStateChange = (me) => {
   }
 };
 
+function fmtCents(n){return n === 0 ? '$0.00' : '$' + (n/100).toFixed(2)}
+
 async function loadTeam() {
   const r = await fetch('/api/me/team');
   if (!r.ok) {
@@ -648,6 +827,9 @@ async function loadTeam() {
   currentTeam = team;
   renderTeam();
   document.getElementById('team-root').style.display = '';
+
+  const w = await fetch('/api/me/wallet').then(r => r.ok ? r.json() : null);
+  if (w) document.getElementById('wallet-balance').textContent = fmtCents(w.balance_cents);
 }
 
 function renderFighter(f) {
@@ -821,6 +1003,7 @@ ${AUTH_BAR_HTML}
   <a href="/">Live (tournament)</a>
   <a href="/leagues" class="active">Leagues</a>
   <a href="/team">My Team</a>
+  <a href="/market">Market</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div id="workers"></div>
@@ -977,6 +1160,7 @@ ${AUTH_BAR_HTML}
   <a href="/" class="active">Live</a>
   <a href="/leagues">Leagues</a>
   <a href="/team">My Team</a>
+  <a href="/market">Market</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div class="grid">
@@ -1359,6 +1543,11 @@ const server = createServer((req, res) => {
     res.end(TEAM_HTML);
     return;
   }
+  if (req.url === '/market' || req.url === '/market/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(MARKET_HTML);
+    return;
+  }
   if (req.url === '/leaderboard' || req.url === '/leaderboard/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(LEADERBOARD_HTML);
@@ -1441,6 +1630,43 @@ const server = createServer((req, res) => {
     const team = getTeamForUser(db, u.id);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(team || { error: 'No team yet' }));
+    return;
+  }
+  if (req.url === '/api/me/wallet') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const row = db.prepare('SELECT balance_cents FROM user_account WHERE id = ?').get(u.id);
+    const recent = db.prepare(
+      'SELECT delta_cents, reason, ref_id, created_at FROM wallet_ledger WHERE user_id = ? ORDER BY id DESC LIMIT 15'
+    ).all(u.id);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ balance_cents: row?.balance_cents || 0, recent }));
+    return;
+  }
+  const marketMatch = req.url && req.url.match(/^\/api\/market(?:\?.*)?$/);
+  if (marketMatch && req.method === 'GET') {
+    const db = getDb();
+    const url = new URL(req.url, 'http://x');
+    const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10)));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(marketListings(db, { limit })));
+    return;
+  }
+  if (req.url === '/api/market/buy' && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    readJsonBody(req).then((data) => {
+      const masterId = Number(data.master_fighter_id);
+      if (!Number.isInteger(masterId) || masterId <= 0) {
+        res.writeHead(400); res.end('{"error":"master_fighter_id required"}'); return;
+      }
+      const result = buyUnclaimedMaster(db, u.id, masterId);
+      const status = result.ok ? 200 : (result.error === 'insufficient_balance' ? 402 : 400);
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    }).catch(() => { res.writeHead(400); res.end(); });
     return;
   }
   const teamMatch = req.url && req.url.match(/^\/api\/team\/(\d+)$/);

@@ -18,6 +18,10 @@
 
 import { selectLineup } from './teams.js';
 import { runOwnedFighterMatch } from './match.js';
+import { credit } from './wallet.js';
+
+const PRIZE_WIN_CENTS = 50;
+const PRIZE_DRAW_CENTS = 25;
 
 /**
  * Best-effort: look for `chars/stg_<uuid>_<master>/something.(cns|cmd|st|lua)`
@@ -248,6 +252,7 @@ export async function runFixture(db, fixtureId, ctx) {
         winner_team_id = ?, finished_at = datetime('now') WHERE id = ?
     `).run(homeScore, awayScore, winnerTeamId, fixture.id);
     updateStandings(db, fixture.division_id, fixture.home_team_id, fixture.away_team_id, homeScore, awayScore);
+    awardPrize(db, fixture.id, fixture.home_team_id, fixture.away_team_id, homeScore, awayScore);
     maybeCompleteLeague(db, fixture.division_id);
   });
   finalize();
@@ -284,6 +289,24 @@ function forfeitFixture(db, fixture, homeShort, awayShort) {
   tx();
 
   return { fixture, homeScore, awayScore, winnerTeamId, forfeit: true, slots: [] };
+}
+
+/**
+ * Prize money per fixture result. Credited to the team's owning user's
+ * wallet (bots included — they accumulate cash that simply never spends).
+ * Win = PRIZE_WIN_CENTS; draw = PRIZE_DRAW_CENTS each; loss = 0.
+ */
+function awardPrize(db, fixtureId, homeTeamId, awayTeamId, homeScore, awayScore) {
+  const homeUser = db.prepare('SELECT user_id FROM team WHERE id = ?').get(homeTeamId)?.user_id;
+  const awayUser = db.prepare('SELECT user_id FROM team WHERE id = ?').get(awayTeamId)?.user_id;
+  if (homeScore > awayScore) {
+    if (homeUser) credit(db, homeUser, PRIZE_WIN_CENTS, 'fixture_win', fixtureId);
+  } else if (awayScore > homeScore) {
+    if (awayUser) credit(db, awayUser, PRIZE_WIN_CENTS, 'fixture_win', fixtureId);
+  } else {
+    if (homeUser) credit(db, homeUser, PRIZE_DRAW_CENTS, 'fixture_draw', fixtureId);
+    if (awayUser) credit(db, awayUser, PRIZE_DRAW_CENTS, 'fixture_draw', fixtureId);
+  }
 }
 
 function updateStandings(db, divisionId, homeId, awayId, homeScore, awayScore) {
