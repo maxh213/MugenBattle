@@ -2095,15 +2095,12 @@ function overlayHtml(w) {
     const msg = ctx && ctx.league
       ? 'Between fixtures (' + esc(ctx.league.name) + ')'
       : w.status === 'idle' ? 'Waiting for a league…' : 'Starting up…';
-    return (
-      '<div class="hdr"><span class="wid">Worker #' + w.workerId + ' · ' + esc(w.display) + '</span></div>' +
-      '<div class="meta">' + esc(msg) + '</div>'
-    );
+    return '<div class="meta">' + esc(msg) + '</div>';
   }
   const f = ctx.fixture;
   const fighterLine = (f.home_fighter && f.away_fighter)
     ? '<div class="fighters">' + esc(f.home_fighter) + ' <span class="vs">vs</span> ' + esc(f.away_fighter) + '</div>'
-    : '<div class="fighters" style="color:#6e7681">picking fighters…</div>';
+    : '';
   return (
     '<div class="hdr">' +
       '<span class="lname">' + esc(ctx.league.name) + '</span>' +
@@ -2116,9 +2113,8 @@ function overlayHtml(w) {
     '</div>' +
     fighterLine +
     '<div class="meta">' +
-      '<span>R' + f.round + '.' + f.slot_num + '</span>' +
+      '<span>Round ' + f.round + '</span>' +
       (f.stage ? '<span>Stage: ' + esc(f.stage) + '</span>' : '') +
-      '<span class="wid">Worker #' + w.workerId + '</span>' +
     '</div>'
   );
 }

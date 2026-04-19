@@ -296,6 +296,15 @@ export async function runFixture(db, fixtureId, ctx) {
     "UPDATE fixture SET status = 'running', stage_id = ?, started_at = datetime('now') WHERE id = ?"
   ).run(stageRow.id, fixture.id);
 
+  // Pre-insert the fixture_match row so live-context queries can surface
+  // the picked fighters during the match. Finalise updates rounds + winner.
+  db.prepare(`
+    INSERT INTO fixture_match
+      (fixture_id, slot, home_owned_fighter_id, away_owned_fighter_id, stage_id,
+       home_rounds, away_rounds, winner)
+    VALUES (?, 1, ?, ?, ?, 0, 0, 'draw')
+  `).run(fixture.id, home.id, away.id, stageRow.id);
+
   let r;
   try {
     r = await runOwnedFighterMatch({
@@ -325,11 +334,9 @@ export async function runFixture(db, fixtureId, ctx) {
 
   const finalize = db.transaction(() => {
     db.prepare(`
-      INSERT INTO fixture_match
-        (fixture_id, slot, home_owned_fighter_id, away_owned_fighter_id, stage_id,
-         home_rounds, away_rounds, winner)
-      VALUES (?, 1, ?, ?, ?, ?, ?, ?)
-    `).run(fixture.id, home.id, away.id, stageRow.id, homeRounds, awayRounds, winner);
+      UPDATE fixture_match SET home_rounds = ?, away_rounds = ?, winner = ?
+      WHERE fixture_id = ? AND slot = 1
+    `).run(homeRounds, awayRounds, winner, fixture.id);
 
     db.prepare(`
       UPDATE fixture SET status = 'complete', home_score = ?, away_score = ?,
