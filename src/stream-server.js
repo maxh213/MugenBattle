@@ -36,7 +36,15 @@ import { getTeamForUser, getTeamById, setLineup } from './teams.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 import { StreamWorker } from './streamWorker.js';
 import { getLiveLeagueContext } from './leagues.js';
-import { marketListings, buyUnclaimedMaster } from './market.js';
+import {
+  marketListings,
+  buyUnclaimedMaster,
+  suggestedPriceForOwned,
+  listForSale,
+  unlistFromSale,
+  buyListedFighter,
+  userListings,
+} from './market.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -584,6 +592,11 @@ ${AUTH_BAR_HTML}
   <p>Use the "Sign in" button in the top right. You can still browse the market below.</p>
 </div>
 
+<h2 style="font-size:14px;margin:16px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Player listings <span id="listings-count" style="color:#6e7681">—</span></h2>
+<div class="market-grid" id="listings"></div>
+<div id="no-listings" class="empty-state" style="display:none;margin-bottom:16px">No active player listings right now.</div>
+
+<h2 style="font-size:14px;margin:20px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Unclaimed masters</h2>
 <div class="market-controls">
   <input type="search" id="q" placeholder="Search by name or author…">
   <select id="sort">
@@ -624,9 +637,70 @@ async function refreshWallet() {
 }
 
 async function loadMarket() {
-  const r = await fetch('/api/market?limit=500');
-  all = await r.json();
+  const [m, listings] = await Promise.all([
+    fetch('/api/market?limit=500').then(r => r.json()),
+    fetch('/api/market/listings?limit=200').then(r => r.json()),
+  ]);
+  all = m;
+  renderListings(listings);
   render();
+}
+
+function renderListings(listings) {
+  const host = document.getElementById('listings');
+  const none = document.getElementById('no-listings');
+  document.getElementById('listings-count').textContent = listings.length ? '(' + listings.length + ')' : '';
+  if (!listings.length) {
+    host.innerHTML = '';
+    none.style.display = '';
+    return;
+  }
+  none.style.display = 'none';
+  const canBuy = !!(me && me.authenticated && !me.needs_username);
+  host.innerHTML = listings.map(l => {
+    const isMe = canBuy && me.username === l.seller_username;
+    return '<div class="market-card" data-owned="' + l.owned_fighter_id + '">' +
+      '<img class="port" src="/portrait/' + encodeURIComponent(l.file_name) + '.png" onerror="this.style.visibility=\\'hidden\\'">' +
+      '<div class="body">' +
+        '<div class="name">' + esc(l.display_name) + '</div>' +
+        '<div class="author">as ' + esc(l.master_display_name || l.file_name) +
+          ' · from @' + esc(l.seller_username) + '</div>' +
+        '<div class="record">' + l.matches_won + 'W · ' + l.matches_lost + 'L · ' + l.matches_drawn + 'D</div>' +
+        '<div class="foot">' +
+          '<span class="price ' + (l.price_cents === 0 ? 'free' : '') + '">' + cents(l.price_cents) + '</span>' +
+          (isMe
+            ? '<button disabled>Your listing</button>'
+            : canBuy
+              ? '<button onclick="buyListing(' + l.owned_fighter_id + ', this)">Buy</button>'
+              : '<button disabled>Sign in</button>') +
+        '</div>' +
+        '<div class="market-msg" id="lmsg-' + l.owned_fighter_id + '"></div>' +
+      '</div></div>';
+  }).join('');
+}
+
+async function buyListing(ownedId, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  const msg = document.getElementById('lmsg-' + ownedId);
+  msg.className = 'market-msg';
+  const r = await fetch('/api/market/buy-listing', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ owned_fighter_id: ownedId }),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    msg.className = 'market-msg ok';
+    msg.textContent = 'Added to bench · paid ' + cents(body.price_cents);
+    btn.closest('.market-card').classList.add('bought');
+    await refreshWallet();
+    // reload listings so the sold one disappears
+    fetch('/api/market/listings?limit=200').then(r => r.json()).then(renderListings);
+  } else {
+    msg.className = 'market-msg err';
+    const extra = body.need != null ? ' (need ' + cents(body.need) + ', have ' + cents(body.have) + ')' : '';
+    msg.textContent = 'Failed: ' + (body.error || 'unknown') + extra;
+    btn.disabled = false; btn.textContent = 'Buy';
+  }
 }
 
 function render() {
@@ -835,11 +909,14 @@ async function loadTeam() {
 function renderFighter(f) {
   const master = f.master_display_name || f.master_file_name || '—';
   const stam = Number(f.stamina || 0).toFixed(2);
+  const right = f.slot === 'for_sale' && f.listing_price_cents != null
+    ? '<div class="fr-stam" style="color:#f0ae3c;font-weight:600">' + fmtCents(f.listing_price_cents) + '</div>'
+    : '<div class="fr-stam">stamina ' + stam + '</div>';
   return '<div class="fighter-row" onclick="openEditor(' + f.id + ')">' +
     '<div class="fr-name">' + esc(f.display_name) + '</div>' +
     '<div class="fr-master">' + esc(master) + '</div>' +
     '<div class="fr-stats">' + f.matches_won + 'W · ' + f.matches_lost + 'L · ' + f.matches_drawn + 'D</div>' +
-    '<div class="fr-stam">stamina ' + stam + '</div>' +
+    right +
     '<div class="fr-edit">edit →</div>' +
   '</div>';
 }
@@ -900,6 +977,7 @@ async function openEditor(fighterId) {
       '<button onclick="saveFighterName(' + f.id + ')">Rename</button>' +
       '<span class="msg" id="edit-name-msg"></span>' +
     '</div>' +
+    '<div id="edit-sell" class="row"></div>' +
     '<div class="ai-hdr">AI &middot; loading…</div>' +
     '<textarea id="edit-cmd" spellcheck="false" disabled>loading…</textarea>' +
     '<div class="row" style="margin-top:10px">' +
@@ -907,6 +985,7 @@ async function openEditor(fighterId) {
       '<span class="msg" id="edit-ai-msg"></span>' +
     '</div>';
   document.getElementById('edit-bg').classList.add('open');
+  await renderSellSection(f);
 
   const r = await fetch('/api/owned-fighter/' + fighterId + '/ai');
   if (!r.ok) {
@@ -946,6 +1025,71 @@ async function saveFighterName(id) {
     msg.className = 'msg err'; msg.textContent = body.error || 'error';
   }
   setTimeout(() => { msg.textContent = ''; }, 2200);
+}
+
+async function renderSellSection(f) {
+  const host = document.getElementById('edit-sell');
+  if (!host) return;
+  if (f.slot === 'active') {
+    host.innerHTML = '<label>Market</label><span style="color:#6e7681;font-size:12px">Bench this fighter first to list it for sale.</span>';
+    return;
+  }
+  if (f.slot === 'for_sale') {
+    const price = Number(f.listing_price_cents || 0);
+    host.innerHTML =
+      '<label>Market</label>' +
+      '<span style="font-size:13px">Listed at <b>' + fmtCents(price) + '</b></span>' +
+      '<button onclick="unlistFighter(' + f.id + ')">Unlist</button>' +
+      '<span class="msg" id="edit-sell-msg"></span>';
+    return;
+  }
+  // bench
+  host.innerHTML =
+    '<label>Market</label>' +
+    '<span style="color:#8b949e;font-size:12px">loading suggested price…</span>';
+  const r = await fetch('/api/owned-fighter/' + f.id + '/suggested-price');
+  const suggested = r.ok ? (await r.json()).price_cents : 0;
+  host.innerHTML =
+    '<label>Market</label>' +
+    '<input type="number" id="edit-price" min="0" step="1" value="' + suggested + '" style="max-width:120px">' +
+    '<span style="color:#8b949e;font-size:11px">¢ · suggested ' + fmtCents(suggested) + '</span>' +
+    '<button onclick="listFighter(' + f.id + ')">List for sale</button>' +
+    '<span class="msg" id="edit-sell-msg"></span>';
+}
+
+async function listFighter(id) {
+  const price = parseInt(document.getElementById('edit-price').value, 10);
+  const msg = document.getElementById('edit-sell-msg');
+  msg.className = 'msg'; msg.textContent = '…';
+  const r = await fetch('/api/owned-fighter/' + id + '/list-for-sale', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ price_cents: price }),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    msg.className = 'msg ok'; msg.textContent = 'listed at ' + fmtCents(body.price_cents);
+    const f = currentTeam.fighters.find(x => x.id === id);
+    if (f) { f.slot = 'for_sale'; f.listing_price_cents = body.price_cents; }
+    renderTeam();
+    renderSellSection(f);
+  } else {
+    msg.className = 'msg err'; msg.textContent = body.error || 'error';
+  }
+}
+
+async function unlistFighter(id) {
+  const msg = document.getElementById('edit-sell-msg');
+  msg.className = 'msg'; msg.textContent = '…';
+  const r = await fetch('/api/owned-fighter/' + id + '/unlist', { method: 'POST' });
+  const body = await r.json();
+  if (r.ok) {
+    const f = currentTeam.fighters.find(x => x.id === id);
+    if (f) { f.slot = 'bench'; f.listing_price_cents = null; }
+    renderTeam();
+    renderSellSection(f);
+  } else {
+    msg.className = 'msg err'; msg.textContent = body.error || 'error';
+  }
 }
 
 async function saveFighterAI(id) {
@@ -1667,6 +1811,68 @@ const server = createServer((req, res) => {
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result));
     }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const listingsMatch = req.url && req.url.match(/^\/api\/market\/listings(?:\?.*)?$/);
+  if (listingsMatch && req.method === 'GET') {
+    const db = getDb();
+    const url = new URL(req.url, 'http://x');
+    const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10)));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(userListings(db, { limit })));
+    return;
+  }
+  if (req.url === '/api/market/buy-listing' && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    readJsonBody(req).then((data) => {
+      const id = Number(data.owned_fighter_id);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.writeHead(400); res.end('{"error":"owned_fighter_id required"}'); return;
+      }
+      const result = buyListedFighter(db, u.id, id);
+      const status = result.ok ? 200 : (result.error === 'insufficient_balance' ? 402 : 400);
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const listMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/list-for-sale$/);
+  if (listMatch && req.method === 'POST') {
+    const id = Number(listMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    readJsonBody(req).then((data) => {
+      const price = Number(data.price_cents);
+      const result = listForSale(db, u.id, id, price);
+      const status = result.ok ? 200 : 400;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const unlistMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/unlist$/);
+  if (unlistMatch && req.method === 'POST') {
+    const id = Number(unlistMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const result = unlistFromSale(db, u.id, id);
+    const status = result.ok ? 200 : 400;
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+  const suggestMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/suggested-price$/);
+  if (suggestMatch && req.method === 'GET') {
+    const id = Number(suggestMatch[1]);
+    const db = getDb();
+    const price = suggestedPriceForOwned(db, id);
+    if (price == null) { res.writeHead(404); res.end('{"error":"not_found"}'); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ price_cents: price }));
     return;
   }
   const teamMatch = req.url && req.url.match(/^\/api\/team\/(\d+)$/);
