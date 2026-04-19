@@ -41,6 +41,13 @@ const CRASH_SUSPECT_THRESHOLD = 3;
  * Users can later release the KFM and buy a real replacement.
  */
 function deactivateMaster(db, masterId, reason) {
+  // Never deactivate the training dummy. KFM is the system's fallback char
+  // and the replacement used for every retired clone — losing it would
+  // break the whole mechanism.
+  const m = db.prepare('SELECT file_name, is_unique FROM fighter WHERE id = ?').get(masterId);
+  if (!m || m.file_name === 'kfm' || m.is_unique === 0) {
+    return;
+  }
   db.prepare(
     "UPDATE fighter SET active = 0, validated_at = datetime('now'), validation_reason = ? WHERE id = ?"
   ).run(reason, masterId);
@@ -113,9 +120,13 @@ function deactivateIfIdentifiable(db, errMsg) {
  */
 function chargeCrashSuspects(db, homeMasterId, awayMasterId) {
   const inc = db.prepare('UPDATE fighter SET crash_suspect_count = crash_suspect_count + 1 WHERE id = ?');
-  const get = db.prepare('SELECT id, file_name, crash_suspect_count, active FROM fighter WHERE id = ?');
+  const get = db.prepare('SELECT id, file_name, is_unique, crash_suspect_count, active FROM fighter WHERE id = ?');
   for (const mid of [homeMasterId, awayMasterId]) {
     if (!mid) continue;
+    const row0 = get.get(mid);
+    // KFM (non-unique training dummy) is the fallback and shows up in almost
+    // every unidentifiable crash just by being present — never charge it.
+    if (!row0 || row0.file_name === 'kfm' || row0.is_unique === 0) continue;
     inc.run(mid);
     const row = get.get(mid);
     if (row && row.active === 1 && row.crash_suspect_count >= CRASH_SUSPECT_THRESHOLD) {
