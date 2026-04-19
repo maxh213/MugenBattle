@@ -24,6 +24,14 @@ import { getDb } from './db.js';
 import { credit, assertLedgerIntegrity } from './wallet.js';
 import { runOwnedFighterMatch } from './match.js';
 import { readEffectiveStamina } from './stamina.js';
+import {
+  createSeason,
+  pickNextFixture,
+  runFixture,
+  getStandings,
+  listLeagues,
+} from './leagues.js';
+import { bootstrapTeamForUser } from './teams.js';
 import { closeDb } from './db.js';
 
 program
@@ -459,6 +467,161 @@ program
       console.log(`  post-stamina home=${readEffectiveStamina(db, home.id).toFixed(2)} away=${readEffectiveStamina(db, away.id).toFixed(2)}`);
     } catch (err) {
       console.error('Match failed:', err.message);
+    }
+  });
+
+// --- Users: admin user creation (skips email-code step) ---
+
+users
+  .command('create <username> <email>')
+  .description('Create a user + starter team (admin shortcut; skips email verification)')
+  .action((username, email) => {
+    const db = getDb();
+    if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) {
+      console.error('Username must be 3–20 chars, letters/numbers/underscore only.');
+      return;
+    }
+    const emailNorm = email.trim().toLowerCase();
+    try {
+      const tx = db.transaction(() => {
+        const existing = db.prepare('SELECT id FROM user_account WHERE email = ? OR lower(username) = lower(?)').get(emailNorm, username);
+        if (existing) throw new Error(`User already exists (email or username)`);
+        const r = db.prepare('INSERT INTO user_account (email, username) VALUES (?, ?)').run(emailNorm, username);
+        const userId = r.lastInsertRowid;
+        const teamId = bootstrapTeamForUser(db, userId, username + "'s Team");
+        return { userId, teamId };
+      });
+      const { userId, teamId } = tx();
+      console.log(`Created user ${username} (#${userId}) + team #${teamId}.`);
+    } catch (err) {
+      console.error('Failed:', err.message);
+    }
+  });
+
+// --- Leagues ---
+
+const league = program.command('league').description('Seasons, divisions, fixtures');
+
+league
+  .command('create')
+  .description('Create a season from all eligible teams (>=5 active fighters)')
+  .option('-n, --name <text>', 'season name')
+  .option('-d, --divisions <n>', 'number of divisions', (v) => parseInt(v, 10), 1)
+  .option('-l, --legs <n>', 'legs per round-robin (1 = single, 2 = home+away)', (v) => parseInt(v, 10), 1)
+  .action((opts) => {
+    const db = getDb();
+    const eligible = db.prepare(`
+      SELECT t.id, t.name
+      FROM team t
+      WHERE (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id AND slot = 'active') >= 5
+        AND t.current_league_id IS NULL
+      ORDER BY t.id
+    `).all();
+    if (eligible.length < 2) {
+      console.error(`Need at least 2 eligible teams, found ${eligible.length}.`);
+      return;
+    }
+
+    const divCount = Math.max(1, opts.divisions);
+    if (eligible.length < divCount * 2) {
+      console.error(`${eligible.length} eligible teams can't fill ${divCount} divisions (need >=2 per division).`);
+      return;
+    }
+    const perDiv = Math.floor(eligible.length / divCount);
+    const divisions = [];
+    for (let i = 0; i < divCount; i++) {
+      const start = i * perDiv;
+      const end = i === divCount - 1 ? eligible.length : start + perDiv;
+      divisions.push({
+        name: `Division ${i + 1}`,
+        teamIds: eligible.slice(start, end).map((t) => t.id),
+      });
+    }
+
+    const name = opts.name || `Season ${new Date().toISOString().slice(0, 10)}`;
+    try {
+      const leagueId = createSeason(db, { name, divisions, legs: opts.legs });
+      const fixtureCount = db.prepare(`
+        SELECT COUNT(*) AS n FROM fixture f
+        JOIN division d ON f.division_id = d.id WHERE d.league_id = ?
+      `).get(leagueId).n;
+      console.log(`Created league #${leagueId} "${name}": ${divCount} division(s), ${eligible.length} teams, ${fixtureCount} fixtures.`);
+      for (const d of divisions) {
+        console.log(`  ${d.name}: teams ${d.teamIds.join(', ')}`);
+      }
+    } catch (err) {
+      console.error('Failed:', err.message);
+    }
+  });
+
+league
+  .command('list')
+  .description('List all leagues')
+  .action(() => {
+    const db = getDb();
+    const rows = listLeagues(db);
+    if (rows.length === 0) { console.log('No leagues yet.'); return; }
+    console.log(`\n${'#'.padStart(4)} ${'Name'.padEnd(30)} ${'Status'.padEnd(10)} ${'Divs'.padStart(4)} ${'Done'.padStart(6)} ${'Total'.padStart(6)} Started`);
+    console.log('-'.repeat(85));
+    for (const l of rows) {
+      const progress = `${l.fixtures_done}/${l.fixture_count}`;
+      console.log(`${String(l.id).padStart(4)} ${(l.name || '').slice(0, 30).padEnd(30)} ${l.status.padEnd(10)} ${String(l.division_count).padStart(4)} ${String(l.fixtures_done).padStart(6)} ${String(l.fixture_count).padStart(6)} ${l.started_at || ''}`);
+    }
+  });
+
+league
+  .command('run-next')
+  .description('Run the next pending fixture from any running league')
+  .option('-l, --league <id>', 'restrict to a single league', (v) => parseInt(v, 10))
+  .option('-c, --count <n>', 'run up to N fixtures in a row', (v) => parseInt(v, 10), 1)
+  .action(async (opts) => {
+    const db = getDb();
+    for (let i = 0; i < opts.count; i++) {
+      const next = pickNextFixture(db, { leagueId: opts.league });
+      if (!next) {
+        console.log('No pending fixtures.');
+        break;
+      }
+      const home = db.prepare('SELECT name FROM team WHERE id = ?').get(next.home_team_id);
+      const away = db.prepare('SELECT name FROM team WHERE id = ?').get(next.away_team_id);
+      console.log(`\n[fixture #${next.id}] ${home.name} (home) vs ${away.name} — round ${next.round_num} slot ${next.slot_num}`);
+      try {
+        const r = await runFixture(db, next.id);
+        if (r.forfeit) {
+          console.log(`  FORFEIT: ${r.homeScore}-${r.awayScore}`);
+        } else {
+          console.log(`  stage: ${r.stage}`);
+          for (const s of r.slots) {
+            console.log(`    slot ${s.slot}: ${s.home.name.padEnd(20)} vs ${s.away.name.padEnd(20)} → ${s.winner} (${s.homeRounds}-${s.awayRounds})`);
+          }
+          console.log(`  FINAL: ${r.homeScore}-${r.awayScore}`);
+        }
+      } catch (err) {
+        console.error('  Fixture failed:', err.message);
+        break;
+      }
+    }
+  });
+
+league
+  .command('standings <id>')
+  .description('Show standings for a league')
+  .action((id) => {
+    const db = getDb();
+    const data = getStandings(db, parseInt(id, 10));
+    if (!data) { console.log('League not found.'); return; }
+    console.log(`\nLeague #${data.league.id} — ${data.league.name} (${data.league.status})`);
+    console.log(`Pending fixtures: ${data.pending}`);
+    for (const d of data.divisions) {
+      console.log(`\n  ${d.name} (tier ${d.tier})`);
+      console.log(`    ${'Pos'.padStart(3)} ${'Team'.padEnd(28)} ${'Pl'.padStart(3)} ${'W'.padStart(3)} ${'D'.padStart(3)} ${'L'.padStart(3)} ${'MW'.padStart(4)} ${'ML'.padStart(4)} ${'Pts'.padStart(4)}`);
+      console.log('    ' + '-'.repeat(72));
+      d.standings.forEach((s, i) => {
+        const label = `${s.team_name} (@${s.username})`;
+        console.log(
+          `    ${String(i + 1).padStart(3)} ${label.slice(0, 28).padEnd(28)} ${String(s.fixtures_played).padStart(3)} ${String(s.fixtures_won).padStart(3)} ${String(s.fixtures_drawn).padStart(3)} ${String(s.fixtures_lost).padStart(3)} ${String(s.matches_won).padStart(4)} ${String(s.matches_lost).padStart(4)} ${String(s.points).padStart(4)}`
+        );
+      });
     }
   });
 
