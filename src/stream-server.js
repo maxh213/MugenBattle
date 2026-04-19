@@ -2720,7 +2720,7 @@ function renderStream(workerId) {
 function renderStandings(rows, viewerTeamId) {
   const host = document.getElementById('standings');
   if (!rows.length) { host.innerHTML = '<div style="color:#6e7681">No standings yet.</div>'; return; }
-  const body = rows.slice(0, 12).map((s, i) => {
+  const body = rows.map((s, i) => {
     const mine = s.team_id === viewerTeamId ? ' class="mine"' : '';
     return '<tr' + mine + '><td class="pos' + (i === 0 ? ' p1' : '') + '">' + (i + 1) + '</td>' +
       '<td>' + esc(s.team_name) + '</td>' +
