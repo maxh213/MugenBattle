@@ -2,16 +2,21 @@
 /**
  * Live match streaming server.
  *
- * - Spawns a long-running Xvfb + ffmpeg capturing display :99 as MJPEG.
- * - Serves an HTML dashboard at http://localhost:8080.
- * - Streams video at /stream (multipart MJPEG, plays in any <img>).
- * - Reads current-match state from /tmp/mugenbattle-match-state.json (written by
- *   brackets.js / tournament.js when --stream is passed).
- * - Surfaces bracket + leaderboard state from the SQLite DB.
+ * - Spawns STREAM_WORKERS parallel stream workers. Each worker owns an
+ *   Xvfb (on display :100, :101, ...), an ffmpeg capturing it as MJPEG,
+ *   and an optional runLeagueWorker loop driving a league's fixtures.
+ * - /stream[/<id>]          MJPEG feed for that worker (bare /stream = #1).
+ * - /api/workers            JSON status list.
+ * - /                       Dashboard; existing auth/team/fighter/leaderboard routes
+ *                           are unchanged.
+ * - A supervisor assigns running leagues to idle workers on a 10s poll.
  *
- * Usage:
- *   node src/stream-server.js
- *   (in another shell) node src/index.js tournament start --size 8 --stream
+ * Env knobs:
+ *   STREAM_PORT         HTTP port (default 8080)
+ *   STREAM_WORKERS      parallel worker count (default 1)
+ *   STREAM_DISPLAY_BASE base for worker X displays (default 99 → :100+i)
+ *   STREAM_SIZE         capture resolution (default 640x480)
+ *   STREAM_FPS          capture framerate (default 15)
  */
 
 import { spawn } from 'child_process';
@@ -29,6 +34,7 @@ import {
 } from './auth.js';
 import { getTeamForUser, getTeamById, setLineup } from './teams.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
+import { StreamWorker } from './streamWorker.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -36,88 +42,74 @@ const CHARS_DIR = join(ROOT, 'engine', 'chars');
 const STATE_FILE = '/tmp/mugenbattle-match-state.json';
 
 const PORT = parseInt(process.env.STREAM_PORT || '8080', 10);
-const DISPLAY = process.env.STREAM_DISPLAY || ':99';
 // Default to Ikemen's native 640x480 so the captured image is 1:1 (no padding).
 // Can override with STREAM_SIZE env if you reconfigure engine/save/config.json.
 const SIZE = process.env.STREAM_SIZE || '640x480';
 const FPS = parseInt(process.env.STREAM_FPS || '15', 10);
+// How many parallel league streams to run. Each gets its own Xvfb, ffmpeg,
+// and Ikemen process so they don't stomp each other.
+const WORKER_COUNT = Math.max(1, parseInt(process.env.STREAM_WORKERS || '1', 10));
+const DISPLAY_BASE = parseInt(process.env.STREAM_DISPLAY_BASE || '99', 10);
+const SUPERVISOR_POLL_MS = 10_000;
 
-// ---------- Xvfb + ffmpeg lifecycle ----------
+// ---------- Worker pool ----------
 
-let xvfb, ffmpeg, audioFfmpeg;
-const frameBuffer = { data: null, ts: 0 };  // latest JPEG frame
-const clients = new Set();
+/** workerId → StreamWorker. workerId is 1-indexed for URL friendliness. */
+const workers = new Map();
 const audioClients = new Set();
 const PULSE_SOURCE = process.env.STREAM_AUDIO_SOURCE || 'mugenbattle.monitor';
+let audioFfmpeg;
 
-function startXvfb() {
-  xvfb = spawn('Xvfb', [DISPLAY, '-screen', '0', `${SIZE}x24`, '-nolisten', 'tcp'], {
-    stdio: 'ignore',
-  });
-  xvfb.on('exit', (code) => {
-    console.error(`[xvfb] exited with code ${code}`);
-    xvfb = null;
-  });
-  console.log(`[xvfb] started on ${DISPLAY} at ${SIZE}`);
-  // Park the default X cursor off-screen so the ✕ glyph doesn't show in the capture.
-  setTimeout(() => {
+async function bootWorkers() {
+  // Crash recovery: any fixture left in 'running' from a previous boot gets
+  // pushed back to 'pending' so a worker picks it up fresh. Losing mid-match
+  // progress is cheap here — 5 matches × ~10s per fixture.
+  const db = getDb();
+  const reset = db.prepare("UPDATE fixture SET status = 'pending', started_at = NULL WHERE status = 'running'").run();
+  if (reset.changes > 0) {
+    console.log(`[boot] reset ${reset.changes} stuck 'running' fixture(s) to 'pending'`);
+  }
+
+  for (let i = 1; i <= WORKER_COUNT; i++) {
+    const w = new StreamWorker({
+      workerId: i,
+      display: `:${DISPLAY_BASE + i}`,
+      size: SIZE,
+      fps: FPS,
+      logPath: `/tmp/mb-worker-${i}.log`,
+    });
+    workers.set(i, w);
     try {
-      spawn('xdotool', ['mousemove', '9999', '9999'], {
-        env: { ...process.env, DISPLAY },
-        stdio: 'ignore',
-      });
-    } catch {}
-  }, 1000);
+      await w.start();
+    } catch (err) {
+      console.error(`[boot] worker ${i} failed to start: ${err.message}`);
+    }
+  }
 }
 
-function startFfmpeg() {
-  // -f mpjpeg outputs HTTP-style multipart JPEG that we can parse per frame.
-  ffmpeg = spawn('ffmpeg', [
-    '-loglevel', 'error',
-    '-f', 'x11grab',
-    '-draw_mouse', '0',   // don't include the X cursor in the captured frames
-    '-framerate', String(FPS),
-    '-video_size', SIZE,
-    '-i', `${DISPLAY}.0`,
-    '-c:v', 'mjpeg',
-    '-q:v', '5',
-    '-f', 'mpjpeg',
-    '-',
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
-
-  // Parse mpjpeg: frames separated by boundary lines starting with "--"
-  // Simpler: detect JPEG SOI (0xFFD8) and EOI (0xFFD9).
-  let buf = Buffer.alloc(0);
-  ffmpeg.stdout.on('data', (chunk) => {
-    buf = Buffer.concat([buf, chunk]);
-    while (true) {
-      const soi = buf.indexOf(Buffer.from([0xff, 0xd8]));
-      if (soi < 0) { buf = Buffer.alloc(0); break; }
-      const eoi = buf.indexOf(Buffer.from([0xff, 0xd9]), soi + 2);
-      if (eoi < 0) {
-        if (soi > 0) buf = buf.slice(soi);
-        break;
-      }
-      const frame = buf.slice(soi, eoi + 2);
-      buf = buf.slice(eoi + 2);
-      frameBuffer.data = frame;
-      frameBuffer.ts = Date.now();
-      // Broadcast to all streaming clients
-      for (const c of clients) {
-        try {
-          c.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`);
-          c.write(frame);
-          c.write('\r\n');
-        } catch {}
-      }
+/**
+ * Every SUPERVISOR_POLL_MS: for each idle worker, find a running league that
+ * isn't already claimed by another worker and assign it. Tidy way to keep the
+ * pool busy without manual assignment.
+ */
+function startSupervisor() {
+  setInterval(() => {
+    const db = getDb();
+    const claimed = new Set(
+      Array.from(workers.values()).map((w) => w.leagueId).filter((x) => x != null)
+    );
+    const leagues = db.prepare(`
+      SELECT id FROM league WHERE status = 'running' ORDER BY id
+    `).all();
+    for (const w of workers.values()) {
+      if (w.status !== 'idle') continue;
+      const next = leagues.find((l) => !claimed.has(l.id));
+      if (!next) break;
+      claimed.add(next.id);
+      console.log(`[supervisor] assigning league ${next.id} → worker ${w.workerId}`);
+      w.assignLeague(db, next.id);
     }
-  });
-  ffmpeg.stderr.on('data', (d) => process.stderr.write(`[ffmpeg] ${d}`));
-  ffmpeg.on('exit', (code) => {
-    console.error(`[ffmpeg] exited with code ${code}`);
-    ffmpeg = null;
-  });
-  console.log(`[ffmpeg] capturing ${DISPLAY} at ${SIZE}@${FPS}`);
+  }, SUPERVISOR_POLL_MS);
 }
 
 function startAudio() {
@@ -914,19 +906,25 @@ const server = createServer((req, res) => {
     res.end(HTML);
     return;
   }
-  if (req.url === '/stream') {
+  // MJPEG streams. /stream aliases worker 1 for backwards compat.
+  const streamMatch = req.url && req.url.match(/^\/stream(?:\/(\d+))?$/);
+  if (streamMatch) {
+    const id = streamMatch[1] ? Number(streamMatch[1]) : 1;
+    const w = workers.get(id);
+    if (!w) { res.writeHead(404); res.end('no such worker'); return; }
     res.writeHead(200, {
       'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
       'Cache-Control': 'no-store',
       'Connection': 'close',
     });
-    clients.add(res);
-    if (frameBuffer.data) {
-      res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frameBuffer.data.length}\r\n\r\n`);
-      res.write(frameBuffer.data);
-      res.write('\r\n');
-    }
-    req.on('close', () => clients.delete(res));
+    const detach = w.attachClient(res);
+    req.on('close', detach);
+    return;
+  }
+  if (req.url === '/api/workers') {
+    const data = Array.from(workers.values()).map((w) => w.describe());
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
     return;
   }
   if (req.url === '/audiostream') {
@@ -1162,21 +1160,22 @@ const server = createServer((req, res) => {
 
 // ---------- boot ----------
 
-startXvfb();
-setTimeout(startFfmpeg, 1500);
 // Audio streaming is disabled until we solve OpenAL/PulseAudio routing properly —
 // PULSE_SINK didn't actually redirect Ikemen's output. Left the startAudio + /audiostream
 // plumbing in place for when we revisit.
-server.listen(PORT, () => {
-  console.log(`[server] http://localhost:${PORT}`);
-  console.log(`[hint] run tournaments with: DISPLAY=${DISPLAY} node src/index.js tournament start --size 8 --stream`);
-});
+(async () => {
+  await bootWorkers();
+  startSupervisor();
+  server.listen(PORT, () => {
+    console.log(`[server] http://localhost:${PORT}`);
+    console.log(`[pool] ${WORKER_COUNT} worker(s) on displays :${DISPLAY_BASE + 1}..:${DISPLAY_BASE + WORKER_COUNT}`);
+    console.log(`[hint] create leagues with: node src/index.js league create`);
+  });
+})();
 
 function shutdown() {
   console.log('\n[shutdown]');
-  clients.forEach(c => { try { c.end(); } catch {} });
-  if (ffmpeg) ffmpeg.kill('SIGTERM');
-  if (xvfb) xvfb.kill('SIGTERM');
+  for (const w of workers.values()) w.stop();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000);
 }
