@@ -3,6 +3,12 @@ import { readFile } from 'fs/promises';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
+import { stageOwnedFighter } from './matchStaging.js';
+import {
+  readEffectiveStamina,
+  staminaToLife,
+  applyMatchCost,
+} from './stamina.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(__dirname, '..');
@@ -53,7 +59,7 @@ function isDeterministicFailure(err) {
   );
 }
 
-function launchEngine(fighter1, fighter2, stage) {
+function launchEngine(fighter1, fighter2, stage, p1Life, p2Life) {
   return new Promise((resolve, reject) => {
     let cmd, args;
 
@@ -61,14 +67,15 @@ function launchEngine(fighter1, fighter2, stage) {
       const batPath = join(PROJECT_ROOT, 'runMugenTourney.bat');
       cmd = 'cmd.exe';
       args = ['/c', batPath, fighter1, fighter2, stage];
+      // Windows batch path doesn't wire life args yet — v1 owned matches are Linux-only.
     } else {
       const shPath = join(PROJECT_ROOT, 'runMatch.sh');
       cmd = shPath;
       args = [fighter1, fighter2, stage];
+      if (p1Life != null) args.push(String(p1Life));
+      if (p2Life != null) args.push(String(p2Life));
     }
 
-    // Hard timeout: matches should finish in <90s. If Ikemen hangs on a modal
-    // error dialog, this kills it and lets the tournament move on.
     const child = execFile(cmd, args, { timeout: 120_000, killSignal: 'SIGKILL' }, (error, stdout, stderr) => {
       if (error) {
         reject(error);
@@ -78,6 +85,70 @@ function launchEngine(fighter1, fighter2, stage) {
     });
     return child;
   });
+}
+
+/**
+ * Run a match between two owned_fighter rows. Stages both chars (so AI
+ * overrides apply), scales life by effective stamina, updates per-fighter
+ * stats + stamina after the match, and cleans up the staged dirs.
+ *
+ * Returns the parsed result + the life/stamina metadata used, so callers
+ * (tests, league runner) can log/assert.
+ */
+export async function runOwnedFighterMatch({
+  db,
+  homeOwnedFighterId,
+  awayOwnedFighterId,
+  stageFileName,
+}) {
+  const home = db.prepare('SELECT * FROM owned_fighter WHERE id = ?').get(homeOwnedFighterId);
+  const away = db.prepare('SELECT * FROM owned_fighter WHERE id = ?').get(awayOwnedFighterId);
+  if (!home || !away) throw new Error('owned_fighter not found');
+
+  const homeStam = readEffectiveStamina(db, homeOwnedFighterId);
+  const awayStam = readEffectiveStamina(db, awayOwnedFighterId);
+  const homeLife = staminaToLife(homeStam);
+  const awayLife = staminaToLife(awayStam);
+
+  const homeStage = stageOwnedFighter(db, homeOwnedFighterId);
+  const awayStage = stageOwnedFighter(db, awayOwnedFighterId);
+
+  let result;
+  try {
+    await launchEngine(homeStage.charName, awayStage.charName, stageFileName, homeLife, awayLife);
+    const logContents = await readFile(LOG_FILE, 'utf-8');
+    result = parseIkemenResult(logContents);
+  } finally {
+    homeStage.cleanup();
+    awayStage.cleanup();
+  }
+
+  // Persist stats + stamina in a single transaction
+  const tx = db.transaction(() => {
+    if (result.winner === 'fighter1') {
+      db.prepare('UPDATE owned_fighter SET matches_won = matches_won + 1 WHERE id = ?').run(homeOwnedFighterId);
+      db.prepare('UPDATE owned_fighter SET matches_lost = matches_lost + 1 WHERE id = ?').run(awayOwnedFighterId);
+    } else if (result.winner === 'fighter2') {
+      db.prepare('UPDATE owned_fighter SET matches_won = matches_won + 1 WHERE id = ?').run(awayOwnedFighterId);
+      db.prepare('UPDATE owned_fighter SET matches_lost = matches_lost + 1 WHERE id = ?').run(homeOwnedFighterId);
+    } else {
+      db.prepare('UPDATE owned_fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?').run(homeOwnedFighterId);
+      db.prepare('UPDATE owned_fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?').run(awayOwnedFighterId);
+    }
+    applyMatchCost(db, homeOwnedFighterId);
+    applyMatchCost(db, awayOwnedFighterId);
+  });
+  tx();
+
+  return {
+    ...result,
+    home: { id: home.id, name: home.display_name },
+    away: { id: away.id, name: away.display_name },
+    homeLife,
+    awayLife,
+    homeStam,
+    awayStam,
+  };
 }
 
 /**

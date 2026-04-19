@@ -27,7 +27,7 @@ import {
   currentUser,
   sessionCookieHeader,
 } from './auth.js';
-import { getTeamForUser, getTeamById } from './teams.js';
+import { getTeamForUser, getTeamById, setLineup } from './teams.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1034,11 +1034,68 @@ const server = createServer((req, res) => {
     return;
   }
   const teamMatch = req.url && req.url.match(/^\/api\/team\/(\d+)$/);
-  if (teamMatch) {
+  if (teamMatch && req.method === 'GET') {
     const team = getTeamById(getDb(), Number(teamMatch[1]));
     if (!team) { res.writeHead(404); res.end('{"error":"team not found"}'); return; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(team));
+    return;
+  }
+  const lineupMatch = req.url && req.url.match(/^\/api\/team\/(\d+)\/lineup$/);
+  if (lineupMatch && req.method === 'PUT') {
+    const teamId = Number(lineupMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const owner = db.prepare('SELECT user_id FROM team WHERE id = ?').get(teamId);
+    if (!owner) { res.writeHead(404); res.end('{"error":"team not found"}'); return; }
+    if (owner.user_id !== u.id) { res.writeHead(403); res.end('{"error":"Not your team"}'); return; }
+    readJsonBody(req).then((data) => {
+      const result = setLineup(db, teamId, data);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.body));
+    }).catch((e) => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Bad request', detail: String(e.message || e) }));
+    });
+    return;
+  }
+  const renameTeamMatch = req.url && req.url.match(/^\/api\/team\/(\d+)\/name$/);
+  if (renameTeamMatch && req.method === 'PUT') {
+    const teamId = Number(renameTeamMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const owner = db.prepare('SELECT user_id FROM team WHERE id = ?').get(teamId);
+    if (!owner || owner.user_id !== u.id) { res.writeHead(403); res.end('{"error":"Not your team"}'); return; }
+    readJsonBody(req).then((data) => {
+      const name = String(data.name || '').trim();
+      if (!name || name.length > 40) {
+        res.writeHead(400); res.end('{"error":"name must be 1-40 chars"}'); return;
+      }
+      db.prepare('UPDATE team SET name = ? WHERE id = ?').run(name, teamId);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name }));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const renameFighterMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/name$/);
+  if (renameFighterMatch && req.method === 'PUT') {
+    const fighterId = Number(renameFighterMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const owner = db.prepare(`
+      SELECT t.user_id FROM owned_fighter of JOIN team t ON of.team_id = t.id WHERE of.id = ?
+    `).get(fighterId);
+    if (!owner || owner.user_id !== u.id) { res.writeHead(403); res.end('{"error":"Not your fighter"}'); return; }
+    readJsonBody(req).then((data) => {
+      const name = String(data.name || '').trim();
+      if (!name || name.length > 40) { res.writeHead(400); res.end('{"error":"name must be 1-40 chars"}'); return; }
+      db.prepare('UPDATE owned_fighter SET display_name = ? WHERE id = ?').run(name, fighterId);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, name }));
+    }).catch(() => { res.writeHead(400); res.end(); });
     return;
   }
   const aiGetMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/ai$/);

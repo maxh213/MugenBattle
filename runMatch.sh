@@ -1,6 +1,8 @@
 #!/bin/bash
-# Usage: ./runMatch.sh <fighter1> <fighter2> <stage>
+# Usage: ./runMatch.sh <fighter1> <fighter2> <stage> [p1_life] [p2_life]
 # Launches an Ikemen GO match with AI-controlled players and outputs the results.
+# p1_life / p2_life are optional starting-life overrides (integer, typically 400-1000).
+# When omitted, Ikemen uses each char's default.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENGINE_DIR="$SCRIPT_DIR/engine"
@@ -23,6 +25,10 @@ else
   exit 1
 fi
 
+EXTRA_ARGS=()
+if [ -n "$4" ]; then EXTRA_ARGS+=(-p1.life "$4"); fi
+if [ -n "$5" ]; then EXTRA_ARGS+=(-p2.life "$5"); fi
+
 $ENGINE \
   -p1 "$1" \
   -p2 "$2" \
@@ -33,4 +39,5 @@ $ENGINE \
   -log "$LOG_FILE" \
   -nosound \
   -nojoy \
-  -windowed
+  -windowed \
+  "${EXTRA_ARGS[@]}"

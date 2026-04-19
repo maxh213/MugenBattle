@@ -22,6 +22,8 @@ import {
 import { validateAllActive, validateFighter } from './validator.js';
 import { getDb } from './db.js';
 import { credit, assertLedgerIntegrity } from './wallet.js';
+import { runOwnedFighterMatch } from './match.js';
+import { readEffectiveStamina } from './stamina.js';
 import { closeDb } from './db.js';
 
 program
@@ -418,6 +420,45 @@ users
       for (const r of bad) {
         console.log(`  ${r.username} (id=${r.id}): materialised=${r.materialised} ledger=${r.ledger_sum}`);
       }
+    }
+  });
+
+// --- Owned-fighter matches (for testing / manual play) ---
+
+program
+  .command('owned-match <home_id> <away_id>')
+  .description('Run a single owned-vs-owned match (for testing)')
+  .option('-s, --stage <name>', 'stage file_name (default: random active)', null)
+  .action(async (homeId, awayId, opts) => {
+    const db = getDb();
+    let stage = opts.stage;
+    if (!stage) {
+      const row = db.prepare('SELECT file_name FROM stage WHERE active = 1 ORDER BY RANDOM() LIMIT 1').get();
+      if (!row) { console.error('No active stages.'); return; }
+      stage = row.file_name;
+    }
+    const home = db.prepare('SELECT id, display_name FROM owned_fighter WHERE id = ?').get(parseInt(homeId, 10));
+    const away = db.prepare('SELECT id, display_name FROM owned_fighter WHERE id = ?').get(parseInt(awayId, 10));
+    if (!home || !away) { console.error('owned_fighter not found'); return; }
+
+    console.log(`\n${home.display_name} (id=${home.id}) vs ${away.display_name} (id=${away.id}) @ ${stage}`);
+    console.log(`  pre-stamina home=${readEffectiveStamina(db, home.id).toFixed(2)} away=${readEffectiveStamina(db, away.id).toFixed(2)}`);
+
+    try {
+      const r = await runOwnedFighterMatch({
+        db,
+        homeOwnedFighterId: home.id,
+        awayOwnedFighterId: away.id,
+        stageFileName: stage,
+      });
+      console.log(`  lives home=${r.homeLife} away=${r.awayLife}`);
+      const winner = r.winner === 'fighter1' ? r.home.name
+                   : r.winner === 'fighter2' ? r.away.name
+                   : 'draw';
+      console.log(`  → ${winner} (${r.fighter1Rounds}-${r.fighter2Rounds})`);
+      console.log(`  post-stamina home=${readEffectiveStamina(db, home.id).toFixed(2)} away=${readEffectiveStamina(db, away.id).toFixed(2)}`);
+    } catch (err) {
+      console.error('Match failed:', err.message);
     }
   });
 
