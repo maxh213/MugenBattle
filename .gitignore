@@ -265,3 +265,10 @@ mugenbattle.db
 matchData.log
 mugen/
 engine/
+# MugenBattle additions
+*.db-shm
+*.db-wal
+.claude/
+bulkgrab/
+.venv/
+scripts/__pycache__/

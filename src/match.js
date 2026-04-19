@@ -23,20 +23,34 @@ export async function runMatch(fighter1, fighter2, stage) {
     try {
       const stdout = await launchEngine(fighter1, fighter2, stage);
       if (isWindows) {
-        // MUGEN outputs "winningteam = N" lines to stdout via the batch file
         return parseMugenResult(stdout);
       } else {
-        // Ikemen GO writes stats to a log file via -log flag
         const logContents = await readFile(LOG_FILE, 'utf-8');
         return parseIkemenResult(logContents);
       }
     } catch (err) {
       lastError = err;
+      // Don't retry on deterministic engine errors (missing files, broken defs, etc.)
+      // — retrying just pops the same modal again.
+      if (isDeterministicFailure(err)) {
+        throw new Error(`Match failed (deterministic): ${err.message}`);
+      }
       console.log(`Attempt ${attempt}/${MAX_RETRIES} failed: ${err.message}`);
     }
   }
 
   throw new Error(`Match failed after ${MAX_RETRIES} attempts: ${lastError.message}`);
+}
+
+function isDeterministicFailure(err) {
+  const msg = String(err?.message || err);
+  return (
+    msg.includes('no such file or directory') ||
+    msg.includes('panic:') ||
+    msg.includes('error loading') ||
+    msg.includes('chars/') ||
+    msg.includes('stages/')
+  );
 }
 
 function launchEngine(fighter1, fighter2, stage) {
@@ -53,13 +67,16 @@ function launchEngine(fighter1, fighter2, stage) {
       args = [fighter1, fighter2, stage];
     }
 
-    execFile(cmd, args, (error, stdout, stderr) => {
+    // Hard timeout: matches should finish in <90s. If Ikemen hangs on a modal
+    // error dialog, this kills it and lets the tournament move on.
+    const child = execFile(cmd, args, { timeout: 120_000, killSignal: 'SIGKILL' }, (error, stdout, stderr) => {
       if (error) {
         reject(error);
       } else {
         resolve(stdout);
       }
     });
+    return child;
   });
 }
 
