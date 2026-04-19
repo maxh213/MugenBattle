@@ -1218,16 +1218,21 @@ const TEAM_HTML = `<!doctype html>
   .wallet-row .market-link:hover { background: #58a6ff; color: #0d1117; }
   .team-header { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; padding: 14px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
   .rotate-panel { padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 14px; }
-  .rotate-row { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
-  .rotate-row .rotate-label { display: flex; gap: 8px; align-items: center; font-size: 13px; color: #c9d1d9; cursor: pointer; font-weight: 600; }
+  .rotate-row { display: flex; gap: 12px; align-items: center; }
+  .rotate-row .rotate-label { display: flex; gap: 8px; align-items: center; font-size: 13px; color: #c9d1d9; cursor: pointer; font-weight: 600; white-space: nowrap; }
   .rotate-row .rotate-label input { width: 16px; height: 16px; cursor: pointer; }
-  .rotate-config { margin-top: 12px; padding-top: 12px; border-top: 1px solid #21262d; }
+  .rotate-row .rotate-hint-inline { color: #6e7681; font-size: 11px; flex: 1; }
+  .rotate-row .msg { margin-left: auto; }
+  .rotate-config { margin-top: 10px; padding-top: 10px; border-top: 1px solid #21262d; display: flex; flex-direction: column; gap: 10px; }
   .rotate-config.disabled { opacity: 0.4; pointer-events: none; }
-  .rotate-slider-row { display: grid; grid-template-columns: auto 1fr 60px; gap: 12px; align-items: center; margin-bottom: 8px; }
-  .rotate-slider-row label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
-  .rotate-slider-row input[type=range] { accent-color: #58a6ff; }
-  .rotate-threshold-val { text-align: right; color: #f0ae3c; font-weight: 600; font-variant-numeric: tabular-nums; font-size: 15px; }
-  .rotate-hint { color: #8b949e; font-size: 11px; line-height: 1.5; }
+  .rule-row { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; }
+  .rule-row .rule-check { display: flex; gap: 8px; align-items: center; font-size: 13px; color: #c9d1d9; cursor: pointer; white-space: nowrap; }
+  .rule-row .rule-check input { width: 15px; height: 15px; cursor: pointer; }
+  .rule-row .rule-suffix { color: #8b949e; font-size: 12px; }
+  .rule-row input[type=range] { accent-color: #58a6ff; }
+  .rule-row input[type=number] { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .rotate-threshold-val { text-align: right; color: #f0ae3c; font-weight: 600; font-variant-numeric: tabular-nums; font-size: 15px; min-width: 40px; }
+  .rotate-hint { color: #8b949e; font-size: 11px; line-height: 1.5; margin-top: 4px; padding-top: 8px; border-top: 1px dashed #21262d; }
   .rotate-hint b { color: #c9d1d9; font-variant-numeric: tabular-nums; }
   .team-header label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
   .team-header input { flex: 1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 16px; font-weight: 600; }
@@ -1351,22 +1356,32 @@ ${AUTH_BAR_HTML}
     <div class="rotate-row">
       <label class="rotate-label">
         <input type="checkbox" id="auto-rotate" onchange="saveRotation()">
-        <span>Auto-rotate tired fighters</span>
+        <span>Auto-rotate</span>
       </label>
+      <span class="rotate-hint-inline">Rotates to the next-priority active fighter when any enabled rule below fires. If every fighter is skipped, priority 0 plays anyway.</span>
       <span class="msg" id="rotate-msg"></span>
     </div>
     <div class="rotate-config" id="rotate-config">
-      <div class="rotate-slider-row">
-        <label for="rotate-threshold">Swap when stamina drops below</label>
-        <input type="range" id="rotate-threshold" min="0" max="1" step="0.05" value="0.30" oninput="updateThresholdLabel()" onchange="saveRotation()">
-        <span class="rotate-threshold-val" id="rotate-threshold-val">0.30</span>
+      <div class="rule-row">
+        <label class="rule-check">
+          <input type="checkbox" id="rotate-on-stamina" onchange="saveRotation()">
+          <span>Swap when stamina drops below</span>
+        </label>
+        <input type="range" id="rotate-threshold" min="0" max="1" step="0.05" value="0.85" oninput="updateThresholdLabel()" onchange="saveRotation()">
+        <span class="rotate-threshold-val" id="rotate-threshold-val">0.85</span>
+      </div>
+      <div class="rule-row">
+        <label class="rule-check">
+          <input type="checkbox" id="rotate-on-losses" onchange="saveRotation()">
+          <span>Swap after</span>
+        </label>
+        <input type="number" id="rotate-loss-streak" min="1" max="20" step="1" value="3" onchange="saveRotation()" style="max-width:70px">
+        <span class="rule-suffix">consecutive losses</span>
       </div>
       <div class="rotate-hint">
-        Threshold <b>0.00</b> = never swap (equivalent to turning auto-rotate off).
-        <b>1.00</b> = always prefer the freshest bench fighter.
-        <b>0.30</b> (default) kicks in when a fighter is roughly one match away from empty.
-        <br>
-        Stamina drops <b>0.20</b> per match played and recovers <b>0.10 per hour</b> of rest.
+        Rotation is between fixtures only. The fielded fighter loses <b>0.20</b>
+        stamina after their match; every other roster fighter on your team
+        gains <b>0.25</b> while resting (capped at 1.00).
       </div>
     </div>
   </div>
@@ -1641,11 +1656,18 @@ function renderTeam() {
   const ar = document.getElementById('auto-rotate');
   if (ar) ar.checked = !!t.auto_rotate;
   const slider = document.getElementById('rotate-threshold');
+  const stamChk = document.getElementById('rotate-on-stamina');
+  const lossChk = document.getElementById('rotate-on-losses');
+  const streakIn = document.getElementById('rotate-loss-streak');
   if (slider) {
-    slider.value = (t.rotation_threshold != null ? t.rotation_threshold : 0.30).toFixed(2);
+    slider.value = (t.rotation_threshold != null ? t.rotation_threshold : 0.85).toFixed(2);
     updateThresholdLabel();
-    document.getElementById('rotate-config').classList.toggle('disabled', !t.auto_rotate);
   }
+  if (stamChk) stamChk.checked = t.rotate_on_stamina == null ? true : !!t.rotate_on_stamina;
+  if (lossChk) lossChk.checked = !!t.rotate_on_losses;
+  if (streakIn) streakIn.value = t.rotation_loss_streak || 3;
+  const cfg = document.getElementById('rotate-config');
+  if (cfg) cfg.classList.toggle('disabled', !t.auto_rotate);
   const active = t.fighters.filter(f => f.slot === 'active').sort((a,b) => a.priority - b.priority || a.id - b.id);
   const bench  = t.fighters.filter(f => f.slot === 'bench' ).sort((a,b) => a.id - b.id);
   const forSale = t.fighters.filter(f => f.slot === 'for_sale').sort((a,b) => a.id - b.id);
@@ -1665,7 +1687,10 @@ function updateThresholdLabel() {
 
 async function saveRotation() {
   const on = document.getElementById('auto-rotate').checked;
+  const stam = document.getElementById('rotate-on-stamina').checked;
+  const loss = document.getElementById('rotate-on-losses').checked;
   const threshold = Number(document.getElementById('rotate-threshold').value);
+  const streak = parseInt(document.getElementById('rotate-loss-streak').value, 10) || 3;
   document.getElementById('rotate-config').classList.toggle('disabled', !on);
   const msg = document.getElementById('rotate-msg');
   msg.className = 'msg'; msg.textContent = 'saving…';
@@ -1677,18 +1702,29 @@ async function saveRotation() {
   active.forEach((id, i) => (priority[id] = i));
   const r = await fetch('/api/team/' + currentTeam.id + '/lineup', {
     method: 'PUT', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ active, bench, priority, auto_rotate: on, rotation_threshold: threshold }),
+    body: JSON.stringify({
+      active, bench, priority,
+      auto_rotate: on,
+      rotate_on_stamina: stam, rotate_on_losses: loss,
+      rotation_threshold: threshold, rotation_loss_streak: streak,
+    }),
   });
   if (r.ok) {
     currentTeam.auto_rotate = on ? 1 : 0;
+    currentTeam.rotate_on_stamina = stam ? 1 : 0;
+    currentTeam.rotate_on_losses = loss ? 1 : 0;
     currentTeam.rotation_threshold = threshold;
+    currentTeam.rotation_loss_streak = streak;
     msg.className = 'msg ok';
-    msg.textContent = on ? 'rotate @ ' + threshold.toFixed(2) : 'auto-rotate off';
+    const rules = [];
+    if (stam) rules.push('stamina<' + threshold.toFixed(2));
+    if (loss) rules.push(streak + 'L streak');
+    msg.textContent = on ? (rules.length ? 'saved · ' + rules.join(' or ') : 'saved') : 'auto-rotate off';
   } else {
     const body = await r.json().catch(() => ({}));
     msg.className = 'msg err'; msg.textContent = body.error || 'error';
   }
-  setTimeout(() => { msg.textContent = ''; }, 2200);
+  setTimeout(() => { msg.textContent = ''; }, 2500);
 }
 
 async function saveTeamName() {

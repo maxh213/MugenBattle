@@ -46,7 +46,7 @@ export function seedBots(db, total) {
     "INSERT INTO user_account (email, username, is_bot) VALUES (?, ?, 1)"
   );
   const insertTeam = db.prepare(
-    'INSERT INTO team (user_id, name) VALUES (?, ?)'
+    'INSERT INTO team (user_id, name, rotation_threshold) VALUES (?, ?, 0.85)'
   );
 
   const tx = db.transaction(() => {

@@ -9,6 +9,7 @@ import {
   readEffectiveStamina,
   staminaToLife,
   applyMatchCost,
+  applyTeamRest,
 } from './stamina.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -250,6 +251,10 @@ export async function runOwnedFighterMatch({
     }
     applyMatchCost(db, homeOwnedFighterId);
     applyMatchCost(db, awayOwnedFighterId);
+    // Event-driven rest: every non-retired roster fighter on the same team
+    // gains REST_RECOVERY while one of their teammates was in the ring.
+    applyTeamRest(db, home.team_id, homeOwnedFighterId);
+    applyTeamRest(db, away.team_id, awayOwnedFighterId);
   });
   tx();
 

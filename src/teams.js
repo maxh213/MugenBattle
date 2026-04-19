@@ -32,7 +32,7 @@ export function bootstrapTeamForUser(db, userId, teamName) {
   if (existing) return existing.id;
 
   const insertTeam = db.prepare(
-    'INSERT INTO team (user_id, name) VALUES (?, ?)'
+    'INSERT INTO team (user_id, name, rotation_threshold) VALUES (?, ?, 0.85)'
   );
   const insertFighter = db.prepare(
     'INSERT INTO owned_fighter (team_id, master_fighter_id, display_name, slot, priority) VALUES (?, ?, ?, \'active\', ?)'
@@ -88,11 +88,20 @@ export function setLineup(db, teamId, body) {
   const bench = Array.isArray(body.bench) ? body.bench.map(Number) : [];
   const priority = body.priority && typeof body.priority === 'object' ? body.priority : {};
   const autoRotate = body.auto_rotate ? 1 : 0;
+  const rotateOnStamina = body.rotate_on_stamina ? 1 : 0;
+  const rotateOnLosses = body.rotate_on_losses ? 1 : 0;
   let rotationThreshold = body.rotation_threshold;
   if (rotationThreshold != null) {
     rotationThreshold = Number(rotationThreshold);
     if (!Number.isFinite(rotationThreshold) || rotationThreshold < 0 || rotationThreshold > 1) {
       return { status: 400, body: { error: 'rotation_threshold must be between 0.0 and 1.0' } };
+    }
+  }
+  let rotationLossStreak = body.rotation_loss_streak;
+  if (rotationLossStreak != null) {
+    rotationLossStreak = Math.floor(Number(rotationLossStreak));
+    if (!Number.isFinite(rotationLossStreak) || rotationLossStreak < 1 || rotationLossStreak > 99) {
+      return { status: 400, body: { error: 'rotation_loss_streak must be 1..99' } };
     }
   }
 
@@ -121,12 +130,12 @@ export function setLineup(db, teamId, body) {
   }
 
   const tx = db.transaction(() => {
-    if (rotationThreshold != null) {
-      db.prepare('UPDATE team SET auto_rotate = ?, rotation_threshold = ? WHERE id = ?')
-        .run(autoRotate, rotationThreshold, teamId);
-    } else {
-      db.prepare('UPDATE team SET auto_rotate = ? WHERE id = ?').run(autoRotate, teamId);
-    }
+    const cols = ['auto_rotate = ?', 'rotate_on_stamina = ?', 'rotate_on_losses = ?'];
+    const args = [autoRotate, rotateOnStamina, rotateOnLosses];
+    if (rotationThreshold != null) { cols.push('rotation_threshold = ?'); args.push(rotationThreshold); }
+    if (rotationLossStreak != null) { cols.push('rotation_loss_streak = ?'); args.push(rotationLossStreak); }
+    args.push(teamId);
+    db.prepare(`UPDATE team SET ${cols.join(', ')} WHERE id = ?`).run(...args);
     const setActive = db.prepare(
       "UPDATE owned_fighter SET slot = 'active', priority = ? WHERE id = ? AND team_id = ?"
     );
@@ -150,22 +159,20 @@ export function setLineup(db, teamId, body) {
  * Returns null if the team can't field 5 eligible fighters.
  */
 /**
- * Choose ONE active fighter to field for the next fixture. Rotation is
- * driven by team.rotation_mode:
- *   'fixed'   — always the top priority (priority=0)
- *   'stamina' — walk priorities, pick first whose eff stamina ≥ threshold;
- *               fall back to top if all tired.
- *   'losses'  — walk priorities, pick first whose consecutive_losses <
- *               rotation_loss_streak; fall back to top if every fighter is
- *               at/past the streak.
+ * Choose ONE active fighter to field for the next fixture. Two independent
+ * triggers, either may fire a rotation:
+ *   rotate_on_stamina — skip if stamina < rotation_threshold
+ *   rotate_on_losses  — skip if consecutive_losses ≥ rotation_loss_streak
  *
- * Bench fighters are never auto-selected — the user must promote them
- * explicitly. Returns null if the team has fewer than 1 non-retired
- * active fighter (would force a forfeit).
+ * Walks priorities; picks the first fighter where every ENABLED trigger
+ * says "keep". All rejected → falls back to priority 0 (team plays anyway;
+ * no forfeit on fatigue).
+ *
+ * Bench fighters are never auto-selected. Returns null if 0 active.
  */
 export function pickActiveFighter(db, teamId) {
   const team = db.prepare(
-    'SELECT auto_rotate, rotation_mode, rotation_threshold, rotation_loss_streak FROM team WHERE id = ?'
+    'SELECT auto_rotate, rotate_on_stamina, rotate_on_losses, rotation_threshold, rotation_loss_streak FROM team WHERE id = ?'
   ).get(teamId);
   if (!team) return null;
   const actives = db
@@ -173,26 +180,20 @@ export function pickActiveFighter(db, teamId) {
     .all(teamId);
   if (actives.length === 0) return null;
 
-  const mode = team.auto_rotate ? (team.rotation_mode || 'stamina') : 'fixed';
-  if (mode === 'fixed') return actives[0];
+  const autoOn = !!team.auto_rotate;
+  const stamOn = autoOn && !!team.rotate_on_stamina;
+  const lossOn = autoOn && !!team.rotate_on_losses;
+  if (!stamOn && !lossOn) return actives[0];
 
-  if (mode === 'stamina') {
-    const threshold = team.rotation_threshold != null ? team.rotation_threshold : LOW_STAMINA_ROTATION_THRESHOLD;
-    for (const f of actives) {
-      const eff = readEffectiveStamina(db, f.id);
-      if (eff >= threshold) return { ...f, eff };
-    }
-    return actives[0];
+  const threshold = team.rotation_threshold != null ? team.rotation_threshold : LOW_STAMINA_ROTATION_THRESHOLD;
+  const cap = team.rotation_loss_streak || 3;
+
+  for (const f of actives) {
+    const eff = readEffectiveStamina(db, f.id);
+    const staminaOk = !stamOn || eff >= threshold;
+    const lossOk = !lossOn || (f.consecutive_losses || 0) < cap;
+    if (staminaOk && lossOk) return { ...f, eff };
   }
-
-  if (mode === 'losses') {
-    const cap = team.rotation_loss_streak || 3;
-    for (const f of actives) {
-      if ((f.consecutive_losses || 0) < cap) return f;
-    }
-    return actives[0];
-  }
-
   return actives[0];
 }
 
