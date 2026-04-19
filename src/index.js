@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { program } from 'commander';
+import { resolve } from 'path';
 import {
   addFighter,
   addStage,
@@ -36,6 +37,7 @@ import { runLeagueWorker } from './leagueWorker.js';
 import { bootstrapTeamForUser } from './teams.js';
 import { seedBots, retireAllBotRosters, listBots } from './bots.js';
 import { marketListings, priceFor } from './market.js';
+import { importCharFromZip, listUserImports } from './charImport.js';
 import { closeDb } from './db.js';
 
 program
@@ -765,6 +767,63 @@ market
       console.log(`${String(r.id).padStart(5)} ${fname.padEnd(26)} ${display.padEnd(24)} ${author.padEnd(16)} ${String(r.matches_won).padStart(5)} ${String(r.price_cents).padStart(7)}`);
     }
     console.log(`\nShowing ${rows.length} of unlimited.  (Total unclaimed available in DB shows above.)`);
+  });
+
+// --- Character import (admin/testing) ---
+
+program
+  .command('import <zipfile>')
+  .description('Import a character .zip through the upload pipeline (extract → validate → sandbox test → install)')
+  .option('-u, --as-user <username>', 'user to record as the uploader (default: first non-bot user)')
+  .action(async (zipfile, opts) => {
+    const db = getDb();
+    const path = resolve(process.cwd(), zipfile);
+    let user;
+    if (opts.asUser) {
+      user = db.prepare('SELECT id, username FROM user_account WHERE lower(username) = lower(?)').get(opts.asUser);
+      if (!user) { console.error(`No user "${opts.asUser}".`); return; }
+    } else {
+      user = db.prepare('SELECT id, username FROM user_account WHERE is_bot = 0 ORDER BY id LIMIT 1').get();
+      if (!user) { console.error('No non-bot users.'); return; }
+    }
+    console.log(`Importing ${zipfile} as @${user.username} (#${user.id})…`);
+    const r = await importCharFromZip(db, { zipPath: path, originalFilename: zipfile, userId: user.id });
+    if (r.ok) {
+      console.log(`Approved: fighter #${r.fighter_id} installed as "${r.file_name}".`);
+    } else {
+      console.error(`Rejected (${r.reason || r.error})${r.import_id ? ` [import #${r.import_id}]` : ''}.`);
+    }
+  });
+
+program
+  .command('imports [username]')
+  .description('List recent character imports (all users or a specific one)')
+  .option('-n, --limit <n>', 'max rows', (v) => parseInt(v, 10), 20)
+  .action((username, opts) => {
+    const db = getDb();
+    let rows;
+    if (username) {
+      const u = db.prepare('SELECT id FROM user_account WHERE lower(username) = lower(?)').get(username);
+      if (!u) { console.log(`No user "${username}".`); return; }
+      rows = listUserImports(db, u.id, opts.limit);
+    } else {
+      rows = db.prepare(`
+        SELECT ci.*, u.username FROM character_import ci
+        JOIN user_account u ON ci.user_id = u.id
+        ORDER BY ci.id DESC LIMIT ?
+      `).all(opts.limit);
+    }
+    if (rows.length === 0) { console.log('No imports.'); return; }
+    console.log(`\n${'#'.padStart(4)} ${'User'.padEnd(14)} ${'File'.padEnd(24)} ${'Status'.padEnd(10)} ${'Fighter'.padStart(7)} Reason`);
+    console.log('-'.repeat(95));
+    for (const r of rows) {
+      const fileLabel = (r.file_name || r.original_filename || '').slice(0, 24);
+      const status = r.status.padEnd(10);
+      const fighter = String(r.fighter_id || '').padStart(7);
+      const reason = r.reject_reason || '';
+      const user = (r.username || '').slice(0, 14);
+      console.log(`${String(r.id).padStart(4)} ${user.padEnd(14)} ${fileLabel.padEnd(24)} ${status} ${fighter} ${reason}`);
+    }
   });
 
 program.hook('postAction', () => {

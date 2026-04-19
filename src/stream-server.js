@@ -45,6 +45,9 @@ import {
   buyListedFighter,
   userListings,
 } from './market.js';
+import { importCharFromZip, listUserImports } from './charImport.js';
+import { writeFileSync, unlinkSync } from 'fs';
+import { randomUUID } from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -798,6 +801,21 @@ const TEAM_HTML = `<!doctype html>
   .fighter-row .fr-stam { font-size: 12px; font-variant-numeric: tabular-nums; }
   .fighter-row .fr-edit { text-align: right; color: #58a6ff; font-size: 12px; }
   .roster-empty { padding: 14px; color: #6e7681; font-size: 12px; background: #0d1117; border-radius: 8px; border: 1px dashed #30363d; text-align: center; }
+  .import-box { padding: 12px 14px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+  .import-box .import-hint { color: #8b949e; font-size: 12px; margin-bottom: 10px; }
+  .import-box .import-row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+  .import-box input[type=file] { flex: 1; color: #c9d1d9; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+  .import-box button { background: #238636; color: white; border: 1px solid #2ea043; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .import-box button:hover { background: #2ea043; }
+  .import-box button:disabled { background: #21262d; border-color: #30363d; color: #6e7681; cursor: not-allowed; }
+  .import-box .msg { font-size: 12px; min-width: 120px; }
+  .import-box .msg.ok { color: #3fb950; }
+  .import-box .msg.err { color: #f85149; }
+  .imports-list { margin-top: 10px; font-size: 12px; }
+  .imports-list .import-row-rec { display: grid; grid-template-columns: 1.5fr 1fr 2fr; gap: 10px; padding: 6px 8px; border-top: 1px solid #21262d; align-items: center; }
+  .imports-list .status-approved { color: #3fb950; font-weight: 600; }
+  .imports-list .status-rejected { color: #f85149; font-weight: 600; }
+  .imports-list .status-other { color: #f0ae3c; }
   .empty-state { text-align: center; padding: 60px 20px; color: #8b949e; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
   .empty-state h2 { color: #c9d1d9; margin-top: 0; }
   .editor { max-width: 820px !important; }
@@ -856,6 +874,19 @@ ${AUTH_BAR_HTML}
   <div class="roster-section" id="forsale-section" style="display:none">
     <h2>Listed for sale</h2>
     <div id="forsale-slots"></div>
+  </div>
+
+  <div class="roster-section">
+    <h2>Import a character</h2>
+    <div class="import-box">
+      <div class="import-hint">Upload a MUGEN character .zip. Must have a single top-level folder (&lt;name&gt;/) containing &lt;name&gt;.def. Max 100 MB.</div>
+      <div class="import-row">
+        <input type="file" id="import-file" accept=".zip,application/zip">
+        <button id="import-btn" onclick="doImport()">Upload</button>
+        <span class="msg" id="import-msg"></span>
+      </div>
+      <div class="imports-list" id="imports-list"></div>
+    </div>
   </div>
 </div>
 
@@ -1111,6 +1142,56 @@ async function saveFighterAI(id) {
 }
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeEditor(); });
+
+async function loadImports() {
+  const r = await fetch('/api/me/imports');
+  if (!r.ok) return;
+  const rows = await r.json();
+  const host = document.getElementById('imports-list');
+  if (rows.length === 0) { host.innerHTML = ''; return; }
+  host.innerHTML = rows.map(r => {
+    const cls = r.status === 'approved' ? 'status-approved' : r.status === 'rejected' ? 'status-rejected' : 'status-other';
+    const label = esc(r.file_name || r.original_filename || '(upload)');
+    const reason = r.reject_reason ? ' — ' + esc(r.reject_reason) : '';
+    return '<div class="import-row-rec">' +
+      '<div>' + label + '</div>' +
+      '<div class="' + cls + '">' + esc(r.status) + '</div>' +
+      '<div style="color:#8b949e">' + esc(r.created_at) + reason + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+async function doImport() {
+  const file = document.getElementById('import-file').files[0];
+  const msg = document.getElementById('import-msg');
+  const btn = document.getElementById('import-btn');
+  if (!file) { msg.className = 'msg err'; msg.textContent = 'Pick a .zip first.'; return; }
+  msg.className = 'msg'; msg.textContent = 'uploading + testing (can take ~10s)…';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/import/char', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip', 'X-Filename': file.name },
+      body: file,
+    });
+    const body = await r.json();
+    if (r.ok && body.ok) {
+      msg.className = 'msg ok';
+      msg.textContent = 'Imported "' + body.file_name + '" (fighter #' + body.fighter_id + ').';
+    } else {
+      msg.className = 'msg err';
+      msg.textContent = 'Rejected: ' + (body.reason || body.error || 'unknown');
+    }
+  } catch (e) {
+    msg.className = 'msg err';
+    msg.textContent = 'Upload failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    loadImports();
+  }
+}
+
+loadImports();
 </script>
 </body></html>`;
 
@@ -1623,6 +1704,20 @@ function readJsonBody(req, maxBytes = 1_048_576 /* 1 MiB */) {
   });
 }
 
+function readBinaryBody(req, maxBytes = 100 * 1024 * 1024 /* 100 MiB */) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > maxBytes) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
 // ---------- HTTP server ----------
 
 const server = createServer((req, res) => {
@@ -1863,6 +1958,38 @@ const server = createServer((req, res) => {
     const status = result.ok ? 200 : 400;
     res.writeHead(status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
+    return;
+  }
+  if (req.url === '/api/import/char' && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    readBinaryBody(req).then(async (buf) => {
+      if (buf.length < 200) { res.writeHead(400); res.end('{"error":"tiny_upload"}'); return; }
+      const tmpPath = `/tmp/mb-upload-${randomUUID().slice(0, 8)}.zip`;
+      writeFileSync(tmpPath, buf);
+      try {
+        const original = (req.headers['x-filename'] || 'upload.zip').toString();
+        const result = await importCharFromZip(db, {
+          zipPath: tmpPath, originalFilename: original, userId: u.id,
+        });
+        res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } finally {
+        try { unlinkSync(tmpPath); } catch {}
+      }
+    }).catch((err) => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'upload_failed', detail: String(err.message || err).slice(0, 200) }));
+    });
+    return;
+  }
+  if (req.url === '/api/me/imports') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(listUserImports(db, u.id)));
     return;
   }
   const suggestMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/suggested-price$/);
