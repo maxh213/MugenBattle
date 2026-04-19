@@ -67,6 +67,7 @@ import {
   buyListedStage,
   priceForStage,
   releaseOwnedFighter,
+  releaseStage,
 } from './market.js';
 import { importCharFromZip, listUserImports } from './charImport.js';
 import { writeFileSync, unlinkSync } from 'fs';
@@ -1266,7 +1267,9 @@ const TEAM_HTML = `<!doctype html>
   .history-row .res-d { color: #8b949e; }
   .history-row .opp { color: #c9d1d9; }
   .history-row .rounds { color: #6e7681; text-align: right; font-variant-numeric: tabular-nums; }
-  .stage-card { padding: 12px 14px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+  .stage-card { display: grid; grid-template-columns: 180px 1fr; gap: 14px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+  .stage-card .home-stage-preview { width: 180px; aspect-ratio: 4 / 3; object-fit: cover; background: #0d1117; image-rendering: pixelated; }
+  .stage-card .stage-body { padding: 12px 14px 12px 0; }
   .stage-card .stage-head { margin-bottom: 10px; }
   .stage-card .stage-name { font-size: 15px; font-weight: 600; color: #c9d1d9; }
   .stage-card .stage-meta { color: #8b949e; font-size: 11px; margin-top: 2px; }
@@ -1447,22 +1450,40 @@ async function loadHomeStage() {
     return;
   }
   const listed = s.listing_price_cents != null;
+  const preview = '<img class="home-stage-preview" src="/stage-preview/' + encodeURIComponent(s.file_name) + '.png" alt="" onerror="this.style.display=\\'none\\'">';
+  const releaseBtn = '<button onclick="stageRelease(' + s.id + ')" style="background:transparent;color:#f85149;border:1px solid #f85149">Release</button>';
   host.innerHTML =
     '<div class="stage-card">' +
-      '<div class="stage-head">' +
-        '<div class="stage-name">' + esc(s.display_name || s.file_name) + '</div>' +
-        '<div class="stage-meta">' + (s.author ? 'by ' + esc(s.author) + ' · ' : '') + 'used ' + s.times_used + ' times</div>' +
+      preview +
+      '<div class="stage-body">' +
+        '<div class="stage-head">' +
+          '<div class="stage-name">' + esc(s.display_name || s.file_name) + '</div>' +
+          '<div class="stage-meta">' + (s.author ? 'by ' + esc(s.author) + ' · ' : '') + 'used ' + s.times_used + ' times</div>' +
+        '</div>' +
+        (listed
+          ? '<div class="stage-row"><span>Listed at <b>' + fmtCents(s.listing_price_cents) + '</b></span>' +
+            '<button onclick="stageUnlist(' + s.id + ')">Unlist</button>' +
+            releaseBtn +
+            '<span class="msg" id="stage-msg"></span></div>'
+          : '<div class="stage-row"><label>List for</label>' +
+            '<input type="number" id="stage-price" min="0" step="1" value="0" style="max-width:120px">' +
+            '<span style="color:#8b949e;font-size:11px">cents</span>' +
+            '<button onclick="stageList(' + s.id + ')">List for sale</button>' +
+            releaseBtn +
+            '<span class="msg" id="stage-msg"></span></div>') +
       '</div>' +
-      (listed
-        ? '<div class="stage-row"><span>Listed at <b>' + fmtCents(s.listing_price_cents) + '</b></span>' +
-          '<button onclick="stageUnlist(' + s.id + ')">Unlist</button>' +
-          '<span class="msg" id="stage-msg"></span></div>'
-        : '<div class="stage-row"><label>List for</label>' +
-          '<input type="number" id="stage-price" min="0" step="1" value="0" style="max-width:120px">' +
-          '<span style="color:#8b949e;font-size:11px">cents</span>' +
-          '<button onclick="stageList(' + s.id + ')">List for sale</button>' +
-          '<span class="msg" id="stage-msg"></span></div>') +
     '</div>';
+}
+
+async function stageRelease(id) {
+  if (!confirm('Release this home stage back to the pool? No money back.')) return;
+  const msg = document.getElementById('stage-msg');
+  msg.className = 'msg'; msg.textContent = '…';
+  const r = await fetch('/api/stage/' + id + '/release', { method: 'POST' });
+  const body = await r.json();
+  if (r.ok) { loadHomeStage(); } else {
+    msg.className = 'msg err'; msg.textContent = body.error || 'error';
+  }
 }
 
 async function stageList(id) {
@@ -3004,6 +3025,17 @@ const server = createServer((req, res) => {
     const u = currentUser(db, req);
     if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
     const result = unlistStage(db, u.id, id);
+    res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+  const stageReleaseMatch = req.url && req.url.match(/^\/api\/stage\/(\d+)\/release$/);
+  if (stageReleaseMatch && req.method === 'POST') {
+    const id = Number(stageReleaseMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const result = releaseStage(db, u.id, id);
     res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
     return;

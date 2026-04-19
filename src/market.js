@@ -371,6 +371,24 @@ export function listStageForSale(db, userId, stageId, priceCents) {
   return tx();
 }
 
+/**
+ * Give up a stage back to the pool — owner relinquishes, no money back.
+ */
+export function releaseStage(db, userId, stageId) {
+  const tx = db.transaction(() => {
+    const stage = db.prepare(`
+      SELECT s.id, s.owner_team_id, t.user_id
+      FROM stage s LEFT JOIN team t ON s.owner_team_id = t.id
+      WHERE s.id = ?
+    `).get(stageId);
+    if (!stage) return { error: 'stage_not_found' };
+    if (stage.user_id !== userId) return { error: 'not_your_stage' };
+    db.prepare('UPDATE stage SET owner_team_id = NULL, listing_price_cents = NULL WHERE id = ?').run(stageId);
+    return { ok: true };
+  });
+  return tx();
+}
+
 /** Remove the for-sale flag; stage stays owned by the same team. */
 export function unlistStage(db, userId, stageId) {
   const tx = db.transaction(() => {
