@@ -190,9 +190,16 @@ export async function runFixture(db, fixtureId, ctx) {
     return forfeitFixture(db, fixture, !homeLineup, !awayLineup);
   }
 
-  const stageRow = db.prepare(
-    'SELECT id, file_name FROM stage WHERE active = 1 ORDER BY RANDOM() LIMIT 1'
-  ).get();
+  // Prefer the home team's owned stage ("home advantage"); otherwise pick a
+  // random active stage from the pool.
+  let stageRow = db.prepare(
+    'SELECT id, file_name FROM stage WHERE active = 1 AND owner_team_id = ? LIMIT 1'
+  ).get(fixture.home_team_id);
+  if (!stageRow) {
+    stageRow = db.prepare(
+      'SELECT id, file_name FROM stage WHERE active = 1 ORDER BY RANDOM() LIMIT 1'
+    ).get();
+  }
   if (!stageRow) throw new Error('No active stages available');
 
   db.prepare(

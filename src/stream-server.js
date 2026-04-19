@@ -57,6 +57,14 @@ import {
   unlistFromSale,
   buyListedFighter,
   userListings,
+  marketStageListings,
+  userStageListings,
+  getHomeStage,
+  buyUnclaimedStage,
+  listStageForSale,
+  unlistStage,
+  buyListedStage,
+  priceForStage,
 } from './market.js';
 import { importCharFromZip, listUserImports } from './charImport.js';
 import { writeFileSync, unlinkSync } from 'fs';
@@ -889,6 +897,10 @@ ${AUTH_BAR_HTML}
 <div class="market-grid" id="listings"></div>
 <div id="no-listings" class="empty-state" style="display:none;margin-bottom:16px">No active player listings right now.</div>
 
+<h2 style="font-size:14px;margin:20px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Stages <span id="stages-count" style="color:#6e7681">—</span></h2>
+<div class="market-grid" id="stages"></div>
+<div id="no-stages" class="empty-state" style="display:none;margin-bottom:16px">No stages listed right now.</div>
+
 <h2 style="font-size:14px;margin:20px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Unclaimed masters</h2>
 <div class="market-controls">
   <input type="search" id="q" placeholder="Search by name or author…">
@@ -930,13 +942,97 @@ async function refreshWallet() {
 }
 
 async function loadMarket() {
-  const [m, listings] = await Promise.all([
+  const [m, listings, stages, stageListings] = await Promise.all([
     fetch('/api/market?limit=500').then(r => r.json()),
     fetch('/api/market/listings?limit=200').then(r => r.json()),
+    fetch('/api/market/stages?limit=200').then(r => r.json()),
+    fetch('/api/market/stage-listings?limit=100').then(r => r.json()),
   ]);
   all = m;
   renderListings(listings);
+  renderStages(stages, stageListings);
   render();
+}
+
+function renderStages(pool, listings) {
+  const host = document.getElementById('stages');
+  const none = document.getElementById('no-stages');
+  const combined = [
+    ...listings.map(l => ({ ...l, id: l.stage_id, isListing: true })),
+    ...pool.map(s => ({ ...s, isListing: false })),
+  ];
+  document.getElementById('stages-count').textContent = combined.length ? '(' + combined.length + ')' : '';
+  if (!combined.length) { host.innerHTML = ''; none.style.display = ''; return; }
+  none.style.display = 'none';
+  const canBuy = !!(me && me.authenticated && !me.needs_username);
+  host.innerHTML = combined.map(s => {
+    const priceLabel = cents(s.price_cents);
+    const sellerLine = s.isListing
+      ? '<div class="author">from @' + esc(s.seller_username) + '</div>'
+      : '<div class="author">' + esc(s.author || 'unknown') + '</div>';
+    const isMe = canBuy && s.isListing && me.username === s.seller_username;
+    const buyLabel = s.isListing ? (isMe ? 'Your listing' : 'Buy') : 'Buy';
+    const buyOnClick = s.isListing ? 'buyStageListing' : 'buyStage';
+    return '<div class="market-card">' +
+      '<div class="body">' +
+        '<div class="name">' + esc(s.display_name || s.file_name) + '</div>' +
+        sellerLine +
+        '<div class="record">used ' + s.times_used + ' times</div>' +
+        '<div class="foot">' +
+          '<span class="price ' + (s.price_cents === 0 ? 'free' : '') + '">' + priceLabel + '</span>' +
+          (canBuy && !isMe
+            ? '<button onclick="' + buyOnClick + '(' + s.id + ', this)">' + buyLabel + '</button>'
+            : '<button disabled>' + (isMe ? buyLabel : 'Sign in') + '</button>') +
+        '</div>' +
+        '<div class="market-msg" id="smsg-' + s.id + '"></div>' +
+      '</div></div>';
+  }).join('');
+}
+
+async function buyStage(stageId, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  const msg = document.getElementById('smsg-' + stageId);
+  msg.className = 'market-msg';
+  const r = await fetch('/api/market/buy-stage', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ stage_id: stageId }),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    msg.className = 'market-msg ok';
+    msg.textContent = 'Home stage acquired · paid ' + cents(body.price_cents);
+    btn.closest('.market-card').classList.add('bought');
+    await refreshWallet();
+    loadMarket();
+  } else {
+    msg.className = 'market-msg err';
+    const extra = body.need != null ? ' (need ' + cents(body.need) + ', have ' + cents(body.have) + ')' : '';
+    msg.textContent = 'Failed: ' + (body.error || 'unknown') + extra;
+    btn.disabled = false; btn.textContent = 'Buy';
+  }
+}
+
+async function buyStageListing(stageId, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  const msg = document.getElementById('smsg-' + stageId);
+  msg.className = 'market-msg';
+  const r = await fetch('/api/market/buy-stage-listing', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ stage_id: stageId }),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    msg.className = 'market-msg ok';
+    msg.textContent = 'Home stage acquired · paid ' + cents(body.price_cents);
+    btn.closest('.market-card').classList.add('bought');
+    await refreshWallet();
+    loadMarket();
+  } else {
+    msg.className = 'market-msg err';
+    const extra = body.need != null ? ' (need ' + cents(body.need) + ', have ' + cents(body.have) + ')' : '';
+    msg.textContent = 'Failed: ' + (body.error || 'unknown') + extra;
+    btn.disabled = false; btn.textContent = 'Buy';
+  }
 }
 
 function renderListings(listings) {
@@ -1135,6 +1231,15 @@ const TEAM_HTML = `<!doctype html>
   .history-row .res-d { color: #8b949e; }
   .history-row .opp { color: #c9d1d9; }
   .history-row .rounds { color: #6e7681; text-align: right; font-variant-numeric: tabular-nums; }
+  .stage-card { padding: 12px 14px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+  .stage-card .stage-head { margin-bottom: 10px; }
+  .stage-card .stage-name { font-size: 15px; font-weight: 600; color: #c9d1d9; }
+  .stage-card .stage-meta { color: #8b949e; font-size: 11px; margin-top: 2px; }
+  .stage-card .stage-row { display: flex; gap: 10px; align-items: center; font-size: 13px; }
+  .stage-card .stage-row label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .stage-card .stage-row input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; padding: 6px 10px; border-radius: 4px; font-size: 12px; }
+  .stage-card .stage-row button { background: #238636; color: white; border: 1px solid #2ea043; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .stage-card .stage-row button:hover { background: #2ea043; }
   .empty-state { text-align: center; padding: 60px 20px; color: #8b949e; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
   .empty-state h2 { color: #c9d1d9; margin-top: 0; }
   .editor { max-width: 820px !important; }
@@ -1202,6 +1307,11 @@ ${AUTH_BAR_HTML}
   </div>
 
   <div class="roster-section">
+    <h2>Home stage</h2>
+    <div id="home-stage"></div>
+  </div>
+
+  <div class="roster-section">
     <h2>Import a character</h2>
     <div class="import-box">
       <div class="import-hint">Upload a MUGEN character .zip. Must have a single top-level folder (&lt;name&gt;/) containing &lt;name&gt;.def. Max 100 MB.</div>
@@ -1263,6 +1373,57 @@ async function loadTeam() {
 
   await loadSchedule();
   await loadWaitState();
+  await loadHomeStage();
+}
+
+async function loadHomeStage() {
+  const host = document.getElementById('home-stage');
+  if (!host) return;
+  const r = await fetch('/api/me/home-stage');
+  if (!r.ok) { host.innerHTML = ''; return; }
+  const s = await r.json();
+  if (!s) {
+    host.innerHTML = '<div class="roster-empty">You don\\'t own a stage. <a href="/market" style="color:#58a6ff">Browse the stage market →</a></div>';
+    return;
+  }
+  const listed = s.listing_price_cents != null;
+  host.innerHTML =
+    '<div class="stage-card">' +
+      '<div class="stage-head">' +
+        '<div class="stage-name">' + esc(s.display_name || s.file_name) + '</div>' +
+        '<div class="stage-meta">' + (s.author ? 'by ' + esc(s.author) + ' · ' : '') + 'used ' + s.times_used + ' times</div>' +
+      '</div>' +
+      (listed
+        ? '<div class="stage-row"><span>Listed at <b>' + fmtCents(s.listing_price_cents) + '</b></span>' +
+          '<button onclick="stageUnlist(' + s.id + ')">Unlist</button>' +
+          '<span class="msg" id="stage-msg"></span></div>'
+        : '<div class="stage-row"><label>List for</label>' +
+          '<input type="number" id="stage-price" min="0" step="1" value="0" style="max-width:120px">' +
+          '<span style="color:#8b949e;font-size:11px">cents</span>' +
+          '<button onclick="stageList(' + s.id + ')">List for sale</button>' +
+          '<span class="msg" id="stage-msg"></span></div>') +
+    '</div>';
+}
+
+async function stageList(id) {
+  const price = parseInt(document.getElementById('stage-price').value, 10);
+  const r = await fetch('/api/stage/' + id + '/list-for-sale', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ price_cents: price }),
+  });
+  const body = await r.json();
+  const msg = document.getElementById('stage-msg');
+  msg.className = 'msg ' + (r.ok ? 'ok' : 'err');
+  msg.textContent = r.ok ? 'listed' : (body.error || 'error');
+  if (r.ok) setTimeout(loadHomeStage, 400);
+}
+async function stageUnlist(id) {
+  const r = await fetch('/api/stage/' + id + '/unlist', { method: 'POST' });
+  const body = await r.json();
+  const msg = document.getElementById('stage-msg');
+  msg.className = 'msg ' + (r.ok ? 'ok' : 'err');
+  msg.textContent = r.ok ? 'unlisted' : (body.error || 'error');
+  if (r.ok) setTimeout(loadHomeStage, 400);
 }
 
 function fmtEta(seconds) {
@@ -2627,6 +2788,81 @@ const server = createServer((req, res) => {
     const db = getDb();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(teamSchedule(db, id)));
+    return;
+  }
+  // --- Stage market ---
+  if (req.url && req.url.match(/^\/api\/market\/stages(?:\?.*)?$/) && req.method === 'GET') {
+    const db = getDb();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(marketStageListings(db, { limit: 500 })));
+    return;
+  }
+  if (req.url && req.url.match(/^\/api\/market\/stage-listings(?:\?.*)?$/) && req.method === 'GET') {
+    const db = getDb();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(userStageListings(db, { limit: 200 })));
+    return;
+  }
+  if (req.url === '/api/me/home-stage' && req.method === 'GET') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const team = db.prepare('SELECT id FROM team WHERE user_id = ?').get(u.id);
+    if (!team) { res.writeHead(200); res.end('null'); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(getHomeStage(db, team.id)));
+    return;
+  }
+  if (req.url === '/api/market/buy-stage' && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    readJsonBody(req).then((data) => {
+      const stageId = Number(data.stage_id);
+      if (!Number.isInteger(stageId) || stageId <= 0) {
+        res.writeHead(400); res.end('{"error":"stage_id required"}'); return;
+      }
+      const result = buyUnclaimedStage(db, u.id, stageId);
+      const status = result.ok ? 200 : (result.error === 'insufficient_balance' ? 402 : 400);
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  if (req.url === '/api/market/buy-stage-listing' && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    readJsonBody(req).then((data) => {
+      const result = buyListedStage(db, u.id, Number(data.stage_id));
+      const status = result.ok ? 200 : (result.error === 'insufficient_balance' ? 402 : 400);
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const stageListMatch = req.url && req.url.match(/^\/api\/stage\/(\d+)\/list-for-sale$/);
+  if (stageListMatch && req.method === 'POST') {
+    const id = Number(stageListMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    readJsonBody(req).then((data) => {
+      const result = listStageForSale(db, u.id, id, Number(data.price_cents));
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const stageUnlistMatch = req.url && req.url.match(/^\/api\/stage\/(\d+)\/unlist$/);
+  if (stageUnlistMatch && req.method === 'POST') {
+    const id = Number(stageUnlistMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const result = unlistStage(db, u.id, id);
+    res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
     return;
   }
   const suggestMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/suggested-price$/);

@@ -272,6 +272,159 @@ export function buyListedFighter(db, buyerUserId, ownedFighterId) {
   return tx();
 }
 
+// ---------- Stages ----------
+
+/**
+ * Stage pricing uses times_used as the "matches played" analogue. First 2
+ * plays free, then 100 cents per additional play.
+ */
+export function priceForStage(stage) {
+  const used = Math.max(0, Number(stage.times_used) || 0);
+  const chargeable = Math.max(0, used - PRICE_FREE_THRESHOLD);
+  return chargeable * PRICE_PER_WIN_CENTS;
+}
+
+/** Unclaimed stages available for purchase. */
+export function marketStageListings(db, { limit = 100 } = {}) {
+  const rows = db.prepare(`
+    SELECT * FROM stage
+    WHERE active = 1 AND is_unique = 1 AND owner_team_id IS NULL
+    ORDER BY RANDOM() LIMIT ?
+  `).all(limit);
+  return rows.map((s) => ({
+    id: s.id,
+    file_name: s.file_name,
+    display_name: s.display_name,
+    author: s.author,
+    times_used: s.times_used,
+    price_cents: priceForStage(s),
+  }));
+}
+
+/** User-listed stages currently for sale. */
+export function userStageListings(db, { limit = 100 } = {}) {
+  return db.prepare(`
+    SELECT s.id AS stage_id, s.file_name, s.display_name, s.author, s.times_used,
+      s.listing_price_cents AS price_cents,
+      t.id AS team_id, t.name AS team_name,
+      u.id AS seller_user_id, u.username AS seller_username
+    FROM stage s
+    JOIN team t ON s.owner_team_id = t.id
+    JOIN user_account u ON t.user_id = u.id
+    WHERE s.active = 1 AND s.owner_team_id IS NOT NULL
+      AND s.listing_price_cents IS NOT NULL
+    ORDER BY s.listing_price_cents ASC LIMIT ?
+  `).all(limit);
+}
+
+/** Snapshot of the team's home stage (or null). */
+export function getHomeStage(db, teamId) {
+  return db.prepare(`
+    SELECT id, file_name, display_name, author, times_used, listing_price_cents
+    FROM stage WHERE owner_team_id = ? AND active = 1 LIMIT 1
+  `).get(teamId) || null;
+}
+
+/**
+ * Buy an unclaimed stage. Each team may own at most one — reject if they
+ * already have a home stage.
+ */
+export function buyUnclaimedStage(db, userId, stageId) {
+  if (!userId) return { error: 'not_signed_in' };
+  const tx = db.transaction(() => {
+    const team = db.prepare('SELECT id FROM team WHERE user_id = ?').get(userId);
+    if (!team) return { error: 'no_team' };
+    const existing = getHomeStage(db, team.id);
+    if (existing) return { error: 'already_own_stage', current: existing.file_name };
+    const stage = db.prepare(
+      'SELECT id, file_name, display_name, times_used, owner_team_id FROM stage WHERE id = ? AND active = 1 AND is_unique = 1'
+    ).get(stageId);
+    if (!stage) return { error: 'stage_not_available' };
+    if (stage.owner_team_id != null) return { error: 'stage_already_owned' };
+    const price = priceForStage(stage);
+    const { balance_cents } = db.prepare('SELECT balance_cents FROM user_account WHERE id = ?').get(userId);
+    if (balance_cents < price) return { error: 'insufficient_balance', need: price, have: balance_cents };
+    db.prepare('UPDATE stage SET owner_team_id = ? WHERE id = ?').run(team.id, stageId);
+    if (price > 0) credit(db, userId, -price, 'buy_stage', stageId);
+    return { ok: true, stage_id: stageId, price_cents: price };
+  });
+  return tx();
+}
+
+/** Owner lists their stage at an asking price. Doesn't remove it from home. */
+export function listStageForSale(db, userId, stageId, priceCents) {
+  const n = Number(priceCents);
+  if (!Number.isInteger(n) || n < MIN_LIST_PRICE_CENTS || n > MAX_LIST_PRICE_CENTS) {
+    return { error: 'bad_price', min: MIN_LIST_PRICE_CENTS, max: MAX_LIST_PRICE_CENTS };
+  }
+  const tx = db.transaction(() => {
+    const stage = db.prepare(`
+      SELECT s.id, s.owner_team_id, t.user_id
+      FROM stage s LEFT JOIN team t ON s.owner_team_id = t.id
+      WHERE s.id = ?
+    `).get(stageId);
+    if (!stage) return { error: 'stage_not_found' };
+    if (stage.user_id !== userId) return { error: 'not_your_stage' };
+    db.prepare('UPDATE stage SET listing_price_cents = ? WHERE id = ?').run(n, stageId);
+    return { ok: true, price_cents: n };
+  });
+  return tx();
+}
+
+/** Remove the for-sale flag; stage stays owned by the same team. */
+export function unlistStage(db, userId, stageId) {
+  const tx = db.transaction(() => {
+    const stage = db.prepare(`
+      SELECT s.id, s.owner_team_id, t.user_id
+      FROM stage s LEFT JOIN team t ON s.owner_team_id = t.id
+      WHERE s.id = ?
+    `).get(stageId);
+    if (!stage) return { error: 'stage_not_found' };
+    if (stage.user_id !== userId) return { error: 'not_your_stage' };
+    db.prepare('UPDATE stage SET listing_price_cents = NULL WHERE id = ?').run(stageId);
+    return { ok: true };
+  });
+  return tx();
+}
+
+/**
+ * P2P: buyer takes a listed stage off the seller, pays, becomes new owner.
+ * Buyer must not already own a stage. Listing price clears on sale.
+ */
+export function buyListedStage(db, buyerUserId, stageId) {
+  if (!buyerUserId) return { error: 'not_signed_in' };
+  const tx = db.transaction(() => {
+    const listing = db.prepare(`
+      SELECT s.id, s.owner_team_id, s.listing_price_cents, t.user_id AS seller_user_id
+      FROM stage s LEFT JOIN team t ON s.owner_team_id = t.id
+      WHERE s.id = ?
+    `).get(stageId);
+    if (!listing) return { error: 'not_found' };
+    if (listing.owner_team_id == null || listing.listing_price_cents == null) {
+      return { error: 'not_for_sale' };
+    }
+    if (listing.seller_user_id === buyerUserId) return { error: 'own_listing' };
+
+    const buyerTeam = db.prepare('SELECT id FROM team WHERE user_id = ?').get(buyerUserId);
+    if (!buyerTeam) return { error: 'no_team' };
+    const existing = getHomeStage(db, buyerTeam.id);
+    if (existing) return { error: 'already_own_stage', current: existing.file_name };
+
+    const price = listing.listing_price_cents;
+    const { balance_cents } = db.prepare('SELECT balance_cents FROM user_account WHERE id = ?').get(buyerUserId);
+    if (balance_cents < price) return { error: 'insufficient_balance', need: price, have: balance_cents };
+
+    db.prepare('UPDATE stage SET owner_team_id = ?, listing_price_cents = NULL WHERE id = ?')
+      .run(buyerTeam.id, stageId);
+    if (price > 0) {
+      credit(db, buyerUserId, -price, 'buy_stage_listing', stageId);
+      credit(db, listing.seller_user_id, price, 'sell_stage_listing', stageId);
+    }
+    return { ok: true, stage_id: stageId, price_cents: price };
+  });
+  return tx();
+}
+
 /**
  * All user-listed fighters currently for sale. Joined with master + seller
  * info so the market UI can render without extra fetches.
