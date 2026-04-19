@@ -55,7 +55,7 @@ function deactivateIfIdentifiable(db, errMsg) {
  * divisions: [{ name, teamIds: number[] }, ...]
  * legs: 1 (default) = single round-robin. 2 = double (home+away legs).
  */
-export function createSeason(db, { name, divisions, legs = 1 }) {
+export function createSeason(db, { name, divisions, legs = 1, promotePerTier = 3 }) {
   if (!Array.isArray(divisions) || divisions.length === 0) {
     throw new Error('Season requires at least one division');
   }
@@ -79,7 +79,7 @@ export function createSeason(db, { name, divisions, legs = 1 }) {
   }
 
   const insertLeague = db.prepare(
-    "INSERT INTO league (name, status, started_at) VALUES (?, 'running', datetime('now'))"
+    "INSERT INTO league (name, status, started_at, promote_per_tier) VALUES (?, 'running', datetime('now'), ?)"
   );
   const insertDivision = db.prepare(
     'INSERT INTO division (league_id, tier, name) VALUES (?, ?, ?)'
@@ -96,7 +96,7 @@ export function createSeason(db, { name, divisions, legs = 1 }) {
   `);
 
   const tx = db.transaction(() => {
-    const leagueId = insertLeague.run(name).lastInsertRowid;
+    const leagueId = insertLeague.run(name, promotePerTier).lastInsertRowid;
     for (let i = 0; i < divisions.length; i++) {
       const d = divisions[i];
       const divisionId = insertDivision.run(leagueId, i + 1, d.name).lastInsertRowid;
@@ -663,7 +663,7 @@ export function autoCreateSeason(db, {
 
   const name = seasonName
     || `Season ${new Date().toISOString().slice(0, 10)} #${Date.now().toString(36).slice(-4)}`;
-  const leagueId = createSeason(db, { name, divisions, legs });
+  const leagueId = createSeason(db, { name, divisions, legs, promotePerTier });
   return {
     leagueId,
     name,

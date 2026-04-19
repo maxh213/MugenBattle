@@ -693,8 +693,19 @@ const PYRAMID_HTML = `<!doctype html>
   .tier .hdr .tier-n { font-size: 20px; font-weight: 600; color: #c9d1d9; font-variant-numeric: tabular-nums; }
   .tier.t1 .hdr .tier-n { color: #f0ae3c; }
   .tier .rows { display: grid; gap: 4px; }
-  .prow { display: grid; grid-template-columns: 30px 2.4fr 50px 50px 50px 70px 60px; gap: 8px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; align-items: center; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .prow { display: grid; grid-template-columns: 30px 2.4fr 50px 50px 50px 70px 60px; gap: 8px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; align-items: center; font-size: 13px; font-variant-numeric: tabular-nums; position: relative; }
+  .prow.promote { border-left: 3px solid #3fb950; background: linear-gradient(90deg, rgba(63,185,80,0.10) 0%, #161b22 40%); }
+  .prow.relegate { border-left: 3px solid #f85149; background: linear-gradient(90deg, rgba(248,81,73,0.10) 0%, #161b22 40%); }
+  .prow.drop { border-left: 3px solid #f0ae3c; background: linear-gradient(90deg, rgba(240,174,60,0.12) 0%, #161b22 40%); }
   .prow.mine { border-color: #58a6ff; background: #1d2a3e; }
+  .prow .zone-tag { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; padding: 2px 6px; border-radius: 4px; opacity: 0; pointer-events: none; }
+  .prow.promote .zone-tag { opacity: 0; }
+  .zone-key { display: flex; gap: 14px; padding: 10px 14px; background: #0d1117; border-radius: 8px; margin-bottom: 10px; font-size: 11px; }
+  .zone-key .k { display: flex; align-items: center; gap: 6px; color: #8b949e; }
+  .zone-key .swatch { width: 10px; height: 10px; border-radius: 2px; }
+  .zone-key .swatch.promote { background: #3fb950; }
+  .zone-key .swatch.relegate { background: #f85149; }
+  .zone-key .swatch.drop { background: #f0ae3c; }
   .prow .pos { color: #6e7681; }
   .prow.pos-1 .pos { color: #f0ae3c; font-weight: 600; }
   .prow .tname { font-weight: 600; color: #c9d1d9; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -744,16 +755,25 @@ async function load() {
     root.innerHTML = '<div class="empty-state"><h2>No leagues yet</h2><p>Run <code>mugenbattle league create</code> to start one.</p></div>';
     return;
   }
+  const K = data.league.promote_per_tier || 3;
+  const divCount = data.divisions.length;
   const statusCls = data.league.status;
   const header =
     '<div class="league-hdr">' +
       '<span class="name">' + esc(data.league.name) + '</span>' +
       '<span class="status ' + statusCls + '">' + statusCls + '</span>' +
       (data.pending > 0 ? '<span class="pending">' + data.pending + ' fixtures pending</span>' : '') +
+    '</div>' +
+    '<div class="zone-key">' +
+      '<div class="k"><span class="swatch promote"></span>Promotion (top ' + K + ')</div>' +
+      '<div class="k"><span class="swatch relegate"></span>Relegation (bottom ' + K + ')</div>' +
+      '<div class="k"><span class="swatch drop"></span>Drop &amp; sit out (bottom ' + K + ' of bottom tier)</div>' +
     '</div>';
 
   const tiers = data.divisions.map((d, i) => {
+    const n = d.standings.length;
     const rowsHtml = d.standings.map((s, idx) => {
+      const pos = idx + 1;
       const diff = s.matches_won - s.matches_lost;
       const diffCls = diff > 0 ? 'pos' : diff < 0 ? 'neg' : '';
       const isMine = data.viewer_team_id === s.team_id;
@@ -762,8 +782,21 @@ async function load() {
         : s.username && s.username.startsWith('bot_')
           ? '<span class="badge bot">bot</span>'
           : '';
-      return '<div class="prow' + (isMine ? ' mine' : '') + ' pos-' + (idx + 1) + '">' +
-        '<div class="pos">' + (idx + 1) + '</div>' +
+      // Zone classification:
+      //   top K of tiers 2..N → promote (nowhere to go above tier 1)
+      //   bottom K of tiers 1..(N-1) → relegate
+      //   bottom K of tier N → drop (sit out one season)
+      let zone = '';
+      if (pos <= K && d.tier > 1) zone = 'promote';
+      else if (pos > n - K && d.tier < divCount) zone = 'relegate';
+      else if (pos > n - K && d.tier === divCount) zone = 'drop';
+
+      const classes = ['prow'];
+      if (isMine) classes.push('mine');
+      if (zone) classes.push(zone);
+
+      return '<div class="' + classes.join(' ') + '">' +
+        '<div class="pos">' + pos + '</div>' +
         '<div class="tname"><a href="/team/' + s.team_id + '" style="color:inherit;text-decoration:none">' + esc(s.team_name) + '</a>' + badge +
           '<span class="user">@' + esc(s.username) + '</span>' +
         '</div>' +
