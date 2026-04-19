@@ -13,7 +13,8 @@
 import { pickNextFixture, runFixture } from './leagues.js';
 
 /**
- * Run all remaining fixtures for leagueId in sequence.
+ * Run all remaining fixtures for leagueId (optionally scoped to a single
+ * division) in sequence.
  *
  * @param {object}   db          better-sqlite3 handle.
  * @param {number}   leagueId    which league this worker owns.
@@ -24,10 +25,12 @@ import { pickNextFixture, runFixture } from './leagues.js';
  * @param {Function}[hooks.onError]        (fixture, err) => boolean | Promise<boolean>
  *                                          return true to stop, false to continue past the error.
  * @param {Function}[hooks.shouldStop]     () => boolean — polled between fixtures.
+ * @param {object}  [opts]
+ * @param {number}  [opts.divisionId] scope to a single division of the league
  *
  * @returns {Promise<{fixturesRun: number, stopped: boolean}>}
  */
-export async function runLeagueWorker(db, leagueId, ctx = {}, hooks = {}) {
+export async function runLeagueWorker(db, leagueId, ctx = {}, hooks = {}, opts = {}) {
   let fixturesRun = 0;
 
   for (;;) {
@@ -35,7 +38,7 @@ export async function runLeagueWorker(db, leagueId, ctx = {}, hooks = {}) {
       return { fixturesRun, stopped: true };
     }
 
-    const next = pickNextFixture(db, { leagueId });
+    const next = pickNextFixture(db, { leagueId, divisionId: opts.divisionId });
     if (!next) {
       // No pending fixtures — either the league is complete or every
       // remaining fixture is already running/done (e.g. another worker

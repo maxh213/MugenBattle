@@ -49,6 +49,7 @@ export class StreamWorker {
 
     this.status = 'pending';
     this.leagueId = null;
+    this.divisionId = null;
     this.currentFixtureId = null;
     this.runPromise = null;
     this.lastError = null;
@@ -159,14 +160,17 @@ export class StreamWorker {
   }
 
   /**
-   * Assign a league and begin running its fixtures. Returns the promise; it
-   * resolves when the league has no more pending fixtures.
+   * Assign a league (optionally scoped to a single division) and begin
+   * running its fixtures. Returns the promise; resolves when nothing is
+   * pending for this scope. With a divisionId, N workers can run the same
+   * league's N tiers in parallel without racing for fixtures.
    */
-  assignLeague(db, leagueId) {
+  assignLeague(db, leagueId, divisionId = null) {
     if (this.status !== 'idle') {
       throw new Error(`StreamWorker ${this.workerId}: can't assign in status=${this.status}`);
     }
     this.leagueId = leagueId;
+    this.divisionId = divisionId;
     this.status = 'running';
     this.lastError = null;
     const ctx = { logPath: this.logPath, display: this.display };
@@ -180,7 +184,7 @@ export class StreamWorker {
         // Try to continue past the error; if another one hits we'll stop.
         return false;
       },
-    }).catch((err) => {
+    }, { divisionId }).catch((err) => {
       this.lastError = err.message;
       console.error(`[worker ${this.workerId}] runLeagueWorker threw: ${err.message}`);
       return { fixturesRun: 0, stopped: true };
@@ -188,6 +192,7 @@ export class StreamWorker {
       this.currentFixtureId = null;
       this.runPromise = null;
       this.leagueId = null;
+      this.divisionId = null;
       if (this.status === 'running') this.status = 'idle';
     });
 
@@ -214,6 +219,7 @@ export class StreamWorker {
       display: this.display,
       status: this.status,
       leagueId: this.leagueId,
+      divisionId: this.divisionId,
       currentFixtureId: this.currentFixtureId,
       clients: this.clients.size,
       lastError: this.lastError,

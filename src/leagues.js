@@ -156,19 +156,20 @@ export function roundRobinFixtures(teamIds, { legs = 1 } = {}) {
   return [...firstLeg, ...secondLeg];
 }
 
-/** Oldest pending fixture across all running leagues, top division first. */
-export function pickNextFixture(db, { leagueId } = {}) {
-  const base = `
+/** Oldest pending fixture. Can be scoped by leagueId, divisionId, or both. */
+export function pickNextFixture(db, { leagueId, divisionId } = {}) {
+  const clauses = ["f.status = 'pending'", "l.status = 'running'"];
+  const params = [];
+  if (leagueId != null) { clauses.push('l.id = ?'); params.push(leagueId); }
+  if (divisionId != null) { clauses.push('f.division_id = ?'); params.push(divisionId); }
+  return db.prepare(`
     SELECT f.*
     FROM fixture f
     JOIN division d ON f.division_id = d.id
     JOIN league l ON d.league_id = l.id
-    WHERE f.status = 'pending' AND l.status = 'running'
-  `;
-  if (leagueId != null) {
-    return db.prepare(`${base} AND l.id = ? ORDER BY d.tier, f.round_num, f.slot_num, f.id LIMIT 1`).get(leagueId);
-  }
-  return db.prepare(`${base} ORDER BY d.tier, f.round_num, f.slot_num, f.id LIMIT 1`).get();
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY d.tier, f.round_num, f.slot_num, f.id LIMIT 1
+  `).get(...params);
 }
 
 export async function runFixture(db, fixtureId, ctx) {
@@ -457,13 +458,18 @@ function sortByHeadToHead(db, group) {
 
 /**
  * Rich snapshot of what's currently playing for a worker driving this league.
- * Returns null if the league has no in-progress fixture right now. Used by
+ * With a divisionId, scoped to just that tier — needed when multiple workers
+ * run different divisions of the same league in parallel.
+ * Returns null if the league has no in-progress fixture in-scope. Used by
  * the /leagues dashboard to overlay team names, slot progress, stage etc.
  */
-export function getLiveLeagueContext(db, leagueId) {
+export function getLiveLeagueContext(db, leagueId, divisionId = null) {
   const league = db.prepare('SELECT id, name, status FROM league WHERE id = ?').get(leagueId);
   if (!league) return null;
 
+  const clauses = ["d.league_id = ?", "f.status = 'running'"];
+  const params = [leagueId];
+  if (divisionId != null) { clauses.push('f.division_id = ?'); params.push(divisionId); }
   const fixture = db.prepare(`
     SELECT f.*,
       h.name AS home_name, a.name AS away_name,
@@ -474,9 +480,9 @@ export function getLiveLeagueContext(db, leagueId) {
     JOIN team h ON f.home_team_id = h.id
     JOIN team a ON f.away_team_id = a.id
     LEFT JOIN stage s ON f.stage_id = s.id
-    WHERE d.league_id = ? AND f.status = 'running'
+    WHERE ${clauses.join(' AND ')}
     ORDER BY f.id LIMIT 1
-  `).get(leagueId);
+  `).get(...params);
 
   if (!fixture) return { league, fixture: null };
 

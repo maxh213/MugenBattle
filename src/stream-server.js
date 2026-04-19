@@ -141,8 +141,9 @@ async function bootWorkers() {
 function startSupervisor() {
   setInterval(() => {
     const db = getDb();
-    const claimed = new Set(
-      Array.from(workers.values()).map((w) => w.leagueId).filter((x) => x != null)
+    // Track claimed divisions — each worker runs one division of one league.
+    const claimedDivs = new Set(
+      Array.from(workers.values()).map((w) => w.divisionId).filter((x) => x != null)
     );
     let leagues = db.prepare(`
       SELECT id FROM league WHERE status = 'running' ORDER BY id
@@ -168,13 +169,29 @@ function startSupervisor() {
       }
     }
 
+    // Build candidate (leagueId, divisionId) assignments: every division of
+    // every running league that still has a pending fixture and isn't
+    // already claimed by a worker.
+    const candidates = [];
+    for (const l of leagues) {
+      const divs = db.prepare(`
+        SELECT d.id AS division_id
+        FROM division d
+        WHERE d.league_id = ?
+          AND EXISTS (SELECT 1 FROM fixture f WHERE f.division_id = d.id AND f.status = 'pending')
+        ORDER BY d.tier
+      `).all(l.id);
+      for (const d of divs) {
+        if (!claimedDivs.has(d.division_id)) candidates.push({ leagueId: l.id, divisionId: d.division_id });
+      }
+    }
+
     for (const w of workers.values()) {
       if (w.status !== 'idle') continue;
-      const next = leagues.find((l) => !claimed.has(l.id));
+      const next = candidates.shift();
       if (!next) break;
-      claimed.add(next.id);
-      console.log(`[supervisor] assigning league ${next.id} → worker ${w.workerId}`);
-      w.assignLeague(db, next.id);
+      console.log(`[supervisor] league ${next.leagueId} div ${next.divisionId} → worker ${w.workerId}`);
+      w.assignLeague(db, next.leagueId, next.divisionId);
     }
   }, SUPERVISOR_POLL_MS);
 }
@@ -1670,6 +1687,48 @@ function chipFor(slotRow, idx, cur) {
   const label = slotRow.winner === 'home' ? 'H' : slotRow.winner === 'away' ? 'A' : '·';
   return '<span class="chip ' + cls + '">' + label + '</span>';
 }
+function overlayHtml(w) {
+  const ctx = w.context;
+  if (!ctx || !ctx.fixture) {
+    const msg = ctx && ctx.league
+      ? 'Between fixtures (' + esc(ctx.league.name) + ')'
+      : w.status === 'idle' ? 'Waiting for a league…' : 'Starting up…';
+    return (
+      '<div class="hdr"><span class="wid">Worker #' + w.workerId + ' · ' + esc(w.display) + '</span></div>' +
+      '<div class="meta">' + esc(msg) + '</div>'
+    );
+  }
+  const f = ctx.fixture;
+  const chips = [];
+  for (let i = 1; i <= 5; i++) {
+    const row = f.slots.find(s => s.slot === i);
+    chips.push(chipFor(row, i, f.current_slot));
+  }
+  return (
+    '<div class="hdr">' +
+      '<span class="lname">' + esc(ctx.league.name) + '</span>' +
+      '<span class="tier">Tier ' + f.division.tier + ' · ' + esc(f.division.name) + '</span>' +
+    '</div>' +
+    '<div class="matchup">' +
+      esc(f.home_team) +
+      '<span class="score">' + f.home_score + ' – ' + f.away_score + '</span>' +
+      esc(f.away_team) +
+    '</div>' +
+    '<div class="meta">' +
+      '<span>R' + f.round + '.' + f.slot_num + '</span>' +
+      (f.stage ? '<span>Stage: ' + esc(f.stage) + '</span>' : '') +
+      '<span class="wid">Worker #' + w.workerId + '</span>' +
+    '</div>' +
+    '<div class="slots">' + chips.join('') + '</div>'
+  );
+}
+
+/**
+ * Tiles are built ONCE per worker and preserved across ticks — only the
+ * overlay DIV's innerHTML updates on each poll. Rebuilding the <img> tag
+ * every tick would force the browser to reconnect to the MJPEG stream and
+ * flicker to black between frames.
+ */
 function render(workers) {
   const root = document.getElementById('workers');
   if (!workers.length) {
@@ -1678,48 +1737,24 @@ function render(workers) {
   }
   const running = workers.filter(w => w.status !== 'stopped');
   root.className = 'workers';
-  root.innerHTML = running.map(w => {
-    const ctx = w.context;
-    const streamHtml = '<div class="stream"><img src="/stream/' + w.workerId + '?t=' + Date.now() + '"></div>';
-    if (!ctx || !ctx.fixture) {
-      const msg = ctx && ctx.league
-        ? 'Between fixtures (' + esc(ctx.league.name) + ')'
-        : w.status === 'idle' ? 'Waiting for a league…' : 'Starting up…';
-      return (
-        '<div class="worker">' + streamHtml +
-        '<div class="overlay">' +
-          '<div class="hdr"><span class="wid">Worker #' + w.workerId + ' · ' + esc(w.display) + '</span></div>' +
-          '<div class="meta">' + esc(msg) + '</div>' +
-        '</div></div>'
-      );
+  for (const w of running) {
+    let tile = document.getElementById('tile-' + w.workerId);
+    if (!tile) {
+      tile = document.createElement('div');
+      tile.id = 'tile-' + w.workerId;
+      tile.className = 'worker';
+      tile.innerHTML =
+        '<div class="stream"><img src="/stream/' + w.workerId + '" alt=""></div>' +
+        '<div class="overlay" id="overlay-' + w.workerId + '"></div>';
+      root.appendChild(tile);
     }
-    const f = ctx.fixture;
-    const chips = [];
-    for (let i = 1; i <= 5; i++) {
-      const row = f.slots.find(s => s.slot === i);
-      chips.push(chipFor(row, i, f.current_slot));
-    }
-    return (
-      '<div class="worker">' + streamHtml +
-      '<div class="overlay">' +
-        '<div class="hdr">' +
-          '<span class="lname">' + esc(ctx.league.name) + '</span>' +
-          '<span class="tier">Tier ' + f.division.tier + ' · ' + esc(f.division.name) + '</span>' +
-        '</div>' +
-        '<div class="matchup">' +
-          esc(f.home_team) +
-          '<span class="score">' + f.home_score + ' – ' + f.away_score + '</span>' +
-          esc(f.away_team) +
-        '</div>' +
-        '<div class="meta">' +
-          '<span>R' + f.round + '.' + f.slot_num + '</span>' +
-          (f.stage ? '<span>Stage: ' + esc(f.stage) + '</span>' : '') +
-          '<span class="wid">Worker #' + w.workerId + '</span>' +
-        '</div>' +
-        '<div class="slots">' + chips.join('') + '</div>' +
-      '</div></div>'
-    );
-  }).join('');
+    document.getElementById('overlay-' + w.workerId).innerHTML = overlayHtml(w);
+  }
+  // Drop tiles for workers that disappeared.
+  const ids = new Set(running.map(w => 'tile-' + w.workerId));
+  for (const tile of Array.from(root.children)) {
+    if (tile.id && !ids.has(tile.id)) tile.remove();
+  }
 }
 async function tick() {
   try {
@@ -2192,7 +2227,7 @@ const server = createServer((req, res) => {
     const db = getDb();
     const data = Array.from(workers.values()).map((w) => {
       const base = w.describe();
-      const ctx = w.leagueId ? getLiveLeagueContext(db, w.leagueId) : null;
+      const ctx = w.leagueId ? getLiveLeagueContext(db, w.leagueId, w.divisionId) : null;
       return { ...base, context: ctx };
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
