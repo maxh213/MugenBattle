@@ -88,6 +88,13 @@ export function setLineup(db, teamId, body) {
   const bench = Array.isArray(body.bench) ? body.bench.map(Number) : [];
   const priority = body.priority && typeof body.priority === 'object' ? body.priority : {};
   const autoRotate = body.auto_rotate ? 1 : 0;
+  let rotationThreshold = body.rotation_threshold;
+  if (rotationThreshold != null) {
+    rotationThreshold = Number(rotationThreshold);
+    if (!Number.isFinite(rotationThreshold) || rotationThreshold < 0 || rotationThreshold > 1) {
+      return { status: 400, body: { error: 'rotation_threshold must be between 0.0 and 1.0' } };
+    }
+  }
 
   if (active.length !== 5) {
     return { status: 400, body: { error: 'Lineup must have exactly 5 active fighters' } };
@@ -114,7 +121,12 @@ export function setLineup(db, teamId, body) {
   }
 
   const tx = db.transaction(() => {
-    db.prepare('UPDATE team SET auto_rotate = ? WHERE id = ?').run(autoRotate, teamId);
+    if (rotationThreshold != null) {
+      db.prepare('UPDATE team SET auto_rotate = ?, rotation_threshold = ? WHERE id = ?')
+        .run(autoRotate, rotationThreshold, teamId);
+    } else {
+      db.prepare('UPDATE team SET auto_rotate = ? WHERE id = ?').run(autoRotate, teamId);
+    }
     const setActive = db.prepare(
       "UPDATE owned_fighter SET slot = 'active', priority = ? WHERE id = ? AND team_id = ?"
     );
@@ -138,24 +150,25 @@ export function setLineup(db, teamId, body) {
  * Returns null if the team can't field 5 eligible fighters.
  */
 export function selectLineup(db, teamId) {
-  const team = db.prepare('SELECT auto_rotate FROM team WHERE id = ?').get(teamId);
+  const team = db.prepare('SELECT auto_rotate, rotation_threshold FROM team WHERE id = ?').get(teamId);
   if (!team) return null;
   const actives = db
-    .prepare("SELECT * FROM owned_fighter WHERE team_id = ? AND slot = 'active' ORDER BY priority, id")
+    .prepare("SELECT * FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'active' ORDER BY priority, id")
     .all(teamId);
   if (actives.length < 5) return null;
 
   if (!team.auto_rotate) return actives.slice(0, 5);
 
+  const threshold = team.rotation_threshold != null ? team.rotation_threshold : LOW_STAMINA_ROTATION_THRESHOLD;
   const enriched = actives.map((f) => ({ ...f, eff: readEffectiveStamina(db, f.id) }));
-  const tired = enriched.filter((f) => f.eff < LOW_STAMINA_ROTATION_THRESHOLD);
+  const tired = enriched.filter((f) => f.eff < threshold);
   if (tired.length === 0) return enriched.slice(0, 5);
 
   const bench = db
-    .prepare("SELECT * FROM owned_fighter WHERE team_id = ? AND slot = 'bench'")
+    .prepare("SELECT * FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'bench'")
     .all(teamId)
     .map((f) => ({ ...f, eff: readEffectiveStamina(db, f.id) }))
-    .filter((f) => f.eff >= LOW_STAMINA_ROTATION_THRESHOLD)
+    .filter((f) => f.eff >= threshold)
     .sort((a, b) => b.eff - a.eff);
 
   const finalLineup = [...enriched];

@@ -885,6 +885,9 @@ const MARKET_HTML = `<!doctype html>
   .market-card button:hover { background: #2ea043; }
   .market-card button:disabled { background: #21262d; border-color: #30363d; color: #6e7681; cursor: not-allowed; }
   .market-card.bought { opacity: 0.5; pointer-events: none; }
+  .market-card.stage-card-market { flex-direction: column; padding: 0; overflow: hidden; gap: 0; }
+  .market-card.stage-card-market .stage-preview { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #0d1117; border-bottom: 1px solid #30363d; display: block; image-rendering: pixelated; }
+  .market-card.stage-card-market .body { padding: 10px 12px; }
   .market-msg { font-size: 11px; margin-top: 4px; }
   .market-msg.ok { color: #3fb950; }
   .market-msg.err { color: #f85149; }
@@ -992,7 +995,9 @@ function renderStages(pool, listings) {
     const isMe = canBuy && s.isListing && me.username === s.seller_username;
     const buyLabel = s.isListing ? (isMe ? 'Your listing' : 'Buy') : 'Buy';
     const buyOnClick = s.isListing ? 'buyStageListing' : 'buyStage';
-    return '<div class="market-card">' +
+    const preview = '<img class="stage-preview" src="/stage-preview/' + encodeURIComponent(s.file_name) + '.png" alt="" onerror="this.style.display=\\'none\\'">';
+    return '<div class="market-card stage-card-market">' +
+      preview +
       '<div class="body">' +
         '<div class="name">' + esc(s.display_name || s.file_name) + '</div>' +
         sellerLine +
@@ -1193,11 +1198,18 @@ const TEAM_HTML = `<!doctype html>
   .wallet-row .market-link { margin-left: auto; background: transparent; color: #58a6ff; border: 1px solid #58a6ff; padding: 6px 14px; border-radius: 6px; font-size: 13px; text-decoration: none; }
   .wallet-row .market-link:hover { background: #58a6ff; color: #0d1117; }
   .team-header { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; padding: 14px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
-  .rotate-row { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 14px; }
+  .rotate-panel { padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 14px; }
+  .rotate-row { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
   .rotate-row .rotate-label { display: flex; gap: 8px; align-items: center; font-size: 13px; color: #c9d1d9; cursor: pointer; font-weight: 600; }
   .rotate-row .rotate-label input { width: 16px; height: 16px; cursor: pointer; }
-  .rotate-row .rotate-hint { color: #8b949e; font-size: 11px; line-height: 1.45; }
-  .rotate-row .rotate-hint b { color: #c9d1d9; font-variant-numeric: tabular-nums; }
+  .rotate-config { margin-top: 12px; padding-top: 12px; border-top: 1px solid #21262d; }
+  .rotate-config.disabled { opacity: 0.4; pointer-events: none; }
+  .rotate-slider-row { display: grid; grid-template-columns: auto 1fr 60px; gap: 12px; align-items: center; margin-bottom: 8px; }
+  .rotate-slider-row label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .rotate-slider-row input[type=range] { accent-color: #58a6ff; }
+  .rotate-threshold-val { text-align: right; color: #f0ae3c; font-weight: 600; font-variant-numeric: tabular-nums; font-size: 15px; }
+  .rotate-hint { color: #8b949e; font-size: 11px; line-height: 1.5; }
+  .rotate-hint b { color: #c9d1d9; font-variant-numeric: tabular-nums; }
   .team-header label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
   .team-header input { flex: 1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 16px; font-weight: 600; }
   .team-header button { background:#238636; color:white; border:1px solid #2ea043; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
@@ -1318,13 +1330,28 @@ ${AUTH_BAR_HTML}
     <span class="msg" id="team-name-msg"></span>
   </div>
 
-  <div class="rotate-row">
-    <label class="rotate-label">
-      <input type="checkbox" id="auto-rotate" onchange="saveAutoRotate()">
-      <span>Auto-rotate tired fighters</span>
-    </label>
-    <div class="rotate-hint">When on, a fighter whose stamina drops below <b>0.30</b> (scale 0–1) gets swapped for the rested bench fighter with the highest stamina before each fixture. Stamina drops <b>0.20</b> per match played and recovers <b>0.10 per hour</b>. Turn off if you want a fixed lineup regardless of fatigue.</div>
-    <span class="msg" id="rotate-msg"></span>
+  <div class="rotate-panel">
+    <div class="rotate-row">
+      <label class="rotate-label">
+        <input type="checkbox" id="auto-rotate" onchange="saveRotation()">
+        <span>Auto-rotate tired fighters</span>
+      </label>
+      <span class="msg" id="rotate-msg"></span>
+    </div>
+    <div class="rotate-config" id="rotate-config">
+      <div class="rotate-slider-row">
+        <label for="rotate-threshold">Swap when stamina drops below</label>
+        <input type="range" id="rotate-threshold" min="0" max="1" step="0.05" value="0.30" oninput="updateThresholdLabel()" onchange="saveRotation()">
+        <span class="rotate-threshold-val" id="rotate-threshold-val">0.30</span>
+      </div>
+      <div class="rotate-hint">
+        Threshold <b>0.00</b> = never swap (equivalent to turning auto-rotate off).
+        <b>1.00</b> = always prefer the freshest bench fighter.
+        <b>0.30</b> (default) kicks in when a fighter is roughly one match away from empty.
+        <br>
+        Stamina drops <b>0.20</b> per match played and recovers <b>0.10 per hour</b> of rest.
+      </div>
+    </div>
   </div>
 
   <div class="roster-section">
@@ -1573,6 +1600,12 @@ function renderTeam() {
   document.getElementById('team-name').value = t.name || '';
   const ar = document.getElementById('auto-rotate');
   if (ar) ar.checked = !!t.auto_rotate;
+  const slider = document.getElementById('rotate-threshold');
+  if (slider) {
+    slider.value = (t.rotation_threshold != null ? t.rotation_threshold : 0.30).toFixed(2);
+    updateThresholdLabel();
+    document.getElementById('rotate-config').classList.toggle('disabled', !t.auto_rotate);
+  }
   const active = t.fighters.filter(f => f.slot === 'active').sort((a,b) => a.priority - b.priority || a.id - b.id);
   const bench  = t.fighters.filter(f => f.slot === 'bench' ).sort((a,b) => a.id - b.id);
   const forSale = t.fighters.filter(f => f.slot === 'for_sale').sort((a,b) => a.id - b.id);
@@ -1584,12 +1617,18 @@ function renderTeam() {
   }
 }
 
-async function saveAutoRotate() {
-  const val = document.getElementById('auto-rotate').checked;
+function updateThresholdLabel() {
+  const slider = document.getElementById('rotate-threshold');
+  if (!slider) return;
+  document.getElementById('rotate-threshold-val').textContent = Number(slider.value).toFixed(2);
+}
+
+async function saveRotation() {
+  const on = document.getElementById('auto-rotate').checked;
+  const threshold = Number(document.getElementById('rotate-threshold').value);
+  document.getElementById('rotate-config').classList.toggle('disabled', !on);
   const msg = document.getElementById('rotate-msg');
   msg.className = 'msg'; msg.textContent = 'saving…';
-  // The existing /api/team/:id/lineup endpoint accepts auto_rotate alongside
-  // the full lineup — we just resend the current lineup with the new flag.
   const active = currentTeam.fighters.filter(f => f.slot === 'active')
     .sort((a, b) => a.priority - b.priority || a.id - b.id).map(f => f.id);
   const bench = currentTeam.fighters.filter(f => f.slot === 'bench')
@@ -1598,11 +1637,13 @@ async function saveAutoRotate() {
   active.forEach((id, i) => (priority[id] = i));
   const r = await fetch('/api/team/' + currentTeam.id + '/lineup', {
     method: 'PUT', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ active, bench, priority, auto_rotate: val }),
+    body: JSON.stringify({ active, bench, priority, auto_rotate: on, rotation_threshold: threshold }),
   });
   if (r.ok) {
-    currentTeam.auto_rotate = val ? 1 : 0;
-    msg.className = 'msg ok'; msg.textContent = val ? 'auto-rotate on' : 'auto-rotate off';
+    currentTeam.auto_rotate = on ? 1 : 0;
+    currentTeam.rotation_threshold = threshold;
+    msg.className = 'msg ok';
+    msg.textContent = on ? 'rotate @ ' + threshold.toFixed(2) : 'auto-rotate off';
   } else {
     const body = await r.json().catch(() => ({}));
     msg.className = 'msg err'; msg.textContent = body.error || 'error';
@@ -3097,6 +3138,18 @@ const server = createServer((req, res) => {
     }
     const png = join(CHARS_DIR, name, 'portrait.png');
     if (!existsSync(png)) { res.writeHead(404); res.end('no portrait'); return; }
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=3600' });
+    createReadStream(png).pipe(res);
+    return;
+  }
+  const stagePrevMatch = req.url && req.url.match(/^\/stage-preview\/([^/]+)\.png$/);
+  if (stagePrevMatch) {
+    const name = decodeURIComponent(stagePrevMatch[1]);
+    if (/[/\\..]/.test(name) || name.includes('..')) {
+      res.writeHead(400); res.end('bad name'); return;
+    }
+    const png = join(ROOT, 'engine', 'stage-previews', `${name}.png`);
+    if (!existsSync(png)) { res.writeHead(404); res.end('no preview'); return; }
     res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=3600' });
     createReadStream(png).pipe(res);
     return;
