@@ -68,7 +68,7 @@ export function getTeamForUser(db, userId) {
         f.author AS master_author
       FROM owned_fighter of
       JOIN fighter f ON of.master_fighter_id = f.id
-      WHERE of.team_id = ?
+      WHERE of.team_id = ? AND of.is_retired = 0
       ORDER BY of.slot, of.priority, of.id
     `)
     .all(team.id);
@@ -177,7 +177,7 @@ export function getTeamById(db, teamId) {
         f.author AS master_author
       FROM owned_fighter of
       JOIN fighter f ON of.master_fighter_id = f.id
-      WHERE of.team_id = ?
+      WHERE of.team_id = ? AND of.is_retired = 0
       ORDER BY of.slot, of.priority, of.id
     `)
     .all(teamId);
