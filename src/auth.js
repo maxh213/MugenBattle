@@ -150,24 +150,52 @@ export function verifyCode(db, email, code) {
 
   db.prepare('UPDATE auth_code SET used = 1 WHERE id = ?').run(row.id);
 
-  let user = db.prepare('SELECT id, email, display_name FROM user_account WHERE email = ?').get(email);
+  let user = db.prepare('SELECT id, email, username FROM user_account WHERE email = ?').get(email);
   if (!user) {
     const r = db.prepare('INSERT INTO user_account (email) VALUES (?)').run(email);
-    user = { id: r.lastInsertRowid, email, display_name: null };
+    user = { id: r.lastInsertRowid, email, username: null };
   }
 
   return {
     status: 200,
-    body: { ok: true, user: { email: user.email, display_name: user.display_name } },
+    body: {
+      ok: true,
+      user: { username: user.username },
+      needs_username: !user.username,
+    },
     cookie: makeSessionCookie(user.id),
   };
+}
+
+export function setUsername(db, userId, username) {
+  username = (username || '').trim();
+  // 3-20 chars, alphanumeric + underscore
+  if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) {
+    return { status: 400, body: { error: 'Username must be 3–20 characters, letters/numbers/underscore only' } };
+  }
+  // Case-insensitive uniqueness (index enforces, but give a nicer error)
+  const clash = db
+    .prepare('SELECT id FROM user_account WHERE lower(username) = lower(?) AND id != ?')
+    .get(username, userId);
+  if (clash) {
+    return { status: 409, body: { error: 'That username is taken' } };
+  }
+  try {
+    db.prepare('UPDATE user_account SET username = ? WHERE id = ?').run(username, userId);
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) {
+      return { status: 409, body: { error: 'That username is taken' } };
+    }
+    throw e;
+  }
+  return { status: 200, body: { ok: true, username } };
 }
 
 export function currentUser(db, req) {
   const raw = parseCookies(req.headers.cookie || '')['mb_session'];
   const sess = verifySessionCookie(raw);
   if (!sess) return null;
-  return db.prepare('SELECT id, email, display_name FROM user_account WHERE id = ?').get(sess.userId) || null;
+  return db.prepare('SELECT id, email, username FROM user_account WHERE id = ?').get(sess.userId) || null;
 }
 
 // ------ cookie helpers ------

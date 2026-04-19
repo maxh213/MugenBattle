@@ -98,6 +98,14 @@ function migrate(db) {
   addColumnIfMissing(db, 'fighter', 'validated_at', 'TEXT');
   addColumnIfMissing(db, 'fighter', 'validation_reason', 'TEXT');
   addColumnIfMissing(db, 'tournament', 'format', 'TEXT');
+  addColumnIfMissing(db, 'user_account', 'username', 'TEXT');
+  // Case-insensitive unique index. Uses a partial index so old rows with NULL
+  // usernames (users mid-onboarding) don't collide.
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_username
+    ON user_account (lower(username))
+    WHERE username IS NOT NULL;
+  `);
 }
 
 function addColumnIfMissing(db, table, column, type) {

@@ -23,6 +23,7 @@ import { getDb } from './db.js';
 import {
   sendCode,
   verifyCode,
+  setUsername,
   currentUser,
   sessionCookieHeader,
 } from './auth.js';
@@ -519,26 +520,41 @@ ${MODAL_HTML}
       <button onclick="authVerifyCode()">Verify</button>
       <div class="msg" id="auth-msg-2"></div>
     </div>
+    <div class="auth-form" id="auth-step-username" style="display:none">
+      <div class="sub" style="margin-bottom:2px">Pick a display name. This is the only thing other people will see.</div>
+      <input type="text" id="auth-username" placeholder="username" maxlength="20" autocomplete="username">
+      <button onclick="authSetUsername()">Save</button>
+      <div class="msg" id="auth-msg-3"></div>
+    </div>
   </div></div>
 </div>
 <script>
 function _escAuth(s) { return String(s == null ? '' : s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+function _showAuthStep(which) {
+  for (const s of ['email', 'code', 'username']) {
+    document.getElementById('auth-step-' + s).style.display = (s === which) ? '' : 'none';
+  }
+  for (const i of [1, 2, 3]) document.getElementById('auth-msg-' + i).textContent = '';
+}
 async function refreshAuth() {
   const r = await fetch('/api/auth/me');
   const me = await r.json();
   const bar = document.getElementById('auth-bar');
   if (me.authenticated) {
-    bar.innerHTML = '<span class="user-email">' + _escAuth(me.email) + '</span>' +
-      '<button class="logout" onclick="authLogout()">Sign out</button>';
+    if (me.needs_username) {
+      bar.innerHTML = '<button onclick="openAuth()">Pick username</button>';
+      openAuth(); // nudge them into finishing signup
+      _showAuthStep('username');
+    } else {
+      bar.innerHTML = '<span class="user-email">' + _escAuth(me.username) + '</span>' +
+        '<button class="logout" onclick="authLogout()">Sign out</button>';
+    }
   } else {
     bar.innerHTML = '<button onclick="openAuth()">Sign in</button>';
   }
 }
 function openAuth() {
-  document.getElementById('auth-step-email').style.display = '';
-  document.getElementById('auth-step-code').style.display = 'none';
-  document.getElementById('auth-msg-1').textContent = '';
-  document.getElementById('auth-msg-2').textContent = '';
+  _showAuthStep('email');
   document.getElementById('auth-modal').classList.add('open');
   setTimeout(() => document.getElementById('auth-email').focus(), 50);
 }
@@ -567,14 +583,34 @@ async function authVerifyCode() {
   msg.className = 'msg'; msg.textContent = 'Verifying…';
   const r = await fetch('/api/auth/verify-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, code }) });
   const body = await r.json();
+  if (!r.ok) {
+    msg.className = 'msg err';
+    msg.textContent = body.error || 'Failed to verify';
+    return;
+  }
+  if (body.needs_username) {
+    _showAuthStep('username');
+    setTimeout(() => document.getElementById('auth-username').focus(), 50);
+  } else {
+    closeAuth();
+    refreshAuth();
+  }
+}
+async function authSetUsername() {
+  const username = document.getElementById('auth-username').value.trim();
+  const msg = document.getElementById('auth-msg-3');
+  msg.className = 'msg'; msg.textContent = 'Saving…';
+  const r = await fetch('/api/auth/set-username', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username }),
+  });
+  const body = await r.json();
   if (r.ok) {
-    msg.className = 'msg ok';
-    msg.textContent = 'Signed in!';
     closeAuth();
     refreshAuth();
   } else {
     msg.className = 'msg err';
-    msg.textContent = body.error || 'Failed to verify';
+    msg.textContent = body.error || 'Could not save';
   }
 }
 async function authLogout() {
@@ -934,7 +970,30 @@ const server = createServer((req, res) => {
     const db = getDb();
     const u = currentUser(db, req);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(u ? { authenticated: true, email: u.email, display_name: u.display_name } : { authenticated: false }));
+    res.end(JSON.stringify(
+      u
+        ? {
+            authenticated: true,
+            username: u.username,
+            needs_username: !u.username,
+          }
+        : { authenticated: false }
+    ));
+    return;
+  }
+  if (req.url === '/api/auth/set-username' && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not signed in' }));
+      return;
+    }
+    readJsonBody(req).then((data) => {
+      const result = setUsername(db, u.id, data.username);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.body));
+    }).catch(() => { res.writeHead(400); res.end(); });
     return;
   }
   if (req.url === '/api/auth/send-code' && req.method === 'POST') {
