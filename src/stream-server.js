@@ -2070,13 +2070,8 @@ const LEAGUES_HTML = `<!doctype html>
   .worker .matchup { font-size: 14px; margin: 2px 0 6px; color: #c9d1d9; }
   .worker .matchup .score { color: #f0ae3c; font-variant-numeric: tabular-nums; font-weight: 600; margin: 0 8px; }
   .worker .meta { color: #8b949e; font-size: 11px; display: flex; gap: 12px; flex-wrap: wrap; }
-  .worker .slots { display: flex; gap: 4px; margin-top: 8px; }
-  .worker .chip { font-size: 10px; width: 20px; height: 20px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; background: #0d1117; color: #6e7681; border: 1px solid #21262d; font-weight: 600; }
-  .worker .chip.h { background: #0f3d1c; color: #3fb950; border-color: #1f6d35; }
-  .worker .chip.a { background: #3d0f0f; color: #f85149; border-color: #6d1f1f; }
-  .worker .chip.d { background: #1d2a3a; color: #58a6ff; border-color: #2b4660; }
-  .worker .chip.live { background: #3d2d0f; color: #f0ae3c; border-color: #6d501f; animation: pulse 1.2s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.5 } }
+  .worker .fighters { font-size: 12px; color: #c9d1d9; margin: 4px 0 6px; }
+  .worker .fighters .vs { color: #6e7681; margin: 0 6px; }
   .worker .wid { color: #6e7681; font-size: 10px; text-transform: uppercase; }
   .empty-state { text-align: center; padding: 40px 20px; color: #6e7681; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
 </style></head>
@@ -2094,15 +2089,6 @@ ${AUTH_BAR_HTML}
 <div id="workers"></div>
 <script>
 function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
-function chipFor(slotRow, idx, cur) {
-  if (!slotRow) {
-    if (idx === cur) return '<span class="chip live">' + idx + '</span>';
-    return '<span class="chip">' + idx + '</span>';
-  }
-  const cls = slotRow.winner === 'home' ? 'h' : slotRow.winner === 'away' ? 'a' : 'd';
-  const label = slotRow.winner === 'home' ? 'H' : slotRow.winner === 'away' ? 'A' : '·';
-  return '<span class="chip ' + cls + '">' + label + '</span>';
-}
 function overlayHtml(w) {
   const ctx = w.context;
   if (!ctx || !ctx.fixture) {
@@ -2115,11 +2101,9 @@ function overlayHtml(w) {
     );
   }
   const f = ctx.fixture;
-  const chips = [];
-  for (let i = 1; i <= 5; i++) {
-    const row = f.slots.find(s => s.slot === i);
-    chips.push(chipFor(row, i, f.current_slot));
-  }
+  const fighterLine = (f.home_fighter && f.away_fighter)
+    ? '<div class="fighters">' + esc(f.home_fighter) + ' <span class="vs">vs</span> ' + esc(f.away_fighter) + '</div>'
+    : '<div class="fighters" style="color:#6e7681">picking fighters…</div>';
   return (
     '<div class="hdr">' +
       '<span class="lname">' + esc(ctx.league.name) + '</span>' +
@@ -2127,15 +2111,15 @@ function overlayHtml(w) {
     '</div>' +
     '<div class="matchup">' +
       esc(f.home_team) +
-      '<span class="score">' + f.home_score + ' – ' + f.away_score + '</span>' +
+      '<span class="score">' + f.home_rounds + ' – ' + f.away_rounds + '</span>' +
       esc(f.away_team) +
     '</div>' +
+    fighterLine +
     '<div class="meta">' +
       '<span>R' + f.round + '.' + f.slot_num + '</span>' +
       (f.stage ? '<span>Stage: ' + esc(f.stage) + '</span>' : '') +
       '<span class="wid">Worker #' + w.workerId + '</span>' +
-    '</div>' +
-    '<div class="slots">' + chips.join('') + '</div>'
+    '</div>'
   );
 }
 

@@ -56,6 +56,7 @@ function resolveCtx(ctx = {}) {
     logPath: ctx.logPath || DEFAULT_LOG_FILE,
     display: ctx.display || process.env.DISPLAY || null,
     speed: ctx.speed || process.env.MATCH_SPEED || null,
+    rounds: ctx.rounds != null ? ctx.rounds : null,
   };
 }
 
@@ -103,7 +104,7 @@ function isDeterministicFailure(err) {
 }
 
 function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
-  const { logPath, display, speed } = resolveCtx(ctx);
+  const { logPath, display, speed, rounds } = resolveCtx(ctx);
   return new Promise((resolve, reject) => {
     let cmd, args;
 
@@ -123,6 +124,7 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
     const env = { ...process.env, MATCH_LOG_FILE: logPath };
     if (display) env.DISPLAY = display;
     if (speed) env.MATCH_SPEED = String(speed);
+    if (rounds) env.MATCH_ROUNDS = String(rounds);
 
     // Patterns that mean "this char just broke Ikemen, won't recover":
     //   - Go runtime panics (stderr)

@@ -16,7 +16,7 @@
  * touching standings.
  */
 
-import { selectLineup } from './teams.js';
+import { pickActiveFighter, teamCanPlay } from './teams.js';
 import { runOwnedFighterMatch } from './match.js';
 import { credit } from './wallet.js';
 import { seedBots } from './bots.js';
@@ -260,6 +260,8 @@ export function pickNextFixture(db, { leagueId, divisionId } = {}) {
   `).get(...params);
 }
 
+const BEST_OF_ROUNDS = 3;
+
 export async function runFixture(db, fixtureId, ctx) {
   const fixture = db.prepare('SELECT * FROM fixture WHERE id = ?').get(fixtureId);
   if (!fixture) throw new Error(`Fixture ${fixtureId} not found`);
@@ -267,11 +269,16 @@ export async function runFixture(db, fixtureId, ctx) {
     throw new Error(`Fixture ${fixtureId} is ${fixture.status}, not pending`);
   }
 
-  const homeLineup = selectLineup(db, fixture.home_team_id);
-  const awayLineup = selectLineup(db, fixture.away_team_id);
-  if (!homeLineup || !awayLineup) {
-    return forfeitFixture(db, fixture, !homeLineup, !awayLineup);
+  // Either team without a playable active roster forfeits the fixture.
+  const homeCanPlay = teamCanPlay(db, fixture.home_team_id);
+  const awayCanPlay = teamCanPlay(db, fixture.away_team_id);
+  if (!homeCanPlay || !awayCanPlay) {
+    return forfeitFixture(db, fixture, !homeCanPlay, !awayCanPlay);
   }
+
+  const home = pickActiveFighter(db, fixture.home_team_id);
+  const away = pickActiveFighter(db, fixture.away_team_id);
+  if (!home || !away) return forfeitFixture(db, fixture, !home, !away);
 
   // Prefer the home team's owned stage ("home advantage"); otherwise pick a
   // random active stage from the pool.
@@ -289,92 +296,81 @@ export async function runFixture(db, fixtureId, ctx) {
     "UPDATE fixture SET status = 'running', stage_id = ?, started_at = datetime('now') WHERE id = ?"
   ).run(stageRow.id, fixture.id);
 
-  const insertSlot = db.prepare(`
-    INSERT INTO fixture_match
-      (fixture_id, slot, home_owned_fighter_id, away_owned_fighter_id, stage_id,
-       home_rounds, away_rounds, winner)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  let homeScore = 0, awayScore = 0;
-  const slotResults = [];
-  for (let i = 0; i < 5; i++) {
-    const h = homeLineup[i];
-    const a = awayLineup[i];
-
-    let r;
-    try {
-      r = await runOwnedFighterMatch({
-        db,
-        homeOwnedFighterId: h.id,
-        awayOwnedFighterId: a.id,
-        stageFileName: stageRow.file_name,
-        ctx,
-      });
-    } catch (err) {
-      // A single character can crash Ikemen ("Invalid state: ..." loops,
-      // missing sprite pointers, malformed .cns at a specific line etc).
-      // Don't abort the fixture — record the slot as a 0-0 draw and continue.
-      console.error(`[fixture ${fixture.id} slot ${i + 1}] match error: ${err.message.split('\n')[0]}`);
-      r = { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
-      // If the error names a specific char's path, deactivate that master
-      // outright. If it doesn't (deep Ikemen panic with no char token), we
-      // can't tell who's at fault — charge both as suspects. Repeat
-      // offenders auto-deactivate at the crash_suspect threshold.
-      const identified = deactivateIfIdentifiable(db, err.message || '');
-      if (!identified) {
-        chargeCrashSuspects(db, h.master_fighter_id, a.master_fighter_id);
-      }
-    }
-
-    let winner;
-    if (r.winner === 'fighter1') { homeScore++; winner = 'home'; }
-    else if (r.winner === 'fighter2') { awayScore++; winner = 'away'; }
-    else winner = 'draw';
-
-    insertSlot.run(
-      fixture.id, i + 1, h.id, a.id, stageRow.id,
-      r.fighter1Rounds, r.fighter2Rounds, winner
-    );
-    slotResults.push({
-      slot: i + 1,
-      home: { id: h.id, name: h.display_name },
-      away: { id: a.id, name: a.display_name },
-      winner, homeRounds: r.fighter1Rounds, awayRounds: r.fighter2Rounds,
+  let r;
+  try {
+    r = await runOwnedFighterMatch({
+      db,
+      homeOwnedFighterId: home.id,
+      awayOwnedFighterId: away.id,
+      stageFileName: stageRow.file_name,
+      ctx: { ...(ctx || {}), rounds: BEST_OF_ROUNDS },
     });
+  } catch (err) {
+    console.error(`[fixture ${fixture.id}] match error: ${err.message.split('\n')[0]}`);
+    r = { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
+    const identified = deactivateIfIdentifiable(db, err.message || '');
+    if (!identified) {
+      chargeCrashSuspects(db, home.master_fighter_id, away.master_fighter_id);
+    }
   }
 
-  const winnerTeamId = homeScore > awayScore ? fixture.home_team_id
-    : awayScore > homeScore ? fixture.away_team_id
+  const homeRounds = r.fighter1Rounds || 0;
+  const awayRounds = r.fighter2Rounds || 0;
+  const winner = r.winner === 'fighter1' ? 'home'
+    : r.winner === 'fighter2' ? 'away'
+    : 'draw';
+  const winnerTeamId = winner === 'home' ? fixture.home_team_id
+    : winner === 'away' ? fixture.away_team_id
     : null;
 
   const finalize = db.transaction(() => {
     db.prepare(`
+      INSERT INTO fixture_match
+        (fixture_id, slot, home_owned_fighter_id, away_owned_fighter_id, stage_id,
+         home_rounds, away_rounds, winner)
+      VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+    `).run(fixture.id, home.id, away.id, stageRow.id, homeRounds, awayRounds, winner);
+
+    db.prepare(`
       UPDATE fixture SET status = 'complete', home_score = ?, away_score = ?,
         winner_team_id = ?, finished_at = datetime('now') WHERE id = ?
-    `).run(homeScore, awayScore, winnerTeamId, fixture.id);
-    updateStandings(db, fixture.division_id, fixture.home_team_id, fixture.away_team_id, homeScore, awayScore);
-    awardPrize(db, fixture.id, fixture.home_team_id, fixture.away_team_id, homeScore, awayScore);
+    `).run(homeRounds, awayRounds, winnerTeamId, fixture.id);
+
+    // consecutive_losses per owned_fighter: reset on win/draw, +1 on loss.
+    updateLossStreak(db, home.id, winner === 'home' ? 'won' : winner === 'away' ? 'lost' : 'drawn');
+    updateLossStreak(db, away.id, winner === 'away' ? 'won' : winner === 'home' ? 'lost' : 'drawn');
+
+    updateStandings(db, fixture.division_id, fixture.home_team_id, fixture.away_team_id, homeRounds, awayRounds, winnerTeamId);
+    awardPrize(db, fixture.id, fixture.home_team_id, fixture.away_team_id, winnerTeamId);
     maybeCompleteLeague(db, fixture.division_id);
   });
   finalize();
 
   return {
-    fixture: { ...fixture, home_score: homeScore, away_score: awayScore, winner_team_id: winnerTeamId },
-    homeScore, awayScore, winnerTeamId,
+    fixture: { ...fixture, home_score: homeRounds, away_score: awayRounds, winner_team_id: winnerTeamId },
+    home: { id: home.id, name: home.display_name },
+    away: { id: away.id, name: away.display_name },
+    homeRounds, awayRounds, winner, winnerTeamId,
     stage: stageRow.file_name,
-    slots: slotResults,
   };
 }
 
+function updateLossStreak(db, ownedFighterId, result) {
+  if (result === 'lost') {
+    db.prepare('UPDATE owned_fighter SET consecutive_losses = consecutive_losses + 1 WHERE id = ?').run(ownedFighterId);
+  } else {
+    db.prepare('UPDATE owned_fighter SET consecutive_losses = 0 WHERE id = ?').run(ownedFighterId);
+  }
+}
+
 function forfeitFixture(db, fixture, homeShort, awayShort) {
-  let homeScore = 0, awayScore = 0, winnerTeamId = null;
+  let homeRounds = 0, awayRounds = 0, winnerTeamId = null;
   if (homeShort && awayShort) {
     // nothing — record as 0-0 no-contest
   } else if (homeShort) {
-    awayScore = 5; winnerTeamId = fixture.away_team_id;
+    awayRounds = 2; winnerTeamId = fixture.away_team_id;
   } else {
-    homeScore = 5; winnerTeamId = fixture.home_team_id;
+    homeRounds = 2; winnerTeamId = fixture.home_team_id;
   }
 
   const tx = db.transaction(() => {
@@ -382,15 +378,15 @@ function forfeitFixture(db, fixture, homeShort, awayShort) {
       UPDATE fixture SET status = 'complete', home_score = ?, away_score = ?,
         winner_team_id = ?, started_at = COALESCE(started_at, datetime('now')),
         finished_at = datetime('now') WHERE id = ?
-    `).run(homeScore, awayScore, winnerTeamId, fixture.id);
+    `).run(homeRounds, awayRounds, winnerTeamId, fixture.id);
     if (!(homeShort && awayShort)) {
-      updateStandings(db, fixture.division_id, fixture.home_team_id, fixture.away_team_id, homeScore, awayScore);
+      updateStandings(db, fixture.division_id, fixture.home_team_id, fixture.away_team_id, homeRounds, awayRounds, winnerTeamId);
     }
     maybeCompleteLeague(db, fixture.division_id);
   });
   tx();
 
-  return { fixture, homeScore, awayScore, winnerTeamId, forfeit: true, slots: [] };
+  return { fixture, homeRounds, awayRounds, winnerTeamId, forfeit: true };
 }
 
 /**
@@ -398,12 +394,12 @@ function forfeitFixture(db, fixture, homeShort, awayShort) {
  * wallet (bots included — they accumulate cash that simply never spends).
  * Win = PRIZE_WIN_CENTS; draw = PRIZE_DRAW_CENTS each; loss = 0.
  */
-function awardPrize(db, fixtureId, homeTeamId, awayTeamId, homeScore, awayScore) {
+function awardPrize(db, fixtureId, homeTeamId, awayTeamId, winnerTeamId) {
   const homeUser = db.prepare('SELECT user_id FROM team WHERE id = ?').get(homeTeamId)?.user_id;
   const awayUser = db.prepare('SELECT user_id FROM team WHERE id = ?').get(awayTeamId)?.user_id;
-  if (homeScore > awayScore) {
+  if (winnerTeamId === homeTeamId) {
     if (homeUser) credit(db, homeUser, PRIZE_WIN_CENTS, 'fixture_win', fixtureId);
-  } else if (awayScore > homeScore) {
+  } else if (winnerTeamId === awayTeamId) {
     if (awayUser) credit(db, awayUser, PRIZE_WIN_CENTS, 'fixture_win', fixtureId);
   } else {
     if (homeUser) credit(db, homeUser, PRIZE_DRAW_CENTS, 'fixture_draw', fixtureId);
@@ -411,9 +407,12 @@ function awardPrize(db, fixtureId, homeTeamId, awayTeamId, homeScore, awayScore)
   }
 }
 
-function updateStandings(db, divisionId, homeId, awayId, homeScore, awayScore) {
-  const homeWon = homeScore > awayScore;
-  const awayWon = awayScore > homeScore;
+function updateStandings(db, divisionId, homeId, awayId, homeScore, awayScore, winnerTeamId) {
+  // For 1v1 best-of-3 fixtures, winnerTeamId is authoritative; home/away
+  // rounds only feed the match-W-L tiebreaker columns. Draw = scores tied
+  // AND no winnerTeamId (both teams short-forfeit or live draw).
+  const homeWon = winnerTeamId === homeId;
+  const awayWon = winnerTeamId === awayId;
   const drawn = !homeWon && !awayWon;
 
   const apply = db.prepare(`
@@ -586,17 +585,22 @@ export function getLiveLeagueContext(db, leagueId, divisionId = null) {
 
   if (!fixture) return { league, fixture: null };
 
-  const slots = db.prepare(`
-    SELECT slot, winner,
-      (SELECT display_name FROM owned_fighter WHERE id = home_owned_fighter_id) AS home_name,
-      (SELECT display_name FROM owned_fighter WHERE id = away_owned_fighter_id) AS away_name
-    FROM fixture_match WHERE fixture_id = ? ORDER BY slot
-  `).all(fixture.id);
-
-  const slotsDone = slots.length;
-  const currentSlot = slotsDone < 5 ? slotsDone + 1 : null;
-  const homeScore = slots.filter((s) => s.winner === 'home').length;
-  const awayScore = slots.filter((s) => s.winner === 'away').length;
+  // New format: one match per fixture, best-of-3. Before the match completes,
+  // fixture_match has no row yet — overlay shows who was picked via the
+  // team's rotation rules for fresher info. After, it's the stored winner.
+  const matchRow = db.prepare(`
+    SELECT fm.home_rounds, fm.away_rounds, fm.winner,
+      oh.display_name AS home_fighter,
+      oa.display_name AS away_fighter,
+      hf.file_name AS home_master,
+      af.file_name AS away_master
+    FROM fixture_match fm
+    JOIN owned_fighter oh ON oh.id = fm.home_owned_fighter_id
+    JOIN owned_fighter oa ON oa.id = fm.away_owned_fighter_id
+    JOIN fighter hf ON hf.id = oh.master_fighter_id
+    JOIN fighter af ON af.id = oa.master_fighter_id
+    WHERE fm.fixture_id = ? ORDER BY fm.slot LIMIT 1
+  `).get(fixture.id);
 
   return {
     league,
@@ -608,11 +612,13 @@ export function getLiveLeagueContext(db, leagueId, divisionId = null) {
       away_team: fixture.away_name,
       division: { tier: fixture.tier, name: fixture.division_name },
       stage: fixture.stage_display || fixture.stage_file,
-      slots_done: slotsDone,
-      current_slot: currentSlot,
-      home_score: homeScore,
-      away_score: awayScore,
-      slots,
+      home_rounds: matchRow?.home_rounds ?? 0,
+      away_rounds: matchRow?.away_rounds ?? 0,
+      home_fighter: matchRow?.home_fighter ?? null,
+      away_fighter: matchRow?.away_fighter ?? null,
+      home_master: matchRow?.home_master ?? null,
+      away_master: matchRow?.away_master ?? null,
+      completed: !!matchRow,
     },
   };
 }

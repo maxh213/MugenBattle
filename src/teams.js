@@ -149,36 +149,62 @@ export function setLineup(db, teamId, body) {
  *
  * Returns null if the team can't field 5 eligible fighters.
  */
-export function selectLineup(db, teamId) {
-  const team = db.prepare('SELECT auto_rotate, rotation_threshold FROM team WHERE id = ?').get(teamId);
+/**
+ * Choose ONE active fighter to field for the next fixture. Rotation is
+ * driven by team.rotation_mode:
+ *   'fixed'   — always the top priority (priority=0)
+ *   'stamina' — walk priorities, pick first whose eff stamina ≥ threshold;
+ *               fall back to top if all tired.
+ *   'losses'  — walk priorities, pick first whose consecutive_losses <
+ *               rotation_loss_streak; fall back to top if every fighter is
+ *               at/past the streak.
+ *
+ * Bench fighters are never auto-selected — the user must promote them
+ * explicitly. Returns null if the team has fewer than 1 non-retired
+ * active fighter (would force a forfeit).
+ */
+export function pickActiveFighter(db, teamId) {
+  const team = db.prepare(
+    'SELECT auto_rotate, rotation_mode, rotation_threshold, rotation_loss_streak FROM team WHERE id = ?'
+  ).get(teamId);
   if (!team) return null;
   const actives = db
     .prepare("SELECT * FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'active' ORDER BY priority, id")
     .all(teamId);
-  if (actives.length < 5) return null;
+  if (actives.length === 0) return null;
 
-  if (!team.auto_rotate) return actives.slice(0, 5);
+  const mode = team.auto_rotate ? (team.rotation_mode || 'stamina') : 'fixed';
+  if (mode === 'fixed') return actives[0];
 
-  const threshold = team.rotation_threshold != null ? team.rotation_threshold : LOW_STAMINA_ROTATION_THRESHOLD;
-  const enriched = actives.map((f) => ({ ...f, eff: readEffectiveStamina(db, f.id) }));
-  const tired = enriched.filter((f) => f.eff < threshold);
-  if (tired.length === 0) return enriched.slice(0, 5);
-
-  const bench = db
-    .prepare("SELECT * FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'bench'")
-    .all(teamId)
-    .map((f) => ({ ...f, eff: readEffectiveStamina(db, f.id) }))
-    .filter((f) => f.eff >= threshold)
-    .sort((a, b) => b.eff - a.eff);
-
-  const finalLineup = [...enriched];
-  for (const swap of tired) {
-    if (bench.length === 0) break;
-    const in_ = bench.shift();
-    const idx = finalLineup.findIndex((f) => f.id === swap.id);
-    finalLineup[idx] = in_;
+  if (mode === 'stamina') {
+    const threshold = team.rotation_threshold != null ? team.rotation_threshold : LOW_STAMINA_ROTATION_THRESHOLD;
+    for (const f of actives) {
+      const eff = readEffectiveStamina(db, f.id);
+      if (eff >= threshold) return { ...f, eff };
+    }
+    return actives[0];
   }
-  return finalLineup.slice(0, 5);
+
+  if (mode === 'losses') {
+    const cap = team.rotation_loss_streak || 3;
+    for (const f of actives) {
+      if ((f.consecutive_losses || 0) < cap) return f;
+    }
+    return actives[0];
+  }
+
+  return actives[0];
+}
+
+/**
+ * Does the team have the minimum roster to play (>= 1 active, non-retired)?
+ * Used by the fixture runner before launching a match.
+ */
+export function teamCanPlay(db, teamId) {
+  const { n } = db.prepare(
+    "SELECT COUNT(*) AS n FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'active'"
+  ).get(teamId);
+  return n >= 1;
 }
 
 export function getTeamById(db, teamId) {

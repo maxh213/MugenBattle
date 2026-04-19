@@ -46,7 +46,8 @@ if [ -n "$MATCH_SPEED" ]; then
   fi
 fi
 
-IKE_ARGS=(-p1 "$1" -p2 "$2" -p1.ai 8 -p2.ai 8 -rounds 1 -s "$3"
+ROUNDS="${MATCH_ROUNDS:-1}"
+IKE_ARGS=(-p1 "$1" -p2 "$2" -p1.ai 8 -p2.ai 8 -rounds "$ROUNDS" -s "$3"
           -log "$LOG_FILE" -nosound -nojoy -windowed "${EXTRA_ARGS[@]}")
 
 # Every match runs under bubblewrap with a PER-MATCH engine/save directory.
