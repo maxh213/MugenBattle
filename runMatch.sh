@@ -49,30 +49,51 @@ fi
 IKE_ARGS=(-p1 "$1" -p2 "$2" -p1.ai 8 -p2.ai 8 -rounds 1 -s "$3"
           -log "$LOG_FILE" -nosound -nojoy -windowed "${EXTRA_ARGS[@]}")
 
-# MATCH_SANDBOX=bwrap runs Ikemen under bubblewrap: no network, separate pid
-# namespace, read-only view of the host filesystem (engine dir RO; a tmpfs
-# overlays engine/save so Ikemen can still scratch replays/configs without
-# touching our real dir), with only the log file bind-mounted writable.
-# Used by the user-character-import sandbox test.
-if [ "$MATCH_SANDBOX" = "bwrap" ]; then
-  # Make sure the log file exists before bind-mounting it.
-  : > "$LOG_FILE"
-  exec bwrap \
-    --unshare-net --unshare-pid --die-with-parent --new-session \
-    --ro-bind /usr /usr \
-    --ro-bind /etc /etc \
-    --symlink usr/lib /lib \
-    --symlink usr/lib /lib64 \
-    --ro-bind "$ENGINE_DIR" "$ENGINE_DIR" \
-    --tmpfs "$ENGINE_DIR/save" \
-    --tmpfs /tmp \
-    --ro-bind /tmp/.X11-unix /tmp/.X11-unix \
-    --bind "$LOG_FILE" "$LOG_FILE" \
-    --dev /dev \
-    --proc /proc \
-    --setenv DISPLAY "${DISPLAY:-:0}" \
-    --chdir "$ENGINE_DIR" \
-    "$ENGINE" "${IKE_ARGS[@]}"
+# Every match runs under bubblewrap with a PER-MATCH engine/save directory.
+# Why: engine/save/config.json is mutated by Ikemen at startup and shutdown.
+# With three parallel workers sharing the host engine/save, they race each
+# other's writes and eventually corrupt the JSON — which Ikemen can't then
+# parse, pops a modal, and hangs. Per-match private save dirs eliminate the
+# shared mutable state entirely.
+#
+# MATCH_SANDBOX=off bypasses bwrap (fall back to the direct launch — used
+# by smokes on machines without bwrap).
+: > "$LOG_FILE"
+
+if [ "$MATCH_SANDBOX" = "off" ] || ! command -v bwrap >/dev/null 2>&1; then
+  $ENGINE "${IKE_ARGS[@]}"
+  exit $?
 fi
 
-$ENGINE "${IKE_ARGS[@]}"
+WORKER_SAVE="$(mktemp -d /tmp/mb-save.XXXXXX)"
+# Seed the private save dir from the host copy — Ikemen reads config.json
+# at startup, so we need it to exist and be valid.
+cp -rT "$ENGINE_DIR/save" "$WORKER_SAVE" 2>/dev/null || true
+# If config.json was corrupt on the host, replace with pristine (or drop it
+# entirely — Ikemen will regenerate defaults).
+if [ -f "$WORKER_SAVE/config.json" ] && \
+   ! python3 -c "import json; json.load(open('$WORKER_SAVE/config.json'))" >/dev/null 2>&1; then
+  if [ -f "$ENGINE_DIR/save/config.json.pristine" ]; then
+    cp "$ENGINE_DIR/save/config.json.pristine" "$WORKER_SAVE/config.json"
+  else
+    rm -f "$WORKER_SAVE/config.json"
+  fi
+fi
+trap 'rm -rf "$WORKER_SAVE"' EXIT
+
+exec bwrap \
+  --unshare-net --unshare-pid --die-with-parent --new-session \
+  --ro-bind /usr /usr \
+  --ro-bind /etc /etc \
+  --symlink usr/lib /lib \
+  --symlink usr/lib /lib64 \
+  --ro-bind "$ENGINE_DIR" "$ENGINE_DIR" \
+  --bind "$WORKER_SAVE" "$ENGINE_DIR/save" \
+  --tmpfs /tmp \
+  --ro-bind /tmp/.X11-unix /tmp/.X11-unix \
+  --bind "$LOG_FILE" "$LOG_FILE" \
+  --dev /dev \
+  --proc /proc \
+  --setenv DISPLAY "${DISPLAY:-:0}" \
+  --chdir "$ENGINE_DIR" \
+  "$ENGINE" "${IKE_ARGS[@]}"

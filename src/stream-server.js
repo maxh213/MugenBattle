@@ -107,6 +107,23 @@ const audioClients = new Set();
 const PULSE_SOURCE = process.env.STREAM_AUDIO_SOURCE || 'mugenbattle.monitor';
 let audioFfmpeg;
 
+/**
+ * Stash a pristine copy of engine/save/config.json on first valid boot.
+ * runMatch.sh uses it to seed per-worker private save dirs. We no longer
+ * self-heal the host file — it's only read as a seed and never written by
+ * match processes (bwrap bind-mounts a per-match scratch copy over it).
+ */
+function seedPristineConfig() {
+  const cfg = resolve(ROOT, 'engine', 'save', 'config.json');
+  const pristine = cfg + '.pristine';
+  if (!existsSync(cfg) || existsSync(pristine)) return;
+  try {
+    JSON.parse(readFileSync(cfg, 'utf-8'));
+    writeFileSync(pristine, readFileSync(cfg));
+    console.log('[boot] saved engine/save/config.json.pristine');
+  } catch {}
+}
+
 async function bootWorkers() {
   // Crash recovery: any fixture left in 'running' from a previous boot gets
   // pushed back to 'pending' so a worker picks it up fresh. We also delete
@@ -126,6 +143,8 @@ async function bootWorkers() {
     return stuck.length;
   })();
   if (reset > 0) console.log(`[boot] reset ${reset} stuck 'running' fixture(s) to 'pending'`);
+
+  seedPristineConfig();
 
   // Retire clones of any already-inactive master AND replace them with KFM
   // training dummies in the same slot, so teams keep a full 5-active lineup
