@@ -1319,10 +1319,6 @@ ${AUTH_BAR_HTML}
     <span class="balance" id="wallet-balance">—</span>
     <a class="market-link" href="/market">Browse market →</a>
   </div>
-  <div class="roster-section" id="schedule-section" style="display:none">
-    <h2>Schedule</h2>
-    <div id="schedule"></div>
-  </div>
   <div class="team-header">
     <label>Team</label>
     <input type="text" id="team-name" maxlength="40">
@@ -1370,6 +1366,11 @@ ${AUTH_BAR_HTML}
   <div class="roster-section">
     <h2>Home stage</h2>
     <div id="home-stage"></div>
+  </div>
+
+  <div class="roster-section" id="schedule-section" style="display:none">
+    <h2>Schedule</h2>
+    <div id="schedule"></div>
   </div>
 
   <div class="roster-section">
