@@ -287,8 +287,19 @@ function maybeCompleteLeague(db, divisionId) {
   `).get(league_id);
   if (n === 0) {
     db.prepare("UPDATE league SET status = 'complete', finished_at = datetime('now') WHERE id = ?").run(league_id);
-    // Release teams so they can be drafted into the next season.
+    // Release all teams so they're eligible for the next season.
     db.prepare('UPDATE team SET current_league_id = NULL WHERE current_league_id = ?').run(league_id);
+    // Retire every bot roster in this league — unique masters flow back to
+    // the unclaimed pool so new signups / next-season bots can draw fresh.
+    db.prepare(`
+      UPDATE owned_fighter SET is_retired = 1
+      WHERE is_retired = 0
+        AND team_id IN (
+          SELECT t.id FROM team t
+          JOIN user_account u ON t.user_id = u.id
+          WHERE u.is_bot = 1
+        )
+    `).run();
   }
 }
 

@@ -15,33 +15,21 @@ import {
   readEffectiveStamina,
   LOW_STAMINA_ROTATION_THRESHOLD,
 } from './stamina.js';
+import { drawStarterMasters, getKfmId } from './market.js';
 
-const STARTER_MASTER_FILENAME = 'kfm';   // bundled Kung Fu Man
-const STARTER_COUNT = 5;
-
-export function findStarterMaster(db) {
-  // Prefer the KFM master (stock Ikemen). Fall back to any active master if
-  // KFM was removed for some reason — we still want signup to work.
-  let row = db
-    .prepare("SELECT id FROM fighter WHERE file_name = ? AND is_master = 1 LIMIT 1")
-    .get(STARTER_MASTER_FILENAME);
-  if (row) return row.id;
-  row = db
-    .prepare('SELECT id FROM fighter WHERE is_master = 1 AND active = 1 LIMIT 1')
-    .get();
-  if (!row) throw new Error('No master fighters available for starter team');
-  return row.id;
-}
+const STARTER_UNCLAIMED_COUNT = 4;
+const STARTER_TOTAL = 5;
 
 /**
  * Create a team for the user and populate 5 starter fighters.
- * Safe to call inside an existing transaction; creates its own otherwise.
+ *   - 4 slots drawn from unclaimed 0-win masters (KFM padding if pool dry).
+ *   - 1 KFM training-dummy slot (non-unique, always available).
+ * Display names default to the master's display_name; KFM slot is labelled
+ * "Training Dummy" to distinguish it in the lineup.
  */
 export function bootstrapTeamForUser(db, userId, teamName) {
   const existing = db.prepare('SELECT id FROM team WHERE user_id = ?').get(userId);
   if (existing) return existing.id;
-
-  const masterId = findStarterMaster(db);
 
   const insertTeam = db.prepare(
     'INSERT INTO team (user_id, name) VALUES (?, ?)'
@@ -54,13 +42,18 @@ export function bootstrapTeamForUser(db, userId, teamName) {
   );
 
   const txn = db.transaction(() => {
-    const res = insertTeam.run(userId, teamName);
-    const teamId = res.lastInsertRowid;
-    for (let i = 0; i < STARTER_COUNT; i++) {
-      const fighterName = `Fighter ${i + 1}`;
-      const fRes = insertFighter.run(teamId, masterId, fighterName, i);
-      insertHistory.run(fRes.lastInsertRowid, teamId, 'created');
+    const teamId = insertTeam.run(userId, teamName).lastInsertRowid;
+    const masters = drawStarterMasters(db, STARTER_UNCLAIMED_COUNT);
+    const kfmId = getKfmId(db);
+
+    for (let i = 0; i < STARTER_UNCLAIMED_COUNT; i++) {
+      const m = masters[i];
+      const name = m.display_name || m.file_name;
+      const fId = insertFighter.run(teamId, m.id, name, i).lastInsertRowid;
+      insertHistory.run(fId, teamId, 'created');
     }
+    const dummyId = insertFighter.run(teamId, kfmId, 'Training Dummy', STARTER_TOTAL - 1).lastInsertRowid;
+    insertHistory.run(dummyId, teamId, 'created');
     return teamId;
   });
   return txn();

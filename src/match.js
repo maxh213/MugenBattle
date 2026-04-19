@@ -123,17 +123,26 @@ export async function runOwnedFighterMatch({
     awayStage.cleanup();
   }
 
-  // Persist stats + stamina in a single transaction
+  // Persist stats + stamina in a single transaction. Master-level counters
+  // are also bumped so market pricing reflects lifetime record across all
+  // past owners of that master.
+  const bumpOwnedW = db.prepare('UPDATE owned_fighter SET matches_won = matches_won + 1 WHERE id = ?');
+  const bumpOwnedL = db.prepare('UPDATE owned_fighter SET matches_lost = matches_lost + 1 WHERE id = ?');
+  const bumpOwnedD = db.prepare('UPDATE owned_fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?');
+  const bumpMasterW = db.prepare('UPDATE fighter SET matches_won = matches_won + 1 WHERE id = ?');
+  const bumpMasterL = db.prepare('UPDATE fighter SET matches_lost = matches_lost + 1 WHERE id = ?');
+  const bumpMasterD = db.prepare('UPDATE fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?');
+
   const tx = db.transaction(() => {
     if (result.winner === 'fighter1') {
-      db.prepare('UPDATE owned_fighter SET matches_won = matches_won + 1 WHERE id = ?').run(homeOwnedFighterId);
-      db.prepare('UPDATE owned_fighter SET matches_lost = matches_lost + 1 WHERE id = ?').run(awayOwnedFighterId);
+      bumpOwnedW.run(homeOwnedFighterId); bumpMasterW.run(home.master_fighter_id);
+      bumpOwnedL.run(awayOwnedFighterId); bumpMasterL.run(away.master_fighter_id);
     } else if (result.winner === 'fighter2') {
-      db.prepare('UPDATE owned_fighter SET matches_won = matches_won + 1 WHERE id = ?').run(awayOwnedFighterId);
-      db.prepare('UPDATE owned_fighter SET matches_lost = matches_lost + 1 WHERE id = ?').run(homeOwnedFighterId);
+      bumpOwnedW.run(awayOwnedFighterId); bumpMasterW.run(away.master_fighter_id);
+      bumpOwnedL.run(homeOwnedFighterId); bumpMasterL.run(home.master_fighter_id);
     } else {
-      db.prepare('UPDATE owned_fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?').run(homeOwnedFighterId);
-      db.prepare('UPDATE owned_fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?').run(awayOwnedFighterId);
+      bumpOwnedD.run(homeOwnedFighterId); bumpMasterD.run(home.master_fighter_id);
+      bumpOwnedD.run(awayOwnedFighterId); bumpMasterD.run(away.master_fighter_id);
     }
     applyMatchCost(db, homeOwnedFighterId);
     applyMatchCost(db, awayOwnedFighterId);

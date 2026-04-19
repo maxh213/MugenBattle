@@ -32,6 +32,8 @@ import {
   listLeagues,
 } from './leagues.js';
 import { bootstrapTeamForUser } from './teams.js';
+import { seedBots, retireAllBotRosters, listBots } from './bots.js';
+import { marketListings, priceFor } from './market.js';
 import { closeDb } from './db.js';
 
 program
@@ -504,38 +506,54 @@ const league = program.command('league').description('Seasons, divisions, fixtur
 
 league
   .command('create')
-  .description('Create a season from all eligible teams (>=5 active fighters)')
+  .description('Create a season: real teams fill bottom-up, bots fill remaining slots.')
   .option('-n, --name <text>', 'season name')
-  .option('-d, --divisions <n>', 'number of divisions', (v) => parseInt(v, 10), 1)
+  .option('-d, --divisions <n>', 'number of divisions (tier 1 = top)', (v) => parseInt(v, 10), 3)
+  .option('-p, --per-division <n>', 'teams per division', (v) => parseInt(v, 10), 8)
   .option('-l, --legs <n>', 'legs per round-robin (1 = single, 2 = home+away)', (v) => parseInt(v, 10), 1)
   .action((opts) => {
     const db = getDb();
-    const eligible = db.prepare(`
-      SELECT t.id, t.name
-      FROM team t
-      WHERE (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id AND slot = 'active') >= 5
+    const divCount = Math.max(1, opts.divisions);
+    const perDiv = Math.max(2, opts.perDivision);
+    const totalSlots = divCount * perDiv;
+
+    // Eligible real teams: not currently in a league, has 5 active fighters.
+    const realTeams = db.prepare(`
+      SELECT t.id, t.name FROM team t
+      JOIN user_account u ON t.user_id = u.id
+      WHERE u.is_bot = 0
         AND t.current_league_id IS NULL
+        AND (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id AND is_retired = 0 AND slot = 'active') >= 5
       ORDER BY t.id
     `).all();
-    if (eligible.length < 2) {
-      console.error(`Need at least 2 eligible teams, found ${eligible.length}.`);
+
+    if (realTeams.length > totalSlots) {
+      console.error(`${realTeams.length} real teams don't fit in ${totalSlots} slots. Increase --divisions or --per-division.`);
       return;
     }
 
-    const divCount = Math.max(1, opts.divisions);
-    if (eligible.length < divCount * 2) {
-      console.error(`${eligible.length} eligible teams can't fill ${divCount} divisions (need >=2 per division).`);
-      return;
-    }
-    const perDiv = Math.floor(eligible.length / divCount);
+    // Seed bots to cover the remainder (idempotent: tops up to count).
+    const botsNeeded = totalSlots - realTeams.length;
+    const allBots = seedBots(db, botsNeeded);
+    const availableBots = allBots.filter((b) => {
+      const t = db.prepare('SELECT current_league_id FROM team WHERE id = ?').get(b.team_id);
+      return t.current_league_id == null;
+    }).slice(0, botsNeeded);
+
+    // Seating order: real teams first (they fill the BOTTOM tier first), then
+    // bots fill everything else. Bottom-up = from highest tier number down.
+    const seats = [...realTeams.map((t) => t.id), ...availableBots.map((b) => b.team_id)];
+    // Place into divisions BOTTOM-UP: division divCount first (tier bottom),
+    // then next-up, ..., finally tier 1.
     const divisions = [];
     for (let i = 0; i < divCount; i++) {
-      const start = i * perDiv;
-      const end = i === divCount - 1 ? eligible.length : start + perDiv;
-      divisions.push({
-        name: `Division ${i + 1}`,
-        teamIds: eligible.slice(start, end).map((t) => t.id),
-      });
+      divisions.push({ name: `Division ${i + 1}`, teamIds: [] });
+    }
+    let seatIdx = 0;
+    for (let tier = divCount; tier >= 1; tier--) {
+      for (let i = 0; i < perDiv; i++) {
+        divisions[tier - 1].teamIds.push(seats[seatIdx++]);
+      }
     }
 
     const name = opts.name || `Season ${new Date().toISOString().slice(0, 10)}`;
@@ -545,7 +563,8 @@ league
         SELECT COUNT(*) AS n FROM fixture f
         JOIN division d ON f.division_id = d.id WHERE d.league_id = ?
       `).get(leagueId).n;
-      console.log(`Created league #${leagueId} "${name}": ${divCount} division(s), ${eligible.length} teams, ${fixtureCount} fixtures.`);
+      console.log(`Created league #${leagueId} "${name}": ${divCount} divisions × ${perDiv} teams = ${totalSlots} slots, ${fixtureCount} fixtures.`);
+      console.log(`  Real teams: ${realTeams.length}; bots: ${availableBots.length}.`);
       for (const d of divisions) {
         console.log(`  ${d.name}: teams ${d.teamIds.join(', ')}`);
       }
@@ -623,6 +642,67 @@ league
         );
       });
     }
+  });
+
+// --- Bots ---
+
+const bots = program.command('bots').description('Bot players (fill empty league slots)');
+
+bots
+  .command('list')
+  .description('List all bots')
+  .action(() => {
+    const db = getDb();
+    const rows = listBots(db);
+    if (rows.length === 0) { console.log('No bots yet.'); return; }
+    console.log(`\n${'#'.padStart(4)} ${'Username'.padEnd(14)} ${'Team'.padStart(5)} ${'Roster'.padStart(6)} ${'League'.padStart(7)}`);
+    console.log('-'.repeat(45));
+    for (const b of rows) {
+      console.log(`${String(b.user_id).padStart(4)} ${b.username.padEnd(14)} ${String(b.team_id || '-').padStart(5)} ${String(b.active_roster || 0).padStart(6)} ${String(b.current_league_id || '-').padStart(7)}`);
+    }
+  });
+
+bots
+  .command('seed')
+  .description('Ensure at least N bots exist with fresh rosters')
+  .requiredOption('-c, --count <n>', 'target bot count', (v) => parseInt(v, 10))
+  .action((opts) => {
+    const db = getDb();
+    const before = listBots(db).length;
+    const all = seedBots(db, opts.count);
+    console.log(`Bots: ${before} → ${all.length} (target ${opts.count}).`);
+  });
+
+bots
+  .command('retire-all')
+  .description('Retire every bot roster (release masters back to pool)')
+  .action(() => {
+    const db = getDb();
+    const n = retireAllBotRosters(db);
+    console.log(`Retired ${n} bot fighter(s); masters returned to unclaimed pool.`);
+  });
+
+// --- Market ---
+
+const market = program.command('market').description('Unclaimed master-roster listings');
+
+market
+  .command('list')
+  .description('Show unclaimed masters available for signup/purchase')
+  .option('-n, --limit <n>', 'max rows', (v) => parseInt(v, 10), 40)
+  .action((opts) => {
+    const db = getDb();
+    const rows = marketListings(db, { limit: opts.limit });
+    if (rows.length === 0) { console.log('Market is empty.'); return; }
+    console.log(`\n${'#'.padStart(5)} ${'File'.padEnd(26)} ${'Display'.padEnd(24)} ${'Author'.padEnd(16)} ${'Wins'.padStart(5)} ${'Price'.padStart(7)}`);
+    console.log('-'.repeat(95));
+    for (const r of rows) {
+      const fname = (r.file_name || '').slice(0, 26);
+      const display = (r.display_name || '').slice(0, 24);
+      const author = (r.author || '').slice(0, 16);
+      console.log(`${String(r.id).padStart(5)} ${fname.padEnd(26)} ${display.padEnd(24)} ${author.padEnd(16)} ${String(r.matches_won).padStart(5)} ${String(r.price_cents).padStart(7)}`);
+    }
+    console.log(`\nShowing ${rows.length} of unlimited.  (Total unclaimed available in DB shows above.)`);
   });
 
 program.hook('postAction', () => {
