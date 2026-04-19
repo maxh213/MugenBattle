@@ -342,6 +342,8 @@ const LEADERBOARD_HTML = `<!doctype html>
 <h1>🏆 Leaderboard</h1>
 <nav>
   <a href="/">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/team">My Team</a>
   <a href="/leaderboard" class="active">Leaderboard</a>
 </nav>
 <div class="panel">
@@ -403,6 +405,389 @@ load();
 </script>
 </body></html>`;
 
+// ---------- Shared auth fragments ----------
+
+/** Empty slot for the current-user label + sign-in/out button. Filled in by AUTH_JS. */
+const AUTH_BAR_HTML = `<div class="auth-bar" id="auth-bar"></div>`;
+
+/** Sign-in modal (email → code → username steps). AUTH_JS drives it. */
+const AUTH_MODAL_HTML = `
+<div class="modal-bg" id="auth-modal" onclick="if(event.target===this)closeAuth()">
+  <div class="modal"><div class="modal-shell">
+    <div class="close" onclick="closeAuth()">×</div>
+    <h3>Sign in</h3>
+    <div class="sub">We'll email you a 6-digit code. No password.</div>
+    <div class="auth-form" id="auth-step-email">
+      <input type="email" id="auth-email" placeholder="you@example.com" autocomplete="email">
+      <button onclick="authSendCode()">Send code</button>
+      <div class="msg" id="auth-msg-1"></div>
+    </div>
+    <div class="auth-form" id="auth-step-code" style="display:none">
+      <input type="text" id="auth-code" placeholder="6-digit code" maxlength="6" inputmode="numeric" autocomplete="one-time-code">
+      <button onclick="authVerifyCode()">Verify</button>
+      <div class="msg" id="auth-msg-2"></div>
+    </div>
+    <div class="auth-form" id="auth-step-username" style="display:none">
+      <div class="sub" style="margin-bottom:2px">Pick a display name. This is the only thing other people will see.</div>
+      <input type="text" id="auth-username" placeholder="username" maxlength="20" autocomplete="username">
+      <button onclick="authSetUsername()">Save</button>
+      <div class="msg" id="auth-msg-3"></div>
+    </div>
+  </div></div>
+</div>`;
+
+/** Auth client-side logic. Self-contained — needs only #auth-bar + AUTH_MODAL_HTML present. */
+const AUTH_JS = `<script>
+function _escAuth(s) { return String(s == null ? '' : s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+function _showAuthStep(which) {
+  for (const s of ['email', 'code', 'username']) {
+    document.getElementById('auth-step-' + s).style.display = (s === which) ? '' : 'none';
+  }
+  for (const i of [1, 2, 3]) document.getElementById('auth-msg-' + i).textContent = '';
+}
+async function refreshAuth() {
+  const r = await fetch('/api/auth/me');
+  const me = await r.json();
+  const bar = document.getElementById('auth-bar');
+  if (me.authenticated) {
+    if (me.needs_username) {
+      bar.innerHTML = '<button onclick="openAuth()">Pick username</button>';
+      openAuth();
+      _showAuthStep('username');
+    } else {
+      bar.innerHTML = '<span class="user-email">' + _escAuth(me.username) + '</span>' +
+        '<button class="logout" onclick="authLogout()">Sign out</button>';
+    }
+  } else {
+    bar.innerHTML = '<button onclick="openAuth()">Sign in</button>';
+  }
+  window.__authState = me;
+  if (window.onAuthStateChange) window.onAuthStateChange(me);
+}
+function openAuth() {
+  _showAuthStep('email');
+  document.getElementById('auth-modal').classList.add('open');
+  setTimeout(() => document.getElementById('auth-email').focus(), 50);
+}
+function closeAuth() { document.getElementById('auth-modal').classList.remove('open'); }
+async function authSendCode() {
+  const email = document.getElementById('auth-email').value.trim();
+  const msg = document.getElementById('auth-msg-1');
+  msg.className = 'msg'; msg.textContent = 'Sending…';
+  const r = await fetch('/api/auth/send-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
+  const body = await r.json();
+  if (r.ok) {
+    document.getElementById('auth-step-email').style.display = 'none';
+    document.getElementById('auth-step-code').style.display = '';
+    document.getElementById('auth-msg-2').className = 'msg ok';
+    document.getElementById('auth-msg-2').textContent = 'Code sent. Check your email.';
+    setTimeout(() => document.getElementById('auth-code').focus(), 50);
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = body.error || 'Failed to send code';
+  }
+}
+async function authVerifyCode() {
+  const email = document.getElementById('auth-email').value.trim();
+  const code = document.getElementById('auth-code').value.trim();
+  const msg = document.getElementById('auth-msg-2');
+  msg.className = 'msg'; msg.textContent = 'Verifying…';
+  const r = await fetch('/api/auth/verify-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, code }) });
+  const body = await r.json();
+  if (!r.ok) {
+    msg.className = 'msg err';
+    msg.textContent = body.error || 'Failed to verify';
+    return;
+  }
+  if (body.needs_username) {
+    _showAuthStep('username');
+    setTimeout(() => document.getElementById('auth-username').focus(), 50);
+  } else {
+    closeAuth();
+    refreshAuth();
+  }
+}
+async function authSetUsername() {
+  const username = document.getElementById('auth-username').value.trim();
+  const msg = document.getElementById('auth-msg-3');
+  msg.className = 'msg'; msg.textContent = 'Saving…';
+  const r = await fetch('/api/auth/set-username', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username }),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    closeAuth();
+    refreshAuth();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = body.error || 'Could not save';
+  }
+}
+async function authLogout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  refreshAuth();
+}
+refreshAuth();
+</script>`;
+
+const TEAM_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>My Team · MugenBattle</title>
+<style>${COMMON_CSS}
+  .team-header { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; padding: 14px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
+  .team-header label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .team-header input { flex: 1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 16px; font-weight: 600; }
+  .team-header button { background:#238636; color:white; border:1px solid #2ea043; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .team-header button:hover { background:#2ea043; }
+  .team-header .msg { font-size: 12px; min-width: 60px; }
+  .team-header .msg.ok { color: #3fb950; }
+  .team-header .msg.err { color: #f85149; }
+  .roster-section { margin-bottom: 18px; }
+  .roster-section h2 { font-size: 12px; text-transform: uppercase; color: #8b949e; margin: 0 0 8px; letter-spacing: 0.4px; }
+  .fighter-row { display: grid; grid-template-columns: 2fr 2fr 1fr 0.8fr 0.6fr; gap: 12px; padding: 12px 14px; align-items: center; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 6px; cursor: pointer; transition: border-color 0.1s; }
+  .fighter-row:hover { border-color: #58a6ff; }
+  .fighter-row .fr-name { font-size: 14px; font-weight: 600; color: #c9d1d9; }
+  .fighter-row .fr-master { color: #8b949e; font-size: 12px; font-style: italic; }
+  .fighter-row .fr-stats { color: #8b949e; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .fighter-row .fr-stam { font-size: 12px; font-variant-numeric: tabular-nums; }
+  .fighter-row .fr-edit { text-align: right; color: #58a6ff; font-size: 12px; }
+  .roster-empty { padding: 14px; color: #6e7681; font-size: 12px; background: #0d1117; border-radius: 8px; border: 1px dashed #30363d; text-align: center; }
+  .empty-state { text-align: center; padding: 60px 20px; color: #8b949e; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
+  .empty-state h2 { color: #c9d1d9; margin-top: 0; }
+  .editor { max-width: 820px !important; }
+  .editor .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0; }
+  .editor .stats .stat { background: #0d1117; padding: 10px; border-radius: 6px; text-align: center; }
+  .editor .stats .stat .v { font-size: 20px; font-weight: 600; color: #c9d1d9; }
+  .editor .stats .stat .l { font-size: 10px; text-transform: uppercase; color: #8b949e; }
+  .editor .row { display: flex; gap: 8px; align-items: center; margin: 10px 0; font-size: 13px; }
+  .editor .row label { color: #8b949e; min-width: 70px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .editor .row input { flex: 1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding: 6px 10px; border-radius: 4px; font-size: 13px; }
+  .editor .row button { background:#238636; color:white; border:1px solid #2ea043; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .editor .row button:hover { background:#2ea043; }
+  .editor .row .msg { font-size: 12px; min-width: 100px; }
+  .editor .row .msg.ok { color: #3fb950; }
+  .editor .row .msg.err { color: #f85149; }
+  .editor textarea { width: 100%; height: 420px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 10px; resize: vertical; box-sizing: border-box; }
+  .editor .ai-hdr { font-size: 11px; color: #8b949e; margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 0.4px; }
+</style></head>
+<body style="position:relative">
+${AUTH_BAR_HTML}
+<h1>🏋️ My Team</h1>
+<nav>
+  <a href="/">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/team" class="active">My Team</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+
+<div id="signed-out" class="empty-state" style="display:none">
+  <h2>Sign in to manage your team</h2>
+  <p>Use the "Sign in" button in the top right to get a one-time code.</p>
+</div>
+
+<div id="team-root" style="display:none">
+  <div class="team-header">
+    <label>Team</label>
+    <input type="text" id="team-name" maxlength="40">
+    <button onclick="saveTeamName()">Rename</button>
+    <span class="msg" id="team-name-msg"></span>
+  </div>
+
+  <div class="roster-section">
+    <h2>Active lineup</h2>
+    <div id="active-slots"></div>
+  </div>
+  <div class="roster-section">
+    <h2>Bench</h2>
+    <div id="bench-slots"></div>
+  </div>
+  <div class="roster-section" id="forsale-section" style="display:none">
+    <h2>Listed for sale</h2>
+    <div id="forsale-slots"></div>
+  </div>
+</div>
+
+${AUTH_MODAL_HTML}
+
+<div class="modal-bg" id="edit-bg" onclick="if(event.target===this)closeEditor()">
+  <div class="modal editor"><div class="modal-shell">
+    <div class="close" onclick="closeEditor()">×</div>
+    <div id="edit-body"></div>
+  </div></div>
+</div>
+
+${AUTH_JS}
+<script>
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
+let currentTeam = null;
+
+window.onAuthStateChange = (me) => {
+  if (!me.authenticated || me.needs_username) {
+    document.getElementById('signed-out').style.display = '';
+    document.getElementById('team-root').style.display = 'none';
+  } else {
+    document.getElementById('signed-out').style.display = 'none';
+    loadTeam();
+  }
+};
+
+async function loadTeam() {
+  const r = await fetch('/api/me/team');
+  if (!r.ok) {
+    document.getElementById('team-root').style.display = 'none';
+    document.getElementById('signed-out').style.display = '';
+    return;
+  }
+  const team = await r.json();
+  if (team.error) {
+    document.getElementById('team-root').innerHTML = '<div class="empty-state"><h2>No team yet</h2><p>Finish signup to get your starter roster.</p></div>';
+    document.getElementById('team-root').style.display = '';
+    return;
+  }
+  currentTeam = team;
+  renderTeam();
+  document.getElementById('team-root').style.display = '';
+}
+
+function renderFighter(f) {
+  const master = f.master_display_name || f.master_file_name || '—';
+  const stam = Number(f.stamina || 0).toFixed(2);
+  return '<div class="fighter-row" onclick="openEditor(' + f.id + ')">' +
+    '<div class="fr-name">' + esc(f.display_name) + '</div>' +
+    '<div class="fr-master">' + esc(master) + '</div>' +
+    '<div class="fr-stats">' + f.matches_won + 'W · ' + f.matches_lost + 'L · ' + f.matches_drawn + 'D</div>' +
+    '<div class="fr-stam">stamina ' + stam + '</div>' +
+    '<div class="fr-edit">edit →</div>' +
+  '</div>';
+}
+
+function renderSection(id, rows) {
+  document.getElementById(id).innerHTML = rows.length
+    ? rows.map(renderFighter).join('')
+    : '<div class="roster-empty">(none)</div>';
+}
+
+function renderTeam() {
+  const t = currentTeam;
+  document.getElementById('team-name').value = t.name || '';
+  const active = t.fighters.filter(f => f.slot === 'active').sort((a,b) => a.priority - b.priority || a.id - b.id);
+  const bench  = t.fighters.filter(f => f.slot === 'bench' ).sort((a,b) => a.id - b.id);
+  const forSale = t.fighters.filter(f => f.slot === 'for_sale').sort((a,b) => a.id - b.id);
+  renderSection('active-slots', active);
+  renderSection('bench-slots', bench);
+  if (forSale.length) {
+    document.getElementById('forsale-section').style.display = '';
+    renderSection('forsale-slots', forSale);
+  }
+}
+
+async function saveTeamName() {
+  const name = document.getElementById('team-name').value.trim();
+  const msg = document.getElementById('team-name-msg');
+  msg.className = 'msg'; msg.textContent = '…';
+  const r = await fetch('/api/team/' + currentTeam.id + '/name', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({name}),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    currentTeam.name = body.name;
+    msg.className = 'msg ok'; msg.textContent = 'saved';
+  } else {
+    msg.className = 'msg err'; msg.textContent = body.error || 'error';
+  }
+  setTimeout(() => { msg.textContent = ''; }, 2200);
+}
+
+async function openEditor(fighterId) {
+  const f = currentTeam.fighters.find(x => x.id === fighterId);
+  if (!f) return;
+  document.getElementById('edit-body').innerHTML =
+    '<h3>' + esc(f.display_name) + '</h3>' +
+    '<div class="sub">Master: ' + esc(f.master_display_name || f.master_file_name) + ' · ' + esc(f.slot) + ' · priority ' + f.priority + '</div>' +
+    '<div class="stats">' +
+      '<div class="stat"><div class="v">' + f.matches_won + '</div><div class="l">Wins</div></div>' +
+      '<div class="stat"><div class="v">' + f.matches_lost + '</div><div class="l">Losses</div></div>' +
+      '<div class="stat"><div class="v">' + f.matches_drawn + '</div><div class="l">Draws</div></div>' +
+      '<div class="stat"><div class="v">' + Number(f.stamina || 0).toFixed(2) + '</div><div class="l">Stamina</div></div>' +
+    '</div>' +
+    '<div class="row">' +
+      '<label>Name</label>' +
+      '<input type="text" id="edit-name" value="' + esc(f.display_name) + '" maxlength="40">' +
+      '<button onclick="saveFighterName(' + f.id + ')">Rename</button>' +
+      '<span class="msg" id="edit-name-msg"></span>' +
+    '</div>' +
+    '<div class="ai-hdr">AI &middot; loading…</div>' +
+    '<textarea id="edit-cmd" spellcheck="false" disabled>loading…</textarea>' +
+    '<div class="row" style="margin-top:10px">' +
+      '<button id="edit-ai-save" onclick="saveFighterAI(' + f.id + ')" disabled>Save AI</button>' +
+      '<span class="msg" id="edit-ai-msg"></span>' +
+    '</div>';
+  document.getElementById('edit-bg').classList.add('open');
+
+  const r = await fetch('/api/owned-fighter/' + fighterId + '/ai');
+  if (!r.ok) {
+    document.querySelector('.ai-hdr').textContent = 'AI · unavailable';
+    return;
+  }
+  const ai = await r.json();
+  document.querySelector('.ai-hdr').textContent =
+    'AI &middot; ' + (ai.source === 'override' ? 'your override v' + ai.version : 'stock master');
+  const ta = document.getElementById('edit-cmd');
+  ta.value = ai.cmd_text;
+  ta.disabled = false;
+  document.getElementById('edit-ai-save').disabled = false;
+}
+
+function closeEditor() {
+  document.getElementById('edit-bg').classList.remove('open');
+}
+
+async function saveFighterName(id) {
+  const name = document.getElementById('edit-name').value.trim();
+  const msg = document.getElementById('edit-name-msg');
+  msg.className = 'msg'; msg.textContent = '…';
+  const r = await fetch('/api/owned-fighter/' + id + '/name', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({name}),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    const f = currentTeam.fighters.find(x => x.id === id);
+    if (f) f.display_name = body.name;
+    renderTeam();
+    msg.className = 'msg ok'; msg.textContent = 'saved';
+    // also update the title in the modal header
+    document.querySelector('#edit-body h3').textContent = body.name;
+  } else {
+    msg.className = 'msg err'; msg.textContent = body.error || 'error';
+  }
+  setTimeout(() => { msg.textContent = ''; }, 2200);
+}
+
+async function saveFighterAI(id) {
+  const cmd_text = document.getElementById('edit-cmd').value;
+  const msg = document.getElementById('edit-ai-msg');
+  msg.className = 'msg'; msg.textContent = 'validating…';
+  const r = await fetch('/api/owned-fighter/' + id + '/ai', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({cmd_text}),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    msg.className = 'msg ok'; msg.textContent = 'saved v' + body.version;
+    document.querySelector('.ai-hdr').textContent = 'AI · your override v' + body.version;
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = (body.error || 'error') + (body.reason ? ' (' + body.reason + ')' : '');
+  }
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeEditor(); });
+</script>
+</body></html>`;
+
 const LEAGUES_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><title>Leagues · MugenBattle</title>
@@ -429,11 +814,13 @@ const LEAGUES_HTML = `<!doctype html>
   .worker .wid { color: #6e7681; font-size: 10px; text-transform: uppercase; }
   .empty-state { text-align: center; padding: 40px 20px; color: #6e7681; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
 </style></head>
-<body>
+<body style="position:relative">
+${AUTH_BAR_HTML}
 <h1>📺 Live Leagues</h1>
 <nav>
   <a href="/">Live (tournament)</a>
   <a href="/leagues" class="active">Leagues</a>
+  <a href="/team">My Team</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div id="workers"></div>
@@ -508,6 +895,8 @@ async function tick() {
 tick();
 setInterval(tick, 2000);
 </script>
+${AUTH_MODAL_HTML}
+${AUTH_JS}
 </body></html>`;
 
 const HTML = `<!doctype html>
@@ -582,10 +971,12 @@ const HTML = `<!doctype html>
 </style>
 </head>
 <body style="position:relative">
-<div class="auth-bar" id="auth-bar"></div>
+${AUTH_BAR_HTML}
 <h1>🥊 MugenBattle Live</h1>
 <nav>
   <a href="/" class="active">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/team">My Team</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div class="grid">
@@ -617,120 +1008,8 @@ const HTML = `<!doctype html>
   </div>
 </div>
 ${MODAL_HTML}
-<div class="modal-bg" id="auth-modal" onclick="if(event.target===this)closeAuth()">
-  <div class="modal"><div class="modal-shell">
-    <div class="close" onclick="closeAuth()">×</div>
-    <h3>Sign in</h3>
-    <div class="sub">We'll email you a 6-digit code. No password.</div>
-    <div class="auth-form" id="auth-step-email">
-      <input type="email" id="auth-email" placeholder="you@example.com" autocomplete="email">
-      <button onclick="authSendCode()">Send code</button>
-      <div class="msg" id="auth-msg-1"></div>
-    </div>
-    <div class="auth-form" id="auth-step-code" style="display:none">
-      <input type="text" id="auth-code" placeholder="6-digit code" maxlength="6" inputmode="numeric" autocomplete="one-time-code">
-      <button onclick="authVerifyCode()">Verify</button>
-      <div class="msg" id="auth-msg-2"></div>
-    </div>
-    <div class="auth-form" id="auth-step-username" style="display:none">
-      <div class="sub" style="margin-bottom:2px">Pick a display name. This is the only thing other people will see.</div>
-      <input type="text" id="auth-username" placeholder="username" maxlength="20" autocomplete="username">
-      <button onclick="authSetUsername()">Save</button>
-      <div class="msg" id="auth-msg-3"></div>
-    </div>
-  </div></div>
-</div>
-<script>
-function _escAuth(s) { return String(s == null ? '' : s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
-function _showAuthStep(which) {
-  for (const s of ['email', 'code', 'username']) {
-    document.getElementById('auth-step-' + s).style.display = (s === which) ? '' : 'none';
-  }
-  for (const i of [1, 2, 3]) document.getElementById('auth-msg-' + i).textContent = '';
-}
-async function refreshAuth() {
-  const r = await fetch('/api/auth/me');
-  const me = await r.json();
-  const bar = document.getElementById('auth-bar');
-  if (me.authenticated) {
-    if (me.needs_username) {
-      bar.innerHTML = '<button onclick="openAuth()">Pick username</button>';
-      openAuth(); // nudge them into finishing signup
-      _showAuthStep('username');
-    } else {
-      bar.innerHTML = '<span class="user-email">' + _escAuth(me.username) + '</span>' +
-        '<button class="logout" onclick="authLogout()">Sign out</button>';
-    }
-  } else {
-    bar.innerHTML = '<button onclick="openAuth()">Sign in</button>';
-  }
-}
-function openAuth() {
-  _showAuthStep('email');
-  document.getElementById('auth-modal').classList.add('open');
-  setTimeout(() => document.getElementById('auth-email').focus(), 50);
-}
-function closeAuth() { document.getElementById('auth-modal').classList.remove('open'); }
-async function authSendCode() {
-  const email = document.getElementById('auth-email').value.trim();
-  const msg = document.getElementById('auth-msg-1');
-  msg.className = 'msg'; msg.textContent = 'Sending…';
-  const r = await fetch('/api/auth/send-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
-  const body = await r.json();
-  if (r.ok) {
-    document.getElementById('auth-step-email').style.display = 'none';
-    document.getElementById('auth-step-code').style.display = '';
-    document.getElementById('auth-msg-2').className = 'msg ok';
-    document.getElementById('auth-msg-2').textContent = 'Code sent. Check your email.';
-    setTimeout(() => document.getElementById('auth-code').focus(), 50);
-  } else {
-    msg.className = 'msg err';
-    msg.textContent = body.error || 'Failed to send code';
-  }
-}
-async function authVerifyCode() {
-  const email = document.getElementById('auth-email').value.trim();
-  const code = document.getElementById('auth-code').value.trim();
-  const msg = document.getElementById('auth-msg-2');
-  msg.className = 'msg'; msg.textContent = 'Verifying…';
-  const r = await fetch('/api/auth/verify-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, code }) });
-  const body = await r.json();
-  if (!r.ok) {
-    msg.className = 'msg err';
-    msg.textContent = body.error || 'Failed to verify';
-    return;
-  }
-  if (body.needs_username) {
-    _showAuthStep('username');
-    setTimeout(() => document.getElementById('auth-username').focus(), 50);
-  } else {
-    closeAuth();
-    refreshAuth();
-  }
-}
-async function authSetUsername() {
-  const username = document.getElementById('auth-username').value.trim();
-  const msg = document.getElementById('auth-msg-3');
-  msg.className = 'msg'; msg.textContent = 'Saving…';
-  const r = await fetch('/api/auth/set-username', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username }),
-  });
-  const body = await r.json();
-  if (r.ok) {
-    closeAuth();
-    refreshAuth();
-  } else {
-    msg.className = 'msg err';
-    msg.textContent = body.error || 'Could not save';
-  }
-}
-async function authLogout() {
-  await fetch('/api/auth/logout', { method: 'POST' });
-  refreshAuth();
-}
-refreshAuth();
-</script>
+${AUTH_MODAL_HTML}
+${AUTH_JS}
 <div class="fs-modal" id="fs-modal" onclick="if(event.target===this)closeFullscreen()">
   <div class="fs-close" onclick="closeFullscreen()">×</div>
   <h2 id="fs-title"></h2>
@@ -1073,6 +1352,11 @@ const server = createServer((req, res) => {
   if (req.url === '/leagues' || req.url === '/leagues/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(LEAGUES_HTML);
+    return;
+  }
+  if (req.url === '/team' || req.url === '/team/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(TEAM_HTML);
     return;
   }
   if (req.url === '/leaderboard' || req.url === '/leaderboard/') {
