@@ -229,19 +229,21 @@ const tournament = program.command('tournament').description('Bracket tournament
 
 tournament
   .command('start')
-  .description('Create and run a new single-elimination tournament')
-  .requiredOption('-s, --size <n>', 'bracket size (power of 2: 2, 4, 8, 16, 32, 64, ...)', (v) => parseInt(v, 10))
-  .option('-n, --name <name>', 'tournament name')
+  .description('Create and run a new tournament (single-elimination or round-robin)')
+  .requiredOption('-s, --size <n>', 'fighter count (elimination: power of 2; roundrobin: any >= 3)', (v) => parseInt(v, 10))
+  .option('-n, --name <name>', 'tournament name (auto-generated if omitted)')
+  .option('-f, --format <kind>', 'elimination | roundrobin', 'elimination')
   .option('--selection <kind>', 'fighter selection: fresh (least-played) | random | top', 'fresh')
-  .option('--seeding <kind>', 'bracket seeding: random or seeded', 'random')
+  .option('--seeding <kind>', 'bracket seeding (elimination only): random or seeded', 'random')
   .action(async (opts) => {
-    const { tournamentId, fighters } = createTournament({
+    const { tournamentId, fighters, name } = createTournament({
       size: opts.size,
       name: opts.name,
+      format: opts.format,
       selection: opts.selection,
       seeding: opts.seeding,
     });
-    console.log(`Created tournament #${tournamentId} with ${fighters.length} fighters.`);
+    console.log(`Created tournament #${tournamentId} "${name}" with ${fighters.length} fighters (${opts.format}).`);
     await runTournament(tournamentId);
   });
 
@@ -261,23 +263,51 @@ tournament
       console.log('No tournaments yet. Start one with: mugenbattle tournament start --size 8');
       return;
     }
-    console.log(`\n${'#'.padStart(4)} ${'Size'.padStart(5)} ${'Status'.padEnd(10)} ${'Seeding'.padEnd(8)} ${'Winner'.padEnd(25)} Name`);
-    console.log('-'.repeat(85));
+    console.log(`\n${'#'.padStart(4)} ${'Size'.padStart(5)} ${'Format'.padEnd(11)} ${'Status'.padEnd(10)} ${'Winner'.padEnd(25)} Name`);
+    console.log('-'.repeat(90));
     for (const t of rows) {
       const winner = t.winner_display || t.winner_name || (t.status === 'complete' ? '(unknown)' : '(tbd)');
+      const format = t.format || 'elimination';
       console.log(
-        `${String(t.id).padStart(4)} ${String(t.size).padStart(5)} ${t.status.padEnd(10)} ${(t.seeding || '').padEnd(8)} ${winner.slice(0, 25).padEnd(25)} ${t.name || ''}`
+        `${String(t.id).padStart(4)} ${String(t.size).padStart(5)} ${format.padEnd(11)} ${t.status.padEnd(10)} ${winner.slice(0, 25).padEnd(25)} ${t.name || ''}`
       );
     }
   });
 
 tournament
   .command('show <id>')
-  .description('Show bracket state for a tournament')
+  .description('Show bracket / standings for a tournament')
   .action((id) => {
     const { tournament: t, matches } = showTournament(parseInt(id, 10));
     console.log(`\nTournament #${t.id}${t.name ? ` — ${t.name}` : ''}`);
-    console.log(`Size ${t.size}, seeding=${t.seeding}, selection=${t.selection}, status=${t.status}`);
+    console.log(`Size ${t.size}, format=${t.format || 'elimination'}, selection=${t.selection}, status=${t.status}`);
+
+    if ((t.format || 'elimination') === 'roundrobin') {
+      // Standings table
+      const wins = new Map();
+      const played = new Map();
+      const fighterName = new Map();
+      for (const m of matches) {
+        const a = m.fighter_one_id, b = m.fighter_two_id;
+        fighterName.set(a, m.f1_display || m.f1_name || `#${a}`);
+        fighterName.set(b, m.f2_display || m.f2_name || `#${b}`);
+        if (m.victor_id != null) {
+          played.set(a, (played.get(a) || 0) + 1);
+          played.set(b, (played.get(b) || 0) + 1);
+          wins.set(m.victor_id, (wins.get(m.victor_id) || 0) + 1);
+        }
+      }
+      const standings = [...new Set([...wins.keys(), ...played.keys(), ...fighterName.keys()])]
+        .map((id) => ({ id, name: fighterName.get(id), w: wins.get(id) || 0, p: played.get(id) || 0 }))
+        .sort((a, b) => b.w - a.w || a.name.localeCompare(b.name));
+      console.log('\n  Standings');
+      standings.forEach((s, i) => console.log(`    ${String(i + 1).padStart(2)}. ${s.name.padEnd(28)} ${s.w}W / ${s.p - s.w}L`));
+      const completed = matches.filter((m) => m.victor_id).length;
+      console.log(`\n  Completed: ${completed} / ${matches.length} matches`);
+      return;
+    }
+
+    // Elimination bracket
     if (t.status === 'complete') {
       const winner = matches[matches.length - 1];
       console.log(`Winner: ${winner?.v_display || winner?.v_name}`);

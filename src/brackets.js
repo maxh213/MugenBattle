@@ -18,6 +18,27 @@ function assertPowerOfTwo(n) {
   }
 }
 
+const NAME_ADJECTIVES = [
+  'Eternal', 'Crimson', 'Iron', 'Blood', 'Phantom', 'Infernal', 'Royal', 'Fatal',
+  'Absolute', 'Brutal', 'Savage', 'Violent', 'Frozen', 'Burning', 'Cursed', 'Divine',
+  'Chaotic', 'Primal', 'Ancient', 'Mythic', 'Steel', 'Shadow', 'Thunder', 'Cosmic',
+  'Forbidden', 'Final', 'Twilight', 'Astral', 'Doomed', 'Endless', 'Vengeful', 'Sacred',
+  'Hellfire', 'Galactic', 'Tempest', 'Obsidian', 'Wraith', 'Spectral', 'Apocalyptic', 'Volcanic',
+];
+const NAME_NOUNS = [
+  'Gauntlet', 'Carnage', 'Reckoning', 'Onslaught', 'Inferno', 'Tempest', 'Genesis', 'Crucible',
+  'Colosseum', 'Tournament', 'Championship', 'Cup', 'Battle', 'Showdown', 'Brawl', 'Kombat',
+  'Fury', 'Rampage', 'Judgment', 'Conquest', 'Massacre', 'Strike', 'Onslaught', 'Vortex',
+  'Maelstrom', 'Bloodbath', 'Gladiator', 'Skirmish', 'Throwdown', 'Mayhem', 'Pandemonium',
+  'Apocalypse', 'Cataclysm', 'Eruption', 'Awakening', 'Ascension', 'Gambit', 'Annihilation',
+];
+
+function generateTournamentName() {
+  const adj = NAME_ADJECTIVES[Math.floor(Math.random() * NAME_ADJECTIVES.length)];
+  const noun = NAME_NOUNS[Math.floor(Math.random() * NAME_NOUNS.length)];
+  return `${adj} ${noun}`;
+}
+
 function shuffle(arr) {
   const out = [...arr];
   for (let i = out.length - 1; i > 0; i--) {
@@ -122,41 +143,70 @@ function seededBracketOrder(size) {
   return list;
 }
 
-export function createTournament({ size, name, selection = 'random', seeding = 'random' }) {
-  assertPowerOfTwo(size);
+export function createTournament({ size, name, selection = 'fresh', seeding = 'random', format = 'elimination' }) {
+  if (!['elimination', 'roundrobin'].includes(format)) {
+    throw new Error(`Invalid format: ${format}`);
+  }
+  if (format === 'elimination') {
+    assertPowerOfTwo(size);
+  } else if (size < 3) {
+    throw new Error('Round-robin needs at least 3 fighters');
+  }
   if (!['random', 'top', 'fresh'].includes(selection)) {
     throw new Error(`Invalid selection: ${selection}`);
   }
   if (!['random', 'seeded'].includes(seeding)) {
     throw new Error(`Invalid seeding: ${seeding}`);
   }
-  if (seeding === 'seeded' && selection !== 'top') {
-    // Seeded pairing needs ranked input; upgrade selection automatically.
+  if (seeding === 'seeded' && selection !== 'top' && format === 'elimination') {
     selection = 'top';
   }
 
   const db = getDb();
   const fighters = selectFighters(db, size, selection);
-  const pairs = buildRoundOnePairs(fighters, seeding);
+  const finalName = name || generateTournamentName();
 
   const insertTournament = db.prepare(
-    'INSERT INTO tournament (name, size, selection, seeding) VALUES (?, ?, ?, ?)'
+    'INSERT INTO tournament (name, size, selection, seeding, format) VALUES (?, ?, ?, ?, ?)'
   );
   const insertMatch = db.prepare(
     'INSERT INTO tournament_match (tournament_id, round, match_index, fighter_one_id, fighter_two_id) VALUES (?, ?, ?, ?, ?)'
   );
 
-  const txn = db.transaction(() => {
-    const result = insertTournament.run(name || null, size, selection, seeding);
-    const tournamentId = result.lastInsertRowid;
-    pairs.forEach((pair, idx) => {
-      insertMatch.run(tournamentId, 1, idx, pair[0].id, pair[1].id);
-    });
-    return tournamentId;
-  });
+  let tournamentId;
+  let pairs;
 
-  const tournamentId = txn();
-  return { tournamentId, fighters, pairs };
+  if (format === 'roundrobin') {
+    // Every fighter vs every other fighter, once.
+    pairs = [];
+    const shuffled = shuffle(fighters);
+    for (let i = 0; i < shuffled.length; i++) {
+      for (let j = i + 1; j < shuffled.length; j++) {
+        pairs.push([shuffled[i], shuffled[j]]);
+      }
+    }
+    pairs = shuffle(pairs); // randomize match order so it's fun to watch
+    const txn = db.transaction(() => {
+      const result = insertTournament.run(finalName, size, selection, seeding, 'roundrobin');
+      tournamentId = result.lastInsertRowid;
+      pairs.forEach((pair, idx) => {
+        insertMatch.run(tournamentId, 1, idx, pair[0].id, pair[1].id);
+      });
+    });
+    txn();
+  } else {
+    pairs = buildRoundOnePairs(fighters, seeding);
+    const txn = db.transaction(() => {
+      const result = insertTournament.run(finalName, size, selection, seeding, 'elimination');
+      tournamentId = result.lastInsertRowid;
+      pairs.forEach((pair, idx) => {
+        insertMatch.run(tournamentId, 1, idx, pair[0].id, pair[1].id);
+      });
+    });
+    txn();
+  }
+
+  return { tournamentId, fighters, pairs, name: finalName };
 }
 
 function pickActiveStage(db) {
@@ -220,10 +270,14 @@ async function playMatch(db, matchRow) {
     if (!f1v.ok) {
       console.log(`  ⚠ ${f1.file_name} failed pre-flight (${f1v.reason}) — deactivating`);
       db.prepare('UPDATE fighter SET active = 0, validation_reason = ? WHERE id = ?').run(f1v.reason, f1.id);
+      const n = cascadeWalkover(db, matchRow.tournament_id, f1.id);
+      if (n > 0) console.log(`    · auto-walkover ${n} remaining matches`);
     }
     if (!f2v.ok) {
       console.log(`  ⚠ ${f2.file_name} failed pre-flight (${f2v.reason}) — deactivating`);
       db.prepare('UPDATE fighter SET active = 0, validation_reason = ? WHERE id = ?').run(f2v.reason, f2.id);
+      const n = cascadeWalkover(db, matchRow.tournament_id, f2.id);
+      if (n > 0) console.log(`    · auto-walkover ${n} remaining matches`);
     }
     const winner = !f1v.ok && f2v.ok ? f2 : !f2v.ok && f1v.ok ? f1 : Math.random() < 0.5 ? f1 : f2;
     db.prepare(
@@ -259,7 +313,9 @@ async function playMatch(db, matchRow) {
     const broken = detectBrokenFighter(msg, [f1, f2]);
     if (broken) {
       console.log(`  ⚠ broken char detected: ${broken.file_name} — deactivating`);
-      db.prepare('UPDATE fighter SET active = 0 WHERE id = ?').run(broken.id);
+      db.prepare('UPDATE fighter SET active = 0, validation_reason = ? WHERE id = ?').run('runtime_error', broken.id);
+      const n = cascadeWalkover(db, matchRow.tournament_id, broken.id);
+      if (n > 0) console.log(`    · auto-walkover ${n} remaining matches`);
       const winnerFighter = broken.id === f1.id ? 'fighter2' : 'fighter1';
       result = { winner: winnerFighter, fighter1Rounds: 0, fighter2Rounds: 0 };
     } else {
@@ -288,6 +344,29 @@ function detectBrokenFighter(errorMsg, fighters) {
     }
   }
   return null;
+}
+
+/**
+ * When a fighter is deactivated mid-tournament, walkover every pending match
+ * they're scheduled for in this tournament so we don't relaunch Ikemen against
+ * the same broken char again and risk a coin-flip wrong-decision.
+ */
+function cascadeWalkover(db, tournamentId, brokenFighterId) {
+  const pending = db
+    .prepare(
+      'SELECT * FROM tournament_match WHERE tournament_id = ? AND victor_id IS NULL ' +
+        'AND (fighter_one_id = ? OR fighter_two_id = ?)'
+    )
+    .all(tournamentId, brokenFighterId, brokenFighterId);
+  if (pending.length === 0) return 0;
+  const update = db.prepare(
+    "UPDATE tournament_match SET victor_id = ?, fought_at = datetime('now') WHERE id = ?"
+  );
+  for (const m of pending) {
+    const winnerId = m.fighter_one_id === brokenFighterId ? m.fighter_two_id : m.fighter_one_id;
+    update.run(winnerId, m.id);
+  }
+  return pending.length;
 }
 
 function advanceRound(db, tournamentId, fromRound) {
@@ -325,6 +404,10 @@ export async function runTournament(tournamentId) {
     const winner = db.prepare('SELECT * FROM fighter WHERE id = ?').get(t.winner_id);
     console.log(`Tournament already complete — winner was ${winner?.display_name || winner?.file_name}`);
     return t;
+  }
+
+  if (t.format === 'roundrobin') {
+    return runRoundRobin(db, t);
   }
 
   const rounds = Math.log2(t.size);
@@ -391,6 +474,48 @@ export async function runTournament(tournamentId) {
   }
 
   return db.prepare('SELECT * FROM tournament WHERE id = ?').get(tournamentId);
+}
+
+async function runRoundRobin(db, t) {
+  console.log(`\n=== Round-Robin #${t.id} "${t.name || ''}" (${t.size} fighters, ${(t.size * (t.size - 1)) / 2} matches) ===`);
+
+  const matches = db
+    .prepare(
+      'SELECT * FROM tournament_match WHERE tournament_id = ? AND victor_id IS NULL ORDER BY match_index'
+    )
+    .all(t.id);
+
+  for (const m of matches) {
+    await playMatch(db, m);
+  }
+
+  // Compute standings
+  const standings = db
+    .prepare(`
+      SELECT f.id, f.file_name, f.display_name,
+        SUM(CASE WHEN tm.victor_id = f.id THEN 1 ELSE 0 END) AS wins,
+        COUNT(*) AS played
+      FROM fighter f
+      JOIN tournament_match tm ON (tm.fighter_one_id = f.id OR tm.fighter_two_id = f.id)
+      WHERE tm.tournament_id = ?
+      GROUP BY f.id
+      ORDER BY wins DESC, f.file_name ASC
+    `)
+    .all(t.id);
+
+  console.log('\n--- Final Standings ---');
+  standings.forEach((s, i) => {
+    console.log(`  ${i + 1}. ${s.display_name || s.file_name}  ${s.wins} W / ${s.played - s.wins} L`);
+  });
+
+  const winner = standings[0];
+  if (winner) {
+    db.prepare(
+      'UPDATE tournament SET winner_id = ?, status = ?, completed_at = datetime(\'now\') WHERE id = ?'
+    ).run(winner.id, 'complete', t.id);
+    console.log(`\n🏆  CHAMPION: ${winner.display_name || winner.file_name}  (${winner.wins} wins)`);
+  }
+  return db.prepare('SELECT * FROM tournament WHERE id = ?').get(t.id);
 }
 
 export function listTournaments() {

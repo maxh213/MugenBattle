@@ -80,6 +80,7 @@ function migrate(db) {
   addColumnIfMissing(db, 'stage', 'source_url', 'TEXT');
   addColumnIfMissing(db, 'fighter', 'validated_at', 'TEXT');
   addColumnIfMissing(db, 'fighter', 'validation_reason', 'TEXT');
+  addColumnIfMissing(db, 'tournament', 'format', 'TEXT');
 }
 
 function addColumnIfMissing(db, table, column, type) {

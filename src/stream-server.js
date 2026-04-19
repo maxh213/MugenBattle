@@ -35,9 +35,11 @@ const FPS = parseInt(process.env.STREAM_FPS || '15', 10);
 
 // ---------- Xvfb + ffmpeg lifecycle ----------
 
-let xvfb, ffmpeg;
+let xvfb, ffmpeg, audioFfmpeg;
 const frameBuffer = { data: null, ts: 0 };  // latest JPEG frame
 const clients = new Set();
+const audioClients = new Set();
+const PULSE_SOURCE = process.env.STREAM_AUDIO_SOURCE || 'mugenbattle.monitor';
 
 function startXvfb() {
   xvfb = spawn('Xvfb', [DISPLAY, '-screen', '0', `${SIZE}x24`, '-nolisten', 'tcp'], {
@@ -109,6 +111,33 @@ function startFfmpeg() {
   console.log(`[ffmpeg] capturing ${DISPLAY} at ${SIZE}@${FPS}`);
 }
 
+function startAudio() {
+  // Capture the mugenbattle PulseAudio sink monitor, encode to MP3, and
+  // broadcast to any connected /audiostream clients as chunked HTTP.
+  audioFfmpeg = spawn('ffmpeg', [
+    '-loglevel', 'error',
+    '-f', 'pulse',
+    '-i', PULSE_SOURCE,
+    '-c:a', 'libmp3lame',
+    '-b:a', '128k',
+    '-ac', '2',
+    '-ar', '44100',
+    '-f', 'mp3',
+    '-',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  audioFfmpeg.stdout.on('data', (chunk) => {
+    for (const c of audioClients) {
+      try { c.write(chunk); } catch {}
+    }
+  });
+  audioFfmpeg.stderr.on('data', (d) => process.stderr.write(`[audio] ${d}`));
+  audioFfmpeg.on('exit', (code) => {
+    console.error(`[audio] ffmpeg exited with code ${code}`);
+    audioFfmpeg = null;
+  });
+  console.log(`[audio] capturing ${PULSE_SOURCE} → mp3 @ 128k`);
+}
+
 // ---------- State + DB queries ----------
 
 function readMatchState() {
@@ -138,6 +167,7 @@ function getActiveTournament() {
   if (!t) return null;
   const matches = db.prepare(`
     SELECT tm.round, tm.match_index, tm.victor_id,
+      tm.fighter_one_id, tm.fighter_two_id,
       f1.file_name AS f1_name, f1.display_name AS f1_display,
       f2.file_name AS f2_name, f2.display_name AS f2_display,
       v.file_name AS v_name, v.display_name AS v_display
@@ -369,9 +399,28 @@ const HTML = `<!doctype html>
 <style>${COMMON_CSS}
   .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
   .sidebar { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+  .stream-row { display: grid; grid-template-columns: 1fr 2fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 1100px) { .stream-row { grid-template-columns: 1fr; } }
   .stream-wrap { max-width: 1280px; margin: 0 auto; }
   .stream { background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 4 / 3; }
   .stream img { width: 100%; height: 100%; object-fit: contain; display: block; image-rendering: pixelated; }
+  .fighter-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+  .fighter-card.empty { opacity: 0.3; }
+  .fighter-card .fc-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .fighter-card .fc-portrait { width: 56px; height: 56px; background: #0d1117; border-radius: 6px; image-rendering: pixelated; object-fit: contain; border: 1px solid #30363d; }
+  .fighter-card .fc-name { font-size: 14px; font-weight: 600; line-height: 1.2; cursor: pointer; }
+  .fighter-card .fc-name:hover { color: #58a6ff; }
+  .fighter-card .fc-author { color: #8b949e; font-size: 11px; }
+  .fighter-card .fc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-bottom: 10px; font-size: 11px; }
+  .fighter-card .fc-stat { text-align: center; background: #0d1117; padding: 6px 2px; border-radius: 4px; }
+  .fighter-card .fc-stat .v { font-size: 16px; font-weight: 600; color: #c9d1d9; }
+  .fighter-card .fc-stat .l { color: #8b949e; font-size: 9px; text-transform: uppercase; }
+  .fighter-card h3 { margin: 0 0 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: #8b949e; }
+  .fighter-card table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .fighter-card td { padding: 2px 4px; border-bottom: 1px solid #21262d; }
+  .fighter-card .res-w { color: #3fb950; font-weight: 600; }
+  .fighter-card .res-l { color: #f85149; font-weight: 600; }
+  .fighter-card .res-d { color: #8b949e; }
   .info { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; margin-top: 10px; font-size: 14px; color: #c9d1d9; flex-wrap: wrap; }
   .info .match strong { color: #f0ae3c; }
   .info .tourney { color: #8b949e; font-size: 12px; }
@@ -384,6 +433,20 @@ const HTML = `<!doctype html>
   .vs { color: #6e7681; }
   .name-link { cursor: pointer; }
   .name-link:hover { text-decoration: underline; color: #58a6ff; }
+  .fs-trigger { float: right; font-size: 14px; cursor: pointer; color: #58a6ff; user-select: none; }
+  .fs-trigger:hover { color: #c9d1d9; }
+  .fs-modal { position: fixed; inset: 0; background: rgba(13,17,23,0.97); z-index: 100; padding: 24px; overflow: auto; display: none; }
+  .fs-modal.open { display: block; }
+  .fs-modal .fs-close { position: fixed; top: 18px; right: 28px; cursor: pointer; font-size: 28px; color: #8b949e; z-index: 101; user-select: none; }
+  .fs-modal .fs-close:hover { color: #c9d1d9; }
+  .fs-modal h2 { margin: 0 0 16px; font-size: 18px; color: #c9d1d9; }
+  .fs-modal svg { width: 100%; height: auto; display: block; }
+  .matchup-matrix { border-collapse: collapse; margin-top: 14px; font-size: 11px; }
+  .matchup-matrix th, .matchup-matrix td { padding: 4px 6px; border: 1px solid #21262d; text-align: center; }
+  .matchup-matrix th.row-hdr { text-align: right; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .matchup-matrix .cell-w { color: #3fb950; }
+  .matchup-matrix .cell-l { color: #f85149; }
+  .matchup-matrix .cell-u { color: #6e7681; }
   .see-all { display: block; text-align: right; font-size: 11px; color: #58a6ff; margin-top: 6px; }
 </style>
 </head>
@@ -394,16 +457,20 @@ const HTML = `<!doctype html>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div class="grid">
-  <div class="stream-wrap">
-    <div class="stream"><img src="/stream" alt="live"></div>
-    <div class="info">
-      <div class="match" id="match-info">No active match</div>
-      <div class="tourney" id="tourney-info"></div>
+  <div class="stream-row">
+    <div class="fighter-card empty" id="fc-1"></div>
+    <div class="stream-wrap">
+      <div class="stream"><img src="/stream" alt="live"></div>
+      <div class="info">
+        <div class="match" id="match-info">No active match</div>
+        <div class="tourney" id="tourney-info"></div>
+      </div>
     </div>
+    <div class="fighter-card empty" id="fc-2"></div>
   </div>
   <div class="sidebar">
     <div class="panel" id="bracket-panel">
-      <h2>Bracket</h2>
+      <h2>Bracket <span class="fs-trigger" onclick="openFullscreen()" title="Full-screen view">⛶</span></h2>
       <div class="bracket" id="bracket">(no active tournament)</div>
     </div>
     <div class="panel">
@@ -418,16 +485,144 @@ const HTML = `<!doctype html>
   </div>
 </div>
 ${MODAL_HTML}
+<div class="fs-modal" id="fs-modal" onclick="if(event.target===this)closeFullscreen()">
+  <div class="fs-close" onclick="closeFullscreen()">×</div>
+  <h2 id="fs-title"></h2>
+  <div id="fs-body"></div>
+</div>
 <script>
+let lastTournament = null;
+function openFullscreen() {
+  if (!lastTournament) return;
+  const t = lastTournament;
+  document.getElementById('fs-title').textContent =
+    \`Tournament #\${t.id} · \${t.name || ''}\${t.format === 'roundrobin' ? '  (Round-Robin, ' + t.size + ' fighters)' : '  (' + t.size + '-fighter bracket)'}\`;
+  document.getElementById('fs-body').innerHTML = t.format === 'roundrobin' ? renderRoundRobinFs(t) : renderBracketSvg(t);
+  document.getElementById('fs-modal').classList.add('open');
+}
+function closeFullscreen() { document.getElementById('fs-modal').classList.remove('open'); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeFullscreen(); });
+
+function renderBracketSvg(t) {
+  const size = t.size;
+  const rounds = Math.log2(size);
+  const colW = 220, matchH = 60, matchW = 200, margin = 30, lineH = 22;
+  const byRound = {};
+  for (const m of t.matches) (byRound[m.round] ||= [])[m.match_index] = m;
+  const totalH = (size / 2) * matchH + margin * 2;
+  const totalW = rounds * colW + matchW + margin * 2;
+  const labels = { 2: 'Final', 4: 'Semifinals', 8: 'Quarterfinals' };
+  let svg = \`<svg viewBox="0 0 \${totalW} \${totalH}" xmlns="http://www.w3.org/2000/svg" font-family="system-ui">\`;
+  for (let r = 1; r <= rounds; r++) {
+    const ms = byRound[r] || [];
+    const stride = matchH * (2 ** (r - 1));
+    const startY = stride / 2 - matchH / 2 + margin;
+    const x = (r - 1) * colW + margin;
+    // Round label at top
+    const remaining = size / (2 ** (r - 1));
+    const label = labels[remaining] || ('Round of ' + remaining);
+    svg += \`<text x="\${x + matchW/2}" y="\${margin - 8}" fill="#8b949e" font-size="11" text-anchor="middle" text-transform="uppercase">\${esc(label)}</text>\`;
+    for (let i = 0; i < ms.length; i++) {
+      const m = ms[i];
+      if (!m) continue;
+      const y = startY + i * stride;
+      const f1Won = m.victor_id === m.fighter_one_id;
+      const f2Won = m.victor_id === m.fighter_two_id;
+      const decided = !!m.victor_id;
+      svg += \`<rect x="\${x}" y="\${y}" width="\${matchW}" height="\${matchH}" fill="#161b22" stroke="#30363d" rx="4"/>\`;
+      svg += \`<text x="\${x + 10}" y="\${y + lineH}" font-size="13" fill="\${f1Won ? '#f0ae3c' : (decided ? '#6e7681' : '#c9d1d9')}" font-weight="\${f1Won ? '700' : '400'}" style="cursor:pointer" onclick="closeFullscreen();openProfile('\${esc(m.f1_name).replace(/'/g, "\\\\'")}')">\${esc((m.f1_display || m.f1_name || '?').slice(0, 24))}</text>\`;
+      svg += \`<line x1="\${x + 6}" y1="\${y + matchH/2}" x2="\${x + matchW - 6}" y2="\${y + matchH/2}" stroke="#21262d"/>\`;
+      svg += \`<text x="\${x + 10}" y="\${y + matchH/2 + lineH}" font-size="13" fill="\${f2Won ? '#f0ae3c' : (decided ? '#6e7681' : '#c9d1d9')}" font-weight="\${f2Won ? '700' : '400'}" style="cursor:pointer" onclick="closeFullscreen();openProfile('\${esc(m.f2_name).replace(/'/g, "\\\\'")}')">\${esc((m.f2_display || m.f2_name || '?').slice(0, 24))}</text>\`;
+      // Connector to next round
+      if (r < rounds) {
+        const nextStride = matchH * (2 ** r);
+        const nextStartY = nextStride / 2 - matchH / 2 + margin;
+        const nextI = Math.floor(i / 2);
+        const nextY = nextStartY + nextI * nextStride + matchH / 2;
+        const sx = x + matchW;
+        const ex = x + colW;
+        const mx = (sx + ex) / 2;
+        svg += \`<polyline points="\${sx},\${y + matchH/2} \${mx},\${y + matchH/2} \${mx},\${nextY} \${ex},\${nextY}" stroke="#30363d" stroke-width="1.5" fill="none"/>\`;
+      }
+    }
+  }
+  // Champion box at the end
+  if (rounds > 0) {
+    const finalMatch = (byRound[rounds] || [])[0];
+    if (finalMatch && finalMatch.victor_id) {
+      const x = rounds * colW + margin;
+      const y = totalH / 2 - matchH / 2;
+      svg += \`<rect x="\${x}" y="\${y}" width="\${matchW}" height="\${matchH}" fill="#1f2933" stroke="#f0ae3c" stroke-width="2" rx="4"/>\`;
+      svg += \`<text x="\${x + matchW/2}" y="\${y - 8}" fill="#f0ae3c" font-size="12" text-anchor="middle">CHAMPION</text>\`;
+      svg += \`<text x="\${x + matchW/2}" y="\${y + matchH/2 + 6}" font-size="16" fill="#f0ae3c" font-weight="700" text-anchor="middle">\${esc(finalMatch.v_display || finalMatch.v_name || '')}</text>\`;
+    }
+  }
+  svg += '</svg>';
+  return svg;
+}
+
+function renderRoundRobinFs(t) {
+  // Collect distinct fighter ids in match order
+  const fighterMap = new Map();
+  for (const m of t.matches) {
+    if (!fighterMap.has(m.fighter_one_id)) fighterMap.set(m.fighter_one_id, m.f1_display || m.f1_name);
+    if (!fighterMap.has(m.fighter_two_id)) fighterMap.set(m.fighter_two_id, m.f2_display || m.f2_name);
+  }
+  const ids = [...fighterMap.keys()];
+  const wins = new Map(), played = new Map();
+  for (const m of t.matches) {
+    if (m.victor_id != null) {
+      played.set(m.fighter_one_id, (played.get(m.fighter_one_id) || 0) + 1);
+      played.set(m.fighter_two_id, (played.get(m.fighter_two_id) || 0) + 1);
+      wins.set(m.victor_id, (wins.get(m.victor_id) || 0) + 1);
+    }
+  }
+  const sortedIds = [...ids].sort((a, b) => (wins.get(b) || 0) - (wins.get(a) || 0));
+  // Standings table
+  let html = '<div style="display:flex;gap:24px;flex-wrap:wrap"><div><h3 style="font-size:13px;color:#8b949e;margin:0 0 8px">Standings</h3><table style="font-size:13px"><thead><tr><th style="text-align:left;padding:4px 8px">#</th><th style="text-align:left;padding:4px 8px">Fighter</th><th style="padding:4px 8px">W</th><th style="padding:4px 8px">L</th></tr></thead><tbody>';
+  sortedIds.forEach((id, i) => {
+    const w = wins.get(id) || 0;
+    const p = played.get(id) || 0;
+    html += \`<tr style="cursor:pointer" onclick="closeFullscreen();openProfile('\${esc(t.matches.find(m => m.fighter_one_id===id)?.f1_name || t.matches.find(m => m.fighter_two_id===id)?.f2_name || '').replace(/'/g, "\\\\'")}')"><td style="padding:3px 8px;color:#8b949e">\${i + 1}</td><td style="padding:3px 8px">\${esc(fighterMap.get(id))}</td><td style="padding:3px 8px;text-align:center;color:#3fb950">\${w}</td><td style="padding:3px 8px;text-align:center;color:#f85149">\${p - w}</td></tr>\`;
+  });
+  html += '</tbody></table></div>';
+  // Matchup matrix (W/L grid)
+  const lookup = new Map();
+  for (const m of t.matches) {
+    if (m.victor_id != null) {
+      lookup.set(m.fighter_one_id + '_' + m.fighter_two_id, m.victor_id === m.fighter_one_id ? 'W' : 'L');
+      lookup.set(m.fighter_two_id + '_' + m.fighter_one_id, m.victor_id === m.fighter_two_id ? 'W' : 'L');
+    }
+  }
+  html += '<div><h3 style="font-size:13px;color:#8b949e;margin:0 0 8px">Matchup Matrix</h3><table class="matchup-matrix"><thead><tr><th></th>';
+  for (const id of sortedIds) html += \`<th title="\${esc(fighterMap.get(id))}">\${esc(fighterMap.get(id).slice(0,3))}</th>\`;
+  html += '</tr></thead><tbody>';
+  for (const rowId of sortedIds) {
+    html += \`<tr><th class="row-hdr">\${esc(fighterMap.get(rowId))}</th>\`;
+    for (const colId of sortedIds) {
+      if (rowId === colId) { html += '<td class="cell-u">—</td>'; continue; }
+      const r = lookup.get(rowId + '_' + colId);
+      const cls = r === 'W' ? 'cell-w' : r === 'L' ? 'cell-l' : 'cell-u';
+      html += \`<td class="\${cls}">\${r || '·'}</td>\`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div></div>';
+  return html;
+}
+
 async function refresh() {
   try {
     const r = await fetch('/api/state'); const s = await r.json();
     document.getElementById('match-info').innerHTML = s.match
       ? \`<strong>\${link(s.match.f1, s.match.f1_fn)}</strong> vs <strong>\${link(s.match.f2, s.match.f2_fn)}</strong>  ·  \${esc(s.match.stage)}\${s.match.round ? '  ·  round ' + s.match.round : ''}\`
       : 'Idle';
+    updateFighterCard('fc-1', s.match?.f1_fn);
+    updateFighterCard('fc-2', s.match?.f2_fn);
     document.getElementById('tourney-info').textContent = s.tournament
       ? \`Tournament #\${s.tournament.id} · \${s.tournament.name || ''} · size \${s.tournament.size}\`
       : '';
+    lastTournament = s.tournament || null;
     document.getElementById('bracket').innerHTML = s.tournament ? renderBracket(s.tournament) : '<span style="color:#6e7681">(no active tournament)</span>';
     const lb = s.leaderboard.map(f =>
       \`<tr class="clickable" onclick="openProfile('\${esc(f.file_name).replace(/'/g,'\\\\\\'')}')"><td>\${esc(f.display_name || f.file_name)}<div class="author">\${esc(f.author || '')}</div></td><td>\${f.matches_won}</td><td>\${f.matches_lost}</td><td>\${f.matches_drawn}</td><td>\${f.win_rate}%</td></tr>\`
@@ -443,17 +638,93 @@ async function refresh() {
   } catch (e) { console.error(e); }
 }
 function esc(s) { return String(s || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+
+// Fighter-card caching: don't re-fetch for the same fighter each poll.
+const fcCache = new Map();
+async function updateFighterCard(cardId, fileName) {
+  const el = document.getElementById(cardId);
+  if (!fileName) { el.classList.add('empty'); el.innerHTML = ''; return; }
+  el.classList.remove('empty');
+  let data = fcCache.get(fileName);
+  if (!data) {
+    try {
+      const r = await fetch('/api/fighter/' + encodeURIComponent(fileName));
+      if (!r.ok) return;
+      data = await r.json();
+      fcCache.set(fileName, data);
+      // Evict cache after 5 min so stats refresh
+      setTimeout(() => fcCache.delete(fileName), 5 * 60 * 1000);
+    } catch { return; }
+  }
+  const recent = (data.recent || []).slice(0, 8).map(m => {
+    const self = (data.display_name || data.file_name);
+    const opp = (m.f1 === self || m.f1 === data.file_name) ? m.f2 : m.f1;
+    let res, cls;
+    if (!m.victor) { res = 'D'; cls = 'res-d'; }
+    else if (m.victor_file === data.file_name || m.victor === self) { res = 'W'; cls = 'res-w'; }
+    else { res = 'L'; cls = 'res-l'; }
+    return \`<tr><td class="\${cls}">\${res}</td><td>\${esc(opp || '?')}</td></tr>\`;
+  }).join('');
+  el.innerHTML = \`
+    <div class="fc-head">
+      <img class="fc-portrait" src="/portrait/\${encodeURIComponent(data.file_name)}.png" onerror="this.style.visibility='hidden'">
+      <div>
+        <div class="fc-name" onclick="openProfile('\${esc(data.file_name).replace(/'/g, "\\\\'")}')">\${esc(data.display_name || data.file_name)}</div>
+        <div class="fc-author">\${esc(data.author || '')}</div>
+      </div>
+    </div>
+    <div class="fc-stats">
+      <div class="fc-stat"><div class="v">\${data.matches_won}</div><div class="l">W</div></div>
+      <div class="fc-stat"><div class="v">\${data.matches_lost}</div><div class="l">L</div></div>
+      <div class="fc-stat"><div class="v">\${data.matches_drawn}</div><div class="l">D</div></div>
+      <div class="fc-stat"><div class="v">\${data.win_rate}%</div><div class="l">Win</div></div>
+    </div>
+    \${recent ? \`<h3>Recent</h3><table>\${recent}</table>\` : ''}
+  \`;
+}
 function link(label, fileName) {
   if (!fileName) return esc(label || '');
   return \`<span class="name-link" onclick="openProfile('\${esc(fileName).replace(/'/g,"\\\\'")}')">\${esc(label || fileName)}</span>\`;
 }
+function renderRoundRobinSidebar(t) {
+  const fighterMap = new Map();
+  for (const m of t.matches) {
+    if (!fighterMap.has(m.fighter_one_id)) fighterMap.set(m.fighter_one_id, { name: m.f1_display || m.f1_name, fn: m.f1_name });
+    if (!fighterMap.has(m.fighter_two_id)) fighterMap.set(m.fighter_two_id, { name: m.f2_display || m.f2_name, fn: m.f2_name });
+  }
+  const wins = new Map(), played = new Map();
+  for (const m of t.matches) {
+    if (m.victor_id != null) {
+      played.set(m.fighter_one_id, (played.get(m.fighter_one_id) || 0) + 1);
+      played.set(m.fighter_two_id, (played.get(m.fighter_two_id) || 0) + 1);
+      wins.set(m.victor_id, (wins.get(m.victor_id) || 0) + 1);
+    }
+  }
+  const sorted = [...fighterMap.entries()]
+    .map(([id, f]) => ({ id, name: f.name, fn: f.fn, w: wins.get(id) || 0, p: played.get(id) || 0 }))
+    .sort((a, b) => b.w - a.w || a.name.localeCompare(b.name));
+  const completed = t.matches.filter((m) => m.victor_id).length;
+  let out = '<div class="round-title">Standings · ' + completed + ' / ' + t.matches.length + '</div>';
+  for (const f of sorted) {
+    out += '<div class="match decided">' + link(f.name, f.fn) + ' <span class="vs">·</span> ' + f.w + 'W ' + (f.p - f.w) + 'L</div>';
+  }
+  const pending = t.matches.find((m) => !m.victor_id);
+  if (pending) {
+    out += '<div class="round-title" style="margin-top:10px">Up next</div>';
+    out += '<div class="match">' + link(pending.f1_display || pending.f1_name, pending.f1_name) + ' <span class="vs">vs</span> ' + link(pending.f2_display || pending.f2_name, pending.f2_name) + '</div>';
+  }
+  return out;
+}
+
 function renderBracket(t) {
+  if (t.format === 'roundrobin') return renderRoundRobinSidebar(t);
   const byRound = {};
   for (const m of t.matches) (byRound[m.round] ||= []).push(m);
   const rounds = Math.log2(t.size);
   const names = { 2: 'Final', 4: 'Semis', 8: 'Quarters' };
   let out = '';
-  for (let r = 1; r <= rounds; r++) {
+  // Latest round first (so the current action is at the top, no scrolling to see it)
+  for (let r = rounds; r >= 1; r--) {
     const label = names[t.size / (2 ** (r - 1))] || 'Round of ' + (t.size / (2 ** (r - 1)));
     const ms = byRound[r] || [];
     if (!ms.length) continue;
@@ -497,13 +768,23 @@ const server = createServer((req, res) => {
       'Connection': 'close',
     });
     clients.add(res);
-    // Send most recent frame immediately if available
     if (frameBuffer.data) {
       res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frameBuffer.data.length}\r\n\r\n`);
       res.write(frameBuffer.data);
       res.write('\r\n');
     }
     req.on('close', () => clients.delete(res));
+    return;
+  }
+  if (req.url === '/audiostream') {
+    res.writeHead(200, {
+      'Content-Type': 'audio/mpeg',
+      'Cache-Control': 'no-store',
+      'Connection': 'close',
+      'Transfer-Encoding': 'chunked',
+    });
+    audioClients.add(res);
+    req.on('close', () => audioClients.delete(res));
     return;
   }
   if (req.url === '/api/state') {
@@ -555,6 +836,9 @@ const server = createServer((req, res) => {
 
 startXvfb();
 setTimeout(startFfmpeg, 1500);
+// Audio streaming is disabled until we solve OpenAL/PulseAudio routing properly —
+// PULSE_SINK didn't actually redirect Ikemen's output. Left the startAudio + /audiostream
+// plumbing in place for when we revisit.
 server.listen(PORT, () => {
   console.log(`[server] http://localhost:${PORT}`);
   console.log(`[hint] run tournaments with: DISPLAY=${DISPLAY} node src/index.js tournament start --size 8 --stream`);
