@@ -635,7 +635,8 @@ const SCOUT_HTML = `<!doctype html>
   .scout-hdr .user { color: #8b949e; font-size: 13px; }
   .scout-hdr .badge { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 4px; background: #21262d; color: #6e7681; margin-left: 8px; text-transform: uppercase; letter-spacing: 0.3px; vertical-align: middle; }
   .roster-section h3 { font-size: 12px; text-transform: uppercase; color: #8b949e; margin: 16px 0 6px; letter-spacing: 0.4px; }
-  .scout-row { display: grid; grid-template-columns: 2fr 2fr 1fr 0.8fr; gap: 12px; padding: 10px 14px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 4px; font-size: 13px; align-items: center; }
+  .scout-row { display: grid; grid-template-columns: 44px 2fr 2fr 1fr 0.8fr; gap: 12px; padding: 8px 14px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 4px; font-size: 13px; align-items: center; }
+  .scout-row .fr-port { width: 44px; height: 44px; background: #0d1117; border-radius: 4px; object-fit: contain; image-rendering: pixelated; border: 1px solid #21262d; }
   .scout-row .fr-name { font-weight: 600; color: #c9d1d9; }
   .scout-row .fr-master { color: #8b949e; font-size: 12px; font-style: italic; }
   .scout-row .fr-stats { color: #8b949e; font-size: 12px; font-variant-numeric: tabular-nums; text-align: center; }
@@ -678,7 +679,12 @@ async function load() {
     const right = f.slot === 'for_sale' && f.listing_price_cents != null
       ? '<div class="fr-price">' + fmtCents(f.listing_price_cents) + '</div>'
       : '<div class="fr-stats">stamina ' + Number(f.stamina || 0).toFixed(2) + '</div>';
+    const portraitSrc = f.master_file_name ? '/portrait/' + encodeURIComponent(f.master_file_name) + '.png' : '';
+    const portrait = portraitSrc
+      ? '<img class="fr-port" src="' + portraitSrc + '" alt="" onerror="this.style.visibility=\\'hidden\\'">'
+      : '<div class="fr-port"></div>';
     return '<div class="scout-row">' +
+      portrait +
       '<div class="fr-name">' + esc(f.display_name) + '</div>' +
       '<div class="fr-master">' + esc(master) + '</div>' +
       '<div class="fr-stats">' + f.matches_won + '-' + f.matches_lost + '-' + f.matches_drawn + '</div>' +
@@ -1196,7 +1202,8 @@ const TEAM_HTML = `<!doctype html>
   .team-header .msg.err { color: #f85149; }
   .roster-section { margin-bottom: 18px; }
   .roster-section h2 { font-size: 12px; text-transform: uppercase; color: #8b949e; margin: 0 0 8px; letter-spacing: 0.4px; }
-  .fighter-row { display: grid; grid-template-columns: 20px 2fr 2fr 1fr 0.8fr 0.6fr; gap: 12px; padding: 12px 14px; align-items: center; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 6px; cursor: pointer; transition: border-color 0.1s, opacity 0.1s; }
+  .fighter-row { display: grid; grid-template-columns: 20px 44px 2fr 2fr 1fr 0.8fr 0.6fr; gap: 12px; padding: 10px 14px; align-items: center; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 6px; cursor: pointer; transition: border-color 0.1s, opacity 0.1s; }
+  .fighter-row .fr-port { width: 44px; height: 44px; background: #0d1117; border-radius: 4px; object-fit: contain; image-rendering: pixelated; border: 1px solid #21262d; }
   .fighter-row:hover { border-color: #58a6ff; }
   .fighter-row[draggable=true] { cursor: grab; }
   .fighter-row[draggable=true]:active { cursor: grabbing; }
@@ -1522,12 +1529,17 @@ function renderFighter(f) {
     ? '<div class="fr-stam" style="color:#f0ae3c;font-weight:600">' + fmtCents(f.listing_price_cents) + '</div>'
     : '<div class="fr-stam">stamina ' + stam + '</div>';
   const dragAttrs = f.slot === 'for_sale' ? '' : ' draggable="true"';
+  const portraitSrc = f.master_file_name ? '/portrait/' + encodeURIComponent(f.master_file_name) + '.png' : '';
+  const portrait = portraitSrc
+    ? '<img class="fr-port" src="' + portraitSrc + '" alt="" onerror="this.style.visibility=\\'hidden\\'">'
+    : '<div class="fr-port"></div>';
   return '<div class="fighter-row"' + dragAttrs + ' data-fid="' + f.id + '" data-slot="' + esc(f.slot) + '"' +
     ' ondragstart="dragStart(event,' + f.id + ')" ondragover="dragOver(event)"' +
     ' ondragenter="dragEnter(event)" ondragleave="dragLeave(event)"' +
     ' ondrop="dropOn(event,' + f.id + ')" ondragend="dragEnd(event)"' +
     ' onclick="maybeOpenEditor(event,' + f.id + ')">' +
     '<div class="fr-grip">⋮⋮</div>' +
+    portrait +
     '<div class="fr-name">' + esc(f.display_name) + '</div>' +
     '<div class="fr-master">' + esc(master) + '</div>' +
     '<div class="fr-stats">' + f.matches_won + 'W · ' + f.matches_lost + 'L · ' + f.matches_drawn + 'D</div>' +
@@ -1665,9 +1677,15 @@ async function saveLineup() {
 async function openEditor(fighterId) {
   const f = currentTeam.fighters.find(x => x.id === fighterId);
   if (!f) return;
+  const portraitSrc = f.master_file_name ? '/portrait/' + encodeURIComponent(f.master_file_name) + '.png' : '';
   document.getElementById('edit-body').innerHTML =
-    '<h3>' + esc(f.display_name) + '</h3>' +
-    '<div class="sub">Master: ' + esc(f.master_display_name || f.master_file_name) + ' · ' + esc(f.slot) + ' · priority ' + f.priority + '</div>' +
+    '<div style="display:flex;gap:14px;align-items:center;margin-bottom:10px">' +
+      (portraitSrc
+        ? '<img src="' + portraitSrc + '" style="width:72px;height:72px;image-rendering:pixelated;background:#0d1117;border:1px solid #30363d;border-radius:6px;object-fit:contain" onerror="this.style.visibility=\\'hidden\\'">'
+        : '') +
+      '<div style="flex:1"><h3 style="margin:0">' + esc(f.display_name) + '</h3>' +
+      '<div class="sub">Master: ' + esc(f.master_display_name || f.master_file_name) + ' · ' + esc(f.slot) + ' · priority ' + f.priority + '</div></div>' +
+    '</div>' +
     '<div class="stats">' +
       '<div class="stat"><div class="v">' + f.matches_won + '</div><div class="l">Wins</div></div>' +
       '<div class="stat"><div class="v">' + f.matches_lost + '</div><div class="l">Losses</div></div>' +
