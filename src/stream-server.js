@@ -906,8 +906,14 @@ const TEAM_HTML = `<!doctype html>
   .team-header .msg.err { color: #f85149; }
   .roster-section { margin-bottom: 18px; }
   .roster-section h2 { font-size: 12px; text-transform: uppercase; color: #8b949e; margin: 0 0 8px; letter-spacing: 0.4px; }
-  .fighter-row { display: grid; grid-template-columns: 2fr 2fr 1fr 0.8fr 0.6fr; gap: 12px; padding: 12px 14px; align-items: center; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 6px; cursor: pointer; transition: border-color 0.1s; }
+  .fighter-row { display: grid; grid-template-columns: 20px 2fr 2fr 1fr 0.8fr 0.6fr; gap: 12px; padding: 12px 14px; align-items: center; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 6px; cursor: pointer; transition: border-color 0.1s, opacity 0.1s; }
   .fighter-row:hover { border-color: #58a6ff; }
+  .fighter-row[draggable=true] { cursor: grab; }
+  .fighter-row[draggable=true]:active { cursor: grabbing; }
+  .fighter-row.dragging { opacity: 0.4; }
+  .fighter-row.drop-target { border-color: #f0ae3c; background: #1d1d14; }
+  .fighter-row .fr-grip { color: #6e7681; font-size: 12px; cursor: grab; user-select: none; }
+  .fighter-row[data-slot=for_sale] .fr-grip { visibility: hidden; }
   .fighter-row .fr-name { font-size: 14px; font-weight: 600; color: #c9d1d9; }
   .fighter-row .fr-master { color: #8b949e; font-size: 12px; font-style: italic; }
   .fighter-row .fr-stats { color: #8b949e; font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -1057,7 +1063,13 @@ function renderFighter(f) {
   const right = f.slot === 'for_sale' && f.listing_price_cents != null
     ? '<div class="fr-stam" style="color:#f0ae3c;font-weight:600">' + fmtCents(f.listing_price_cents) + '</div>'
     : '<div class="fr-stam">stamina ' + stam + '</div>';
-  return '<div class="fighter-row" onclick="openEditor(' + f.id + ')">' +
+  const dragAttrs = f.slot === 'for_sale' ? '' : ' draggable="true"';
+  return '<div class="fighter-row"' + dragAttrs + ' data-fid="' + f.id + '" data-slot="' + esc(f.slot) + '"' +
+    ' ondragstart="dragStart(event,' + f.id + ')" ondragover="dragOver(event)"' +
+    ' ondragenter="dragEnter(event)" ondragleave="dragLeave(event)"' +
+    ' ondrop="dropOn(event,' + f.id + ')" ondragend="dragEnd(event)"' +
+    ' onclick="maybeOpenEditor(event,' + f.id + ')">' +
+    '<div class="fr-grip">⋮⋮</div>' +
     '<div class="fr-name">' + esc(f.display_name) + '</div>' +
     '<div class="fr-master">' + esc(master) + '</div>' +
     '<div class="fr-stats">' + f.matches_won + 'W · ' + f.matches_lost + 'L · ' + f.matches_drawn + 'D</div>' +
@@ -1102,6 +1114,94 @@ async function saveTeamName() {
     msg.className = 'msg err'; msg.textContent = body.error || 'error';
   }
   setTimeout(() => { msg.textContent = ''; }, 2200);
+}
+
+// ---------- Drag-drop lineup reorder ----------
+
+let dragId = null;
+
+function dragStart(e, id) {
+  dragId = id;
+  e.currentTarget.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  // needed for Firefox to actually fire drop
+  e.dataTransfer.setData('text/plain', String(id));
+}
+function dragOver(e) {
+  if (dragId == null) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+}
+function dragEnter(e) {
+  if (dragId == null) return;
+  const row = e.currentTarget;
+  if (Number(row.dataset.fid) === dragId) return;
+  row.classList.add('drop-target');
+}
+function dragLeave(e) {
+  e.currentTarget.classList.remove('drop-target');
+}
+function dragEnd(e) {
+  e.currentTarget.classList.remove('dragging');
+  document.querySelectorAll('.fighter-row.drop-target').forEach(el => el.classList.remove('drop-target'));
+  dragId = null;
+}
+
+function maybeOpenEditor(e, fighterId) {
+  // If a drag-over highlight was left on this row, clear it.
+  e.currentTarget.classList.remove('drop-target', 'dragging');
+  // Only open editor on a plain click — not if the user just finished a drag.
+  if (dragId != null) return;
+  openEditor(fighterId);
+}
+
+async function dropOn(e, targetId) {
+  e.preventDefault();
+  const sourceId = dragId;
+  dragId = null;
+  document.querySelectorAll('.fighter-row.dragging, .fighter-row.drop-target')
+    .forEach((el) => el.classList.remove('dragging', 'drop-target'));
+  if (sourceId == null || sourceId === targetId) return;
+
+  const src = currentTeam.fighters.find(f => f.id === sourceId);
+  const tgt = currentTeam.fighters.find(f => f.id === targetId);
+  if (!src || !tgt) return;
+  if (src.slot === 'for_sale' || tgt.slot === 'for_sale') return;
+
+  // Swap slots + priorities. Keeps "exactly 5 active, 0..2 bench" because
+  // we're only ever swapping one-for-one.
+  const srcSlot = src.slot;
+  const srcPri = src.priority;
+  src.slot = tgt.slot;
+  src.priority = tgt.priority;
+  tgt.slot = srcSlot;
+  tgt.priority = srcPri;
+
+  renderTeam();
+  await saveLineup();
+}
+
+async function saveLineup() {
+  const active = currentTeam.fighters
+    .filter(f => f.slot === 'active')
+    .sort((a, b) => a.priority - b.priority || a.id - b.id)
+    .map(f => f.id);
+  const bench = currentTeam.fighters
+    .filter(f => f.slot === 'bench')
+    .sort((a, b) => a.priority - b.priority || a.id - b.id)
+    .map(f => f.id);
+  const priority = {};
+  active.forEach((id, i) => (priority[id] = i));
+  const r = await fetch('/api/team/' + currentTeam.id + '/lineup', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ active, bench, priority, auto_rotate: currentTeam.auto_rotate ? true : false }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    console.error('lineup save failed', body);
+    // reload to resync with server state
+    await loadTeam();
+  }
 }
 
 async function openEditor(fighterId) {
