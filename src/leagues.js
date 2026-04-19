@@ -17,7 +17,7 @@
  */
 
 import { pickActiveFighter, teamCanPlay } from './teams.js';
-import { runOwnedFighterMatch } from './match.js';
+import { runOwnedFighterMatch, applyMatchOutcome, parseIkemenResult } from './match.js';
 import { credit } from './wallet.js';
 import { seedBots } from './bots.js';
 
@@ -316,11 +316,27 @@ export async function runFixture(db, fixtureId, ctx) {
     });
   } catch (err) {
     console.error(`[fixture ${fixture.id}] match error: ${err.message.split('\n')[0]}`);
-    r = { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
-    const identified = deactivateIfIdentifiable(db, err.message || '');
-    if (!identified) {
-      chargeCrashSuspects(db, home.master_fighter_id, away.master_fighter_id);
+    // Ikemen frequently exits with a non-zero status even after a clean AI
+    // vs AI match (post-match teardown panics, bwrap kills at shutdown, etc).
+    // The match log still holds [p1wins]/[p2wins], so parse it first — only
+    // fall back to a synthetic draw if the log has nothing useful. Without
+    // this, wins were silently being recorded as 0-0 draws.
+    const matchLog = err.matchLog || '';
+    const parsed = matchLog ? parseIkemenResult(matchLog) : null;
+    const hasRealResult = parsed && (parsed.fighter1Rounds > 0 || parsed.fighter2Rounds > 0
+      || /\[p1wins\]\s*=>\s*\d+/.test(matchLog));
+    if (hasRealResult) {
+      r = parsed;
+    } else {
+      r = { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
+      const identified = deactivateIfIdentifiable(db, err.message || '');
+      if (!identified) {
+        chargeCrashSuspects(db, home.master_fighter_id, away.master_fighter_id);
+      }
     }
+    // runOwnedFighterMatch threw before it could persist stats + stamina;
+    // apply the outcome (real or synthetic) here.
+    applyMatchOutcome(db, home.id, away.id, r.winner);
   }
 
   const homeRounds = r.fighter1Rounds || 0;

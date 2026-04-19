@@ -398,6 +398,20 @@ const COMMON_CSS = `
   .modal .field b { color: #8b949e; display: inline-block; min-width: 80px; }
   .modal .close { position: absolute; top: 12px; right: 16px; cursor: pointer; color: #8b949e; font-size: 22px; }
   .modal-shell { position: relative; }
+  /* shared auth bar (top-right signed-in badge + sign-in/out buttons) */
+  .auth-bar { position: absolute; top: 16px; right: 16px; font-size: 13px; display: flex; align-items: center; gap: 10px; z-index: 10; }
+  .auth-bar button { background: #238636; color: white; border: 1px solid #2ea043; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .auth-bar button:hover { background: #2ea043; }
+  .auth-bar .user-email { color: #8b949e; }
+  .auth-bar .logout { background: transparent; color: #8b949e; border: 1px solid #30363d; }
+  .auth-bar .logout:hover { background: #21262d; color: #c9d1d9; }
+  /* auth modal form widgets */
+  .auth-form { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+  .auth-form input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 14px; }
+  .auth-form button { background: #238636; color: white; border: 1px solid #2ea043; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  .auth-form .msg { font-size: 12px; min-height: 1em; }
+  .auth-form .msg.err { color: #f85149; }
+  .auth-form .msg.ok { color: #3fb950; }
 `;
 
 const MODAL_HTML = `
@@ -814,10 +828,10 @@ async function load() {
       (data.pending > 0 ? '<span class="pending">' + data.pending + ' fixtures pending</span>' : '') +
     '</div>' +
     '<div class="zone-key">' +
-      '<div class="k"><span class="swatch champion"></span>Champion (tier 1 #1)</div>' +
+      '<div class="k"><span class="swatch champion"></span>Champion (League 1 #1)</div>' +
       '<div class="k"><span class="swatch promote"></span>Promotion (top ' + K + ')</div>' +
       '<div class="k"><span class="swatch relegate"></span>Relegation (bottom ' + K + ')</div>' +
-      '<div class="k"><span class="swatch drop"></span>Drop &amp; sit out (bottom ' + K + ' of bottom tier)</div>' +
+      '<div class="k"><span class="swatch drop"></span>Drop &amp; sit out (bottom ' + K + ' of bottom league)</div>' +
     '</div>';
 
   const tiers = data.divisions.map((d, i) => {
@@ -860,7 +874,7 @@ async function load() {
     }).join('');
     return '<div class="tier t' + d.tier + '">' +
       '<div class="hdr">' +
-        '<span class="tier-n">Tier ' + d.tier + '</span>' +
+        '<span class="tier-n">League ' + d.tier + '</span>' +
         '<span class="tname">' + esc(d.name) + '</span>' +
       '</div>' +
       '<div class="rows">' + rowsHtml + '</div>' +
@@ -1570,12 +1584,12 @@ async function loadWaitState() {
     const eta = fmtEta(w.eta_seconds || 0);
     const ahead = w.ahead_in_queue || 0;
     const queueMsg = ahead === 0
-      ? 'You\\'re first in the queue — guaranteed a seat in the next season\\'s bottom tier.'
+      ? 'You\\'re first in the queue — guaranteed a seat in the next season\\'s bottom league.'
       : ahead + ' real player' + (ahead === 1 ? '' : 's') + ' ahead of you in the queue.';
     host.innerHTML =
       '<div class="head">Waiting for next league</div>' +
       'Your team will join the next league when the current one finishes — estimated <span class="eta">' + eta + '</span> from now.' +
-      '<div class="meta">' + queueMsg + ' New signups take bot slots first, so if the bottom tier has room you\\'ll take a bot\\'s seat; otherwise you wait one cycle and come in at the NEXT season.</div>';
+      '<div class="meta">' + queueMsg + ' New signups take bot slots first, so if the bottom league has room you\\'ll take a bot\\'s seat; otherwise you wait one cycle and come in at the NEXT season.</div>';
     return;
   }
   host.innerHTML = '<div class="head">Waiting</div>' + 'Your team is between seasons.';
@@ -1605,7 +1619,7 @@ async function loadSchedule() {
       else scoreCls = 'loss';
     }
     return '<div class="schedule-row">' +
-      '<div class="sched-round">T' + f.tier + ' · R' + f.round_num + '.' + f.slot_num + '</div>' +
+      '<div class="sched-round">L' + f.tier + ' · R' + f.round_num + '.' + f.slot_num + '</div>' +
       '<div class="sched-team"><span class="' + homeCls.trim() + '">' + esc(f.home_name) + '</span></div>' +
       '<div class="sched-vs">vs</div>' +
       '<div class="sched-team away"><span class="' + awayCls.trim() + '">' + esc(f.away_name) + '</span></div>' +
@@ -2141,7 +2155,7 @@ function overlayHtml(w) {
   return (
     '<div class="hdr">' +
       '<span class="lname">' + esc(ctx.league.name) + '</span>' +
-      '<span class="tier">Tier ' + f.division.tier + ' · ' + esc(f.division.name) + '</span>' +
+      '<span class="tier">League ' + f.division.tier + ' · ' + esc(f.division.name) + '</span>' +
     '</div>' +
     '<div class="matchup">' +
       esc(f.home_team) +
@@ -2658,7 +2672,7 @@ ${AUTH_BAR_HTML}
 </div>
 
 <div class="sidebar-3">
-  <div class="panel"><h2>Table — Tier <span id="sb-tier">—</span></h2><div id="standings"></div></div>
+  <div class="panel"><h2>Table — League <span id="sb-tier">—</span></h2><div id="standings"></div></div>
   <div class="panel"><h2>Upcoming</h2><div id="upcoming"></div></div>
   <div class="panel"><h2>Recent</h2><div id="recent"></div></div>
 </div>
@@ -2677,7 +2691,7 @@ function renderTabs(league) {
   for (let t = 1; t <= 3; t++) {
     const el = document.createElement('div');
     el.className = 'tab tier-' + t + (t === activeTier ? ' active' : '');
-    el.textContent = 'Tier ' + t;
+    el.textContent = 'League ' + t;
     el.onclick = () => { activeTier = t; refresh(true); };
     tabs.appendChild(el);
   }
@@ -2710,7 +2724,7 @@ function renderSideCard(hostId, side) {
 
 function renderStream(workerId) {
   const host = document.getElementById('stream-wrap');
-  if (!workerId) { host.innerHTML = '<div class="placeholder">Waiting for this tier\\'s stream to start…</div>'; currentWorkerId = null; return; }
+  if (!workerId) { host.innerHTML = '<div class="placeholder">Waiting for this league\\'s stream to start…</div>'; currentWorkerId = null; return; }
   if (workerId !== currentWorkerId) {
     host.innerHTML = '<img src="/stream/' + workerId + '" alt="">';
     currentWorkerId = workerId;

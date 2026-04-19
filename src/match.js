@@ -181,6 +181,46 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
 }
 
 /**
+ * Persist W/L/D + stamina cost + teammate rest for both sides of a played
+ * match. Exported so the league runner can apply the same stats when the
+ * engine crashes and it substitutes a synthetic draw — otherwise a crashed
+ * fixture would finalize 0-0 without anyone's record or stamina moving.
+ *
+ * `winner` is the value returned by parsers: 'fighter1' | 'fighter2' | 'draw'.
+ * Master counters are bumped too so market pricing reflects lifetime record.
+ */
+export function applyMatchOutcome(db, homeOwnedFighterId, awayOwnedFighterId, winner) {
+  const home = db.prepare('SELECT team_id, master_fighter_id FROM owned_fighter WHERE id = ?').get(homeOwnedFighterId);
+  const away = db.prepare('SELECT team_id, master_fighter_id FROM owned_fighter WHERE id = ?').get(awayOwnedFighterId);
+  if (!home || !away) return;
+
+  const bumpOwnedW = db.prepare('UPDATE owned_fighter SET matches_won = matches_won + 1 WHERE id = ?');
+  const bumpOwnedL = db.prepare('UPDATE owned_fighter SET matches_lost = matches_lost + 1 WHERE id = ?');
+  const bumpOwnedD = db.prepare('UPDATE owned_fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?');
+  const bumpMasterW = db.prepare('UPDATE fighter SET matches_won = matches_won + 1 WHERE id = ?');
+  const bumpMasterL = db.prepare('UPDATE fighter SET matches_lost = matches_lost + 1 WHERE id = ?');
+  const bumpMasterD = db.prepare('UPDATE fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?');
+
+  const tx = db.transaction(() => {
+    if (winner === 'fighter1') {
+      bumpOwnedW.run(homeOwnedFighterId); bumpMasterW.run(home.master_fighter_id);
+      bumpOwnedL.run(awayOwnedFighterId); bumpMasterL.run(away.master_fighter_id);
+    } else if (winner === 'fighter2') {
+      bumpOwnedW.run(awayOwnedFighterId); bumpMasterW.run(away.master_fighter_id);
+      bumpOwnedL.run(homeOwnedFighterId); bumpMasterL.run(home.master_fighter_id);
+    } else {
+      bumpOwnedD.run(homeOwnedFighterId); bumpMasterD.run(home.master_fighter_id);
+      bumpOwnedD.run(awayOwnedFighterId); bumpMasterD.run(away.master_fighter_id);
+    }
+    applyMatchCost(db, homeOwnedFighterId);
+    applyMatchCost(db, awayOwnedFighterId);
+    applyTeamRest(db, home.team_id, homeOwnedFighterId);
+    applyTeamRest(db, away.team_id, awayOwnedFighterId);
+  });
+  tx();
+}
+
+/**
  * Run a match between two owned_fighter rows. Stages both chars (so AI
  * overrides apply), scales life by effective stamina, updates per-fighter
  * stats + stamina after the match, and cleans up the staged dirs.
@@ -228,35 +268,7 @@ export async function runOwnedFighterMatch({
     }
   }
 
-  // Persist stats + stamina in a single transaction. Master-level counters
-  // are also bumped so market pricing reflects lifetime record across all
-  // past owners of that master.
-  const bumpOwnedW = db.prepare('UPDATE owned_fighter SET matches_won = matches_won + 1 WHERE id = ?');
-  const bumpOwnedL = db.prepare('UPDATE owned_fighter SET matches_lost = matches_lost + 1 WHERE id = ?');
-  const bumpOwnedD = db.prepare('UPDATE owned_fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?');
-  const bumpMasterW = db.prepare('UPDATE fighter SET matches_won = matches_won + 1 WHERE id = ?');
-  const bumpMasterL = db.prepare('UPDATE fighter SET matches_lost = matches_lost + 1 WHERE id = ?');
-  const bumpMasterD = db.prepare('UPDATE fighter SET matches_drawn = matches_drawn + 1 WHERE id = ?');
-
-  const tx = db.transaction(() => {
-    if (result.winner === 'fighter1') {
-      bumpOwnedW.run(homeOwnedFighterId); bumpMasterW.run(home.master_fighter_id);
-      bumpOwnedL.run(awayOwnedFighterId); bumpMasterL.run(away.master_fighter_id);
-    } else if (result.winner === 'fighter2') {
-      bumpOwnedW.run(awayOwnedFighterId); bumpMasterW.run(away.master_fighter_id);
-      bumpOwnedL.run(homeOwnedFighterId); bumpMasterL.run(home.master_fighter_id);
-    } else {
-      bumpOwnedD.run(homeOwnedFighterId); bumpMasterD.run(home.master_fighter_id);
-      bumpOwnedD.run(awayOwnedFighterId); bumpMasterD.run(away.master_fighter_id);
-    }
-    applyMatchCost(db, homeOwnedFighterId);
-    applyMatchCost(db, awayOwnedFighterId);
-    // Event-driven rest: every non-retired roster fighter on the same team
-    // gains REST_RECOVERY while one of their teammates was in the ring.
-    applyTeamRest(db, home.team_id, homeOwnedFighterId);
-    applyTeamRest(db, away.team_id, awayOwnedFighterId);
-  });
-  tx();
+  applyMatchOutcome(db, homeOwnedFighterId, awayOwnedFighterId, result.winner);
 
   return {
     ...result,
