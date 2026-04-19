@@ -12,11 +12,17 @@
  * - A supervisor assigns running leagues to idle workers on a 10s poll.
  *
  * Env knobs:
- *   STREAM_PORT         HTTP port (default 8080)
- *   STREAM_WORKERS      parallel worker count (default 1)
- *   STREAM_DISPLAY_BASE base for worker X displays (default 99 → :100+i)
- *   STREAM_SIZE         capture resolution (default 640x480)
- *   STREAM_FPS          capture framerate (default 15)
+ *   STREAM_PORT             HTTP port (default 8080)
+ *   STREAM_WORKERS          parallel worker count (default 1)
+ *   STREAM_DISPLAY_BASE     base for worker X displays (default 99 → :100+i)
+ *   STREAM_SIZE             capture resolution (default 640x480)
+ *   STREAM_FPS              capture framerate (default 15)
+ *   STREAM_AUTO_SEASONS=1   continuous mode: auto-create next season when
+ *                           no league is running. Off by default.
+ *   STREAM_AUTO_DIVS        tiers per season (default 3)
+ *   STREAM_AUTO_PER_DIV     teams per division (default 8)
+ *   STREAM_AUTO_LEGS        round-robin legs (default 1)
+ *   STREAM_AUTO_PROMOTE_PER_TIER  top/bottom N per tier (default 2)
  */
 
 import { spawn } from 'child_process';
@@ -41,6 +47,7 @@ import {
   latestInterestingLeagueId,
   ownedFighterHistory,
   teamSchedule,
+  autoCreateSeason,
 } from './leagues.js';
 import {
   marketListings,
@@ -70,6 +77,14 @@ const FPS = parseInt(process.env.STREAM_FPS || '15', 10);
 const WORKER_COUNT = Math.max(1, parseInt(process.env.STREAM_WORKERS || '1', 10));
 const DISPLAY_BASE = parseInt(process.env.STREAM_DISPLAY_BASE || '99', 10);
 const SUPERVISOR_POLL_MS = 10_000;
+// Continuous-seasons mode: when no league is running, auto-create the next
+// one so the stream never idles. Off by default so `node src/stream-server`
+// on a dev laptop doesn't silently burn cycles.
+const AUTO_SEASONS = process.env.STREAM_AUTO_SEASONS === '1';
+const AUTO_DIVS = parseInt(process.env.STREAM_AUTO_DIVS || '3', 10);
+const AUTO_PER_DIV = parseInt(process.env.STREAM_AUTO_PER_DIV || '8', 10);
+const AUTO_LEGS = parseInt(process.env.STREAM_AUTO_LEGS || '1', 10);
+const AUTO_PROMOTE_PER_TIER = parseInt(process.env.STREAM_AUTO_PROMOTE_PER_TIER || '2', 10);
 
 // ---------- Worker pool ----------
 
@@ -127,9 +142,30 @@ function startSupervisor() {
     const claimed = new Set(
       Array.from(workers.values()).map((w) => w.leagueId).filter((x) => x != null)
     );
-    const leagues = db.prepare(`
+    let leagues = db.prepare(`
       SELECT id FROM league WHERE status = 'running' ORDER BY id
     `).all();
+
+    // Continuous-seasons mode: if nothing is running right now, seed the
+    // next season so the workers never sit idle. maybeCompleteLeague
+    // finalises the previous one on the last fixture, so by the time we
+    // hit this branch bot rosters have already retired and teams are
+    // eligible for a fresh seating.
+    if (AUTO_SEASONS && leagues.length === 0) {
+      try {
+        const r = autoCreateSeason(db, {
+          divCount: AUTO_DIVS, perDiv: AUTO_PER_DIV,
+          legs: AUTO_LEGS, promotePerTier: AUTO_PROMOTE_PER_TIER,
+        });
+        if (r) {
+          console.log(`[supervisor] auto-created league ${r.leagueId} "${r.name}" (${AUTO_DIVS}×${AUTO_PER_DIV}, bots=${r.botsUsed})`);
+          leagues = [{ id: r.leagueId }];
+        }
+      } catch (err) {
+        console.error(`[supervisor] auto-season failed: ${err.message}`);
+      }
+    }
+
     for (const w of workers.values()) {
       if (w.status !== 'idle') continue;
       const next = leagues.find((l) => !claimed.has(l.id));

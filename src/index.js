@@ -32,6 +32,7 @@ import {
   getStandings,
   listLeagues,
   computeNextSeasonSeating,
+  autoCreateSeason,
 } from './leagues.js';
 import { runLeagueWorker } from './leagueWorker.js';
 import { bootstrapTeamForUser } from './teams.js';
@@ -518,87 +519,28 @@ league
   .option('--promote-per-tier <n>', 'top-N promote / bottom-N relegate between tiers', (v) => parseInt(v, 10), 2)
   .action((opts) => {
     const db = getDb();
-    const divCount = Math.max(1, opts.divisions);
-    const perDiv = Math.max(2, opts.perDivision);
-    const totalSlots = divCount * perDiv;
-
-    // Pre-seat from prev-season standings if a completed league of matching
-    // shape exists. Otherwise start empty and let everyone go to bottom tier.
-    const pr = computeNextSeasonSeating(db, {
-      divCount, perDiv, promotePerTier: opts.promotePerTier,
-    });
-
-    const divisions = pr
-      ? pr.divisions.map((d) => ({ name: d.name, teamIds: [...d.teamIds] }))
-      : Array.from({ length: divCount }, (_, i) => ({ name: `Division ${i + 1}`, teamIds: [] }));
-    const dropped = pr ? [...pr.dropped] : [];
-    const alreadySeated = new Set(divisions.flatMap((d) => d.teamIds));
-    // Dropped teams from the last bottom-of-bottom sit out THIS season — they
-    // become eligible again for the season after. Excluding them from the
-    // new-real-team pool enforces that "skip a cycle" penalty.
-    const excluded = new Set([...alreadySeated, ...dropped]);
-
-    // Bottom tier absorbs new signups. Only real teams not in the prev
-    // season (fresh waitlist) go here; returning users were seated above.
-    const newRealTeams = db.prepare(`
-      SELECT t.id FROM team t
-      JOIN user_account u ON t.user_id = u.id
-      WHERE u.is_bot = 0
-        AND t.current_league_id IS NULL
-        AND (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id AND is_retired = 0 AND slot = 'active') >= 5
-      ORDER BY t.id
-    `).all().map((r) => r.id).filter((id) => !excluded.has(id));
-
-    const bottom = divisions[divCount - 1];
-    const bottomSpace = () => perDiv - bottom.teamIds.length;
-    const newSeated = [];
-    while (newRealTeams.length && bottomSpace() > 0) {
-      const id = newRealTeams.shift();
-      bottom.teamIds.push(id);
-      newSeated.push(id);
-    }
-    const waitingReal = newRealTeams.length;
-
-    // Fill any remaining per-tier gaps with bots. Seed bot roster as needed.
-    const gaps = divisions.reduce((sum, d) => sum + (perDiv - d.teamIds.length), 0);
-    const allBots = seedBots(db, Math.max(1, gaps));  // min 1 to avoid seedBots(0) corner
-    const botIdsReady = allBots
-      .filter((b) => {
-        const t = db.prepare('SELECT current_league_id FROM team WHERE id = ?').get(b.team_id);
-        return t.current_league_id == null && !excluded.has(b.team_id);
-      })
-      .map((b) => b.team_id);
-
-    let botIdx = 0;
-    for (const d of divisions) {
-      while (d.teamIds.length < perDiv && botIdx < botIdsReady.length) {
-        d.teamIds.push(botIdsReady[botIdx++]);
-      }
-    }
-
-    const botsUsed = botIdx;
-    const totalFilled = divisions.reduce((s, d) => s + d.teamIds.length, 0);
-    if (totalFilled < totalSlots) {
-      console.error(`Only filled ${totalFilled}/${totalSlots} slots. Increase bots or reduce divisions.`);
-      return;
-    }
-
-    const name = opts.name || `Season ${new Date().toISOString().slice(0, 10)}`;
     try {
-      const leagueId = createSeason(db, { name, divisions, legs: opts.legs });
+      const r = autoCreateSeason(db, {
+        divCount: Math.max(1, opts.divisions),
+        perDiv: Math.max(2, opts.perDivision),
+        legs: opts.legs,
+        promotePerTier: opts.promotePerTier,
+        seasonName: opts.name,
+      });
+      if (!r) { console.error('Could not fill bracket — check bot seeding.'); return; }
       const fixtureCount = db.prepare(`
         SELECT COUNT(*) AS n FROM fixture f
         JOIN division d ON f.division_id = d.id WHERE d.league_id = ?
-      `).get(leagueId).n;
-      console.log(`Created league #${leagueId} "${name}": ${divCount} divisions × ${perDiv} teams = ${totalSlots} slots, ${fixtureCount} fixtures.`);
-      if (pr) {
-        console.log(`  Seeded from prev standings (promote-per-tier=${opts.promotePerTier}); new signups: ${newSeated.length}, dropped: ${dropped.length}; bots: ${botsUsed}.`);
+      `).get(r.leagueId).n;
+      console.log(`Created league #${r.leagueId} "${r.name}": ${r.divisions.length} divisions × ${opts.perDivision} teams = ${r.totalSlots} slots, ${fixtureCount} fixtures.`);
+      if (r.hadPrevSeason) {
+        console.log(`  Seeded from prev standings (promote-per-tier=${opts.promotePerTier}); new signups: ${r.newSeated}, dropped: ${r.dropped.length}; bots: ${r.botsUsed}.`);
       } else {
-        console.log(`  Fresh seeding (no prev season); new real teams: ${newSeated.length}; bots: ${botsUsed}.`);
+        console.log(`  Fresh seeding (no prev season); new real teams: ${r.newSeated}; bots: ${r.botsUsed}.`);
       }
-      if (waitingReal > 0) console.log(`  ${waitingReal} real team(s) waiting for next season.`);
-      if (dropped.length > 0) console.log(`  Dropped to waitlist (bottom-of-bottom): teams ${dropped.join(', ')}`);
-      for (const d of divisions) {
+      if (r.waitingReal > 0) console.log(`  ${r.waitingReal} real team(s) waiting for next season.`);
+      if (r.dropped.length > 0) console.log(`  Dropped to waitlist (bottom-of-bottom): teams ${r.dropped.join(', ')}`);
+      for (const d of r.divisions) {
         console.log(`  ${d.name}: teams ${d.teamIds.join(', ')}`);
       }
     } catch (err) {

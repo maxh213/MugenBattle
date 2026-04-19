@@ -19,6 +19,7 @@
 import { selectLineup } from './teams.js';
 import { runOwnedFighterMatch } from './match.js';
 import { credit } from './wallet.js';
+import { seedBots } from './bots.js';
 
 const PRIZE_WIN_CENTS = 50;
 const PRIZE_DRAW_CENTS = 25;
@@ -519,6 +520,92 @@ export function computeNextSeasonSeating(db, { divCount, perDiv, promotePerTier 
   }
 
   return { divisions, dropped };
+}
+
+/**
+ * Create the next season end-to-end: seat returning teams per prev-season
+ * standings (promotion/relegation), route new signups into the bottom tier,
+ * top up bots to fill remaining slots, and insert the fixture list.
+ *
+ * Returns { leagueId, name, divisions, totalSlots, realSeated, waitingReal,
+ * botsUsed, dropped } on success, or null if we couldn't fill the bracket
+ * (shouldn't happen once bots are seeded but handled defensively).
+ *
+ * The CLI wraps this with nicer logging; the stream-server supervisor
+ * calls it on each empty-league tick when STREAM_AUTO_SEASONS=1.
+ */
+export function autoCreateSeason(db, {
+  divCount = 3,
+  perDiv = 8,
+  legs = 1,
+  promotePerTier = 2,
+  seasonName = null,
+} = {}) {
+  const totalSlots = divCount * perDiv;
+
+  const pr = computeNextSeasonSeating(db, { divCount, perDiv, promotePerTier });
+  const divisions = pr
+    ? pr.divisions.map((d) => ({ name: d.name, teamIds: [...d.teamIds] }))
+    : Array.from({ length: divCount }, (_, i) => ({ name: `Division ${i + 1}`, teamIds: [] }));
+  const dropped = pr ? [...pr.dropped] : [];
+  const alreadySeated = new Set(divisions.flatMap((d) => d.teamIds));
+  const excluded = new Set([...alreadySeated, ...dropped]);
+
+  const newRealTeams = db.prepare(`
+    SELECT t.id FROM team t
+    JOIN user_account u ON t.user_id = u.id
+    WHERE u.is_bot = 0
+      AND t.current_league_id IS NULL
+      AND (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id AND is_retired = 0 AND slot = 'active') >= 5
+    ORDER BY t.id
+  `).all().map((r) => r.id).filter((id) => !excluded.has(id));
+
+  const bottom = divisions[divCount - 1];
+  const newSeated = [];
+  while (newRealTeams.length && bottom.teamIds.length < perDiv) {
+    const id = newRealTeams.shift();
+    bottom.teamIds.push(id);
+    newSeated.push(id);
+  }
+  const waitingReal = newRealTeams.length;
+
+  const gaps = divisions.reduce((sum, d) => sum + (perDiv - d.teamIds.length), 0);
+  // Seed enough bots that AFTER excluding prev-season-dropped bots we still
+  // have `gaps` available. currentBotCount + gaps guarantees `gaps` fresh
+  // additions; existing-eligible bots make it spare.
+  const currentBotCount = db.prepare('SELECT COUNT(*) AS n FROM user_account WHERE is_bot = 1').get().n;
+  const allBots = seedBots(db, currentBotCount + Math.max(1, gaps));
+  const botIdsReady = allBots
+    .filter((b) => {
+      const t = db.prepare('SELECT current_league_id FROM team WHERE id = ?').get(b.team_id);
+      return t.current_league_id == null && !excluded.has(b.team_id);
+    })
+    .map((b) => b.team_id);
+
+  let botIdx = 0;
+  for (const d of divisions) {
+    while (d.teamIds.length < perDiv && botIdx < botIdsReady.length) {
+      d.teamIds.push(botIdsReady[botIdx++]);
+    }
+  }
+  const botsUsed = botIdx;
+  const totalFilled = divisions.reduce((s, d) => s + d.teamIds.length, 0);
+  if (totalFilled < totalSlots) return null;
+
+  const name = seasonName
+    || `Season ${new Date().toISOString().slice(0, 10)} #${Date.now().toString(36).slice(-4)}`;
+  const leagueId = createSeason(db, { name, divisions, legs });
+  return {
+    leagueId,
+    name,
+    divisions,
+    totalSlots,
+    newSeated: newSeated.length,
+    waitingReal,
+    botsUsed,
+    dropped,
+    hadPrevSeason: !!pr,
+  };
 }
 
 /**

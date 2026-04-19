@@ -14,6 +14,7 @@ import {
   getStandings,
   computeNextSeasonSeating,
   listLeagues,
+  autoCreateSeason,
 } from '../src/leagues.js';
 import { runLeagueWorker } from '../src/leagueWorker.js';
 
@@ -167,6 +168,28 @@ test('listLeagues exposes progress counters', async () => {
   const afterRun = listLeagues(db).find((l) => l.id === leagueId);
   assert.equal(afterRun.fixtures_done, 2);
   assert.equal(afterRun.status, 'complete');
+});
+
+test('autoCreateSeason runs twice back-to-back (continuous mode)', async () => {
+  const db = getDb();
+  // Season 1: seeds bots from scratch, hadPrevSeason=false.
+  const s1 = autoCreateSeason(db, { divCount: 2, perDiv: 2, promotePerTier: 1 });
+  assert.ok(s1, 'first autoCreateSeason should succeed');
+  assert.equal(s1.hadPrevSeason, false);
+  assert.equal(s1.totalSlots, 4);
+
+  await runLeagueWorker(db, s1.leagueId);
+  assert.equal(db.prepare('SELECT status FROM league WHERE id = ?').get(s1.leagueId).status, 'complete');
+
+  // Season 2: prev now exists — should seed from its standings and pick up
+  // where we left off without any manual intervention.
+  const s2 = autoCreateSeason(db, { divCount: 2, perDiv: 2, promotePerTier: 1 });
+  assert.ok(s2, 'second autoCreateSeason should succeed');
+  assert.equal(s2.hadPrevSeason, true);
+  assert.ok(s2.dropped.length >= 1, 'at least one team should drop from bottom-of-bottom');
+
+  await runLeagueWorker(db, s2.leagueId);
+  assert.equal(db.prepare('SELECT status FROM league WHERE id = ?').get(s2.leagueId).status, 'complete');
 });
 
 function getBotTeamIds(db) {
