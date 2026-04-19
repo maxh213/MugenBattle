@@ -49,6 +49,7 @@ import {
   teamSchedule,
   autoCreateSeason,
   replaceInactiveMasterClones,
+  getLiveTierView,
 } from './leagues.js';
 import {
   marketListings,
@@ -2079,7 +2080,7 @@ const LEAGUES_HTML = `<!doctype html>
 ${AUTH_BAR_HTML}
 <h1>📺 Live Leagues</h1>
 <nav>
-  <a href="/">Live (tournament)</a>
+  <a href="/">Live</a>
   <a href="/leagues" class="active">Leagues</a>
   <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
@@ -2165,11 +2166,14 @@ ${AUTH_MODAL_HTML}
 ${AUTH_JS}
 </body></html>`;
 
-const HTML = `<!doctype html>
+// Classic tournament UI — kept intact for a future championship mode.
+// Served at /tournament. The / route uses the newer tier-tabbed Live page
+// defined further down.
+const TOURNAMENT_HTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>MugenBattle Live</title>
+<title>MugenBattle Tournament</title>
 <style>${COMMON_CSS}
   .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
   .sidebar { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
@@ -2546,6 +2550,225 @@ setInterval(refresh, 2000);
 </body>
 </html>`;
 
+// New / Live page — tier-tabbed view of the current league.
+const HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>MugenBattle Live</title>
+<style>${COMMON_CSS}
+  .tier-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tier-tabs .tab { padding: 8px 18px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; color: #8b949e; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .tier-tabs .tab:hover { color: #c9d1d9; }
+  .tier-tabs .tab.active { background: #1d2a3a; color: #58a6ff; border-color: #58a6ff; }
+  .tier-tabs .tab.tier-1.active { background: #3d2d0f; color: #f0ae3c; border-color: #f0ae3c; }
+  .match-row { display: grid; grid-template-columns: 1fr 2fr 1fr; gap: 14px; align-items: stretch; margin-bottom: 14px; }
+  @media (max-width: 1100px) { .match-row { grid-template-columns: 1fr; } }
+  .side-card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .side-card .team-name { font-size: 15px; font-weight: 600; color: #c9d1d9; }
+  .side-card .team-user { color: #8b949e; font-size: 12px; margin-top: -4px; }
+  .side-card .portrait { width: 120px; height: 120px; align-self: center; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; image-rendering: pixelated; object-fit: contain; }
+  .side-card .fighter-name { font-size: 14px; font-weight: 600; color: #c9d1d9; text-align: center; }
+  .side-card .fighter-master { font-size: 11px; color: #8b949e; text-align: center; font-style: italic; }
+  .side-card .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; font-size: 11px; }
+  .side-card .stat { background: #0d1117; padding: 6px 2px; border-radius: 4px; text-align: center; }
+  .side-card .stat .v { font-size: 15px; font-weight: 600; color: #c9d1d9; display: block; font-variant-numeric: tabular-nums; }
+  .side-card .stat .l { color: #8b949e; font-size: 9px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .side-card .empty { color: #6e7681; text-align: center; margin-top: 30px; font-size: 13px; }
+  .stream-col { display: flex; flex-direction: column; gap: 10px; }
+  .stream-col .stream { background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 4 / 3; border: 1px solid #30363d; }
+  .stream-col .stream img { width: 100%; height: 100%; object-fit: contain; display: block; image-rendering: pixelated; }
+  .stream-col .stream .placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: #6e7681; font-size: 13px; }
+  .stream-col .score-strip { text-align: center; padding: 10px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
+  .stream-col .score-strip .score { font-size: 26px; font-weight: 600; color: #f0ae3c; font-variant-numeric: tabular-nums; }
+  .stream-col .score-strip .meta { color: #8b949e; font-size: 11px; margin-top: 4px; }
+  .sidebar-3 { display: grid; grid-template-columns: 1.2fr 1fr 1.2fr; gap: 14px; }
+  @media (max-width: 1100px) { .sidebar-3 { grid-template-columns: 1fr; } }
+  .sidebar-3 .panel { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 12px; }
+  .sidebar-3 .panel h2 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #8b949e; }
+  .sidebar-3 table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .sidebar-3 td, .sidebar-3 th { padding: 4px 6px; border-bottom: 1px solid #21262d; text-align: left; }
+  .sidebar-3 th { color: #8b949e; font-weight: normal; font-size: 10px; text-transform: uppercase; }
+  .sidebar-3 .pos { color: #6e7681; width: 24px; }
+  .sidebar-3 .pos.p1 { color: #f0ae3c; font-weight: 600; }
+  .sidebar-3 tr.mine td { background: #1d2a3e; }
+  .sidebar-3 .w { color: #3fb950; font-weight: 600; }
+  .sidebar-3 .l { color: #f85149; }
+  .sidebar-3 .d { color: #8b949e; }
+  .sidebar-3 .fighter-cell { color: #8b949e; font-size: 10px; font-style: italic; }
+</style></head>
+<body style="position:relative">
+${AUTH_BAR_HTML}
+<h1>🥊 MugenBattle Live</h1>
+<nav>
+  <a href="/" class="active">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
+  <a href="/team">My Team</a>
+  <a href="/market">Market</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+
+<div class="tier-tabs" id="tier-tabs"></div>
+
+<div class="match-row">
+  <div class="side-card" id="home-card"><div class="empty">Loading…</div></div>
+  <div class="stream-col">
+    <div class="stream" id="stream-wrap"><div class="placeholder">Loading stream…</div></div>
+    <div class="score-strip">
+      <div class="score" id="score">— –  —</div>
+      <div class="meta" id="score-meta">&nbsp;</div>
+    </div>
+  </div>
+  <div class="side-card" id="away-card"><div class="empty">Loading…</div></div>
+</div>
+
+<div class="sidebar-3">
+  <div class="panel"><h2>Table — Tier <span id="sb-tier">—</span></h2><div id="standings"></div></div>
+  <div class="panel"><h2>Upcoming</h2><div id="upcoming"></div></div>
+  <div class="panel"><h2>Recent</h2><div id="recent"></div></div>
+</div>
+
+${MODAL_HTML}
+${AUTH_MODAL_HTML}
+${AUTH_JS}
+<script>
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
+let activeTier = 1;
+let currentWorkerId = null;
+
+function renderTabs(league) {
+  const tabs = document.getElementById('tier-tabs');
+  tabs.innerHTML = '';
+  for (let t = 1; t <= 3; t++) {
+    const el = document.createElement('div');
+    el.className = 'tab tier-' + t + (t === activeTier ? ' active' : '');
+    el.textContent = 'Tier ' + t;
+    el.onclick = () => { activeTier = t; refresh(true); };
+    tabs.appendChild(el);
+  }
+}
+
+function renderSideCard(hostId, side) {
+  const host = document.getElementById(hostId);
+  if (!side) { host.innerHTML = '<div class="empty">No team yet</div>'; return; }
+  const f = side.fighter;
+  if (!f) {
+    host.innerHTML =
+      '<div class="team-name">' + esc(side.team_name) + '</div>' +
+      '<div class="team-user">@' + esc(side.username) + '</div>' +
+      '<div class="empty">Picking fighter…</div>';
+    return;
+  }
+  host.innerHTML =
+    '<div class="team-name"><a href="/team/' + side.team_id + '" style="color:inherit;text-decoration:none">' + esc(side.team_name) + '</a></div>' +
+    '<div class="team-user">@' + esc(side.username) + '</div>' +
+    '<img class="portrait" src="/portrait/' + encodeURIComponent(f.master_file_name) + '.png" onerror="this.style.visibility=\\'hidden\\'">' +
+    '<div class="fighter-name">' + esc(f.display_name) + '</div>' +
+    '<div class="fighter-master">' + esc(f.master_display_name || f.master_file_name) + '</div>' +
+    '<div class="stat-grid">' +
+      '<div class="stat"><span class="v">' + f.matches_won + '</span><span class="l">W</span></div>' +
+      '<div class="stat"><span class="v">' + f.matches_lost + '</span><span class="l">L</span></div>' +
+      '<div class="stat"><span class="v">' + f.matches_drawn + '</span><span class="l">D</span></div>' +
+      '<div class="stat"><span class="v">' + Number(f.stamina || 0).toFixed(2) + '</span><span class="l">Stam</span></div>' +
+    '</div>';
+}
+
+function renderStream(workerId) {
+  const host = document.getElementById('stream-wrap');
+  if (!workerId) { host.innerHTML = '<div class="placeholder">Waiting for this tier\\'s stream to start…</div>'; currentWorkerId = null; return; }
+  if (workerId !== currentWorkerId) {
+    host.innerHTML = '<img src="/stream/' + workerId + '" alt="">';
+    currentWorkerId = workerId;
+  }
+}
+
+function renderStandings(rows, viewerTeamId) {
+  const host = document.getElementById('standings');
+  if (!rows.length) { host.innerHTML = '<div style="color:#6e7681">No standings yet.</div>'; return; }
+  const body = rows.slice(0, 12).map((s, i) => {
+    const mine = s.team_id === viewerTeamId ? ' class="mine"' : '';
+    return '<tr' + mine + '><td class="pos' + (i === 0 ? ' p1' : '') + '">' + (i + 1) + '</td>' +
+      '<td>' + esc(s.team_name) + '</td>' +
+      '<td>' + s.fixtures_played + '</td>' +
+      '<td>' + s.points + '</td></tr>';
+  }).join('');
+  host.innerHTML = '<table><thead><tr><th>#</th><th>Team</th><th>Pl</th><th>Pts</th></tr></thead><tbody>' + body + '</tbody></table>';
+}
+
+function renderUpcoming(rows) {
+  const host = document.getElementById('upcoming');
+  if (!rows.length) { host.innerHTML = '<div style="color:#6e7681">None.</div>'; return; }
+  host.innerHTML = '<table><tbody>' + rows.map(r =>
+    '<tr><td>R' + r.round_num + '</td><td>' + esc(r.home_team_name) + '</td><td style="color:#6e7681">vs</td><td>' + esc(r.away_team_name) + '</td></tr>'
+  ).join('') + '</tbody></table>';
+}
+
+function renderRecent(rows) {
+  const host = document.getElementById('recent');
+  if (!rows.length) { host.innerHTML = '<div style="color:#6e7681">No results yet.</div>'; return; }
+  host.innerHTML = '<table><tbody>' + rows.map(r => {
+    const homeWon = r.winner_team_id && r.home_team_name && r.winner_team_id !== null;
+    const hCls = r.winner_team_id && r.winner_team_id === r.home_team_id ? 'w' : (r.winner_team_id ? 'l' : 'd');
+    const aCls = r.winner_team_id && r.winner_team_id === r.away_team_id ? 'w' : (r.winner_team_id ? 'l' : 'd');
+    const hFighter = r.home_fighter ? '<div class="fighter-cell">' + esc(r.home_fighter) + '</div>' : '';
+    const aFighter = r.away_fighter ? '<div class="fighter-cell">' + esc(r.away_fighter) + '</div>' : '';
+    return '<tr>' +
+      '<td class="' + hCls + '">' + esc(r.home_team_name) + hFighter + '</td>' +
+      '<td style="text-align:center;font-variant-numeric:tabular-nums">' + r.home_rounds + '-' + r.away_rounds + '</td>' +
+      '<td class="' + aCls + '">' + esc(r.away_team_name) + aFighter + '</td>' +
+    '</tr>';
+  }).join('') + '</tbody></table>';
+}
+
+async function viewerTeamId() {
+  if (!window.__authState || !window.__authState.authenticated) return null;
+  try {
+    const r = await fetch('/api/me/team');
+    if (!r.ok) return null;
+    const t = await r.json();
+    return t.id || null;
+  } catch { return null; }
+}
+
+async function refresh(fromTab = false) {
+  renderTabs();
+  const r = await fetch('/api/live/' + activeTier);
+  const view = await r.json();
+  document.getElementById('sb-tier').textContent = activeTier;
+  if (!view || !view.league) {
+    renderSideCard('home-card', null);
+    renderSideCard('away-card', null);
+    renderStream(null);
+    renderStandings([]); renderUpcoming([]); renderRecent([]);
+    document.getElementById('score').textContent = '—';
+    document.getElementById('score-meta').textContent = 'No active season';
+    return;
+  }
+  const cur = view.current;
+  if (cur) {
+    renderSideCard('home-card', cur.home);
+    renderSideCard('away-card', cur.away);
+    document.getElementById('score').textContent = cur.home_rounds + ' – ' + cur.away_rounds;
+    document.getElementById('score-meta').innerHTML =
+      (cur.stage ? 'Stage: ' + esc(cur.stage) + ' · ' : '') +
+      'Round ' + cur.round + ' · ' + esc(view.league.name);
+  } else {
+    renderSideCard('home-card', null);
+    renderSideCard('away-card', null);
+    document.getElementById('score').textContent = '—';
+    document.getElementById('score-meta').textContent = 'Between fixtures — ' + esc(view.league.name);
+  }
+  renderStream(view.stream_worker_id);
+  const viewer = await viewerTeamId();
+  renderStandings(view.standings || [], viewer);
+  renderUpcoming(view.upcoming || []);
+  renderRecent(view.recent || []);
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body></html>`;
+
 function readJsonBody(req, maxBytes = 1_048_576 /* 1 MiB */) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -2585,6 +2808,11 @@ const server = createServer((req, res) => {
     res.end(HTML);
     return;
   }
+  if (req.url === '/tournament' || req.url === '/tournament/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(TOURNAMENT_HTML);
+    return;
+  }
   // MJPEG streams. /stream aliases worker 1 for backwards compat.
   const streamMatch = req.url && req.url.match(/^\/stream(?:\/(\d+))?$/);
   if (streamMatch) {
@@ -2598,6 +2826,22 @@ const server = createServer((req, res) => {
     });
     const detach = w.attachClient(res);
     req.on('close', detach);
+    return;
+  }
+  const liveTierMatch = req.url && req.url.match(/^\/api\/live\/(\d+)$/);
+  if (liveTierMatch) {
+    const tier = Number(liveTierMatch[1]);
+    const db = getDb();
+    const view = getLiveTierView(db, tier);
+    if (!view) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ league: null })); return;
+    }
+    // Find the stream worker currently running this tier's division.
+    const w = Array.from(workers.values()).find((ww) => ww.divisionId === view.division.id);
+    view.stream_worker_id = w ? w.workerId : null;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(view));
     return;
   }
   if (req.url === '/api/pyramid') {

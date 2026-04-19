@@ -867,6 +867,128 @@ export function latestInterestingLeagueId(db) {
   return complete?.id ?? null;
 }
 
+/**
+ * Everything the /live Tier N view needs in a single query. Returns null
+ * when there's no league to show.
+ */
+export function getLiveTierView(db, tier) {
+  const leagueRow = db.prepare(
+    "SELECT id, name, promote_per_tier FROM league WHERE status = 'running' ORDER BY id DESC LIMIT 1"
+  ).get() || db.prepare(
+    "SELECT id, name, promote_per_tier FROM league WHERE status = 'complete' ORDER BY id DESC LIMIT 1"
+  ).get();
+  if (!leagueRow) return null;
+
+  const division = db.prepare(
+    'SELECT * FROM division WHERE league_id = ? AND tier = ? LIMIT 1'
+  ).get(leagueRow.id, tier);
+  if (!division) return null;
+
+  const fighter = (ownedId) => {
+    if (!ownedId) return null;
+    return db.prepare(`
+      SELECT of.id, of.display_name, of.matches_won, of.matches_lost, of.matches_drawn,
+        of.stamina, of.stamina_updated_at,
+        f.file_name AS master_file_name, f.display_name AS master_display_name
+      FROM owned_fighter of
+      JOIN fighter f ON of.master_fighter_id = f.id
+      WHERE of.id = ?
+    `).get(ownedId);
+  };
+
+  // Current running fixture (if any) — populated with fighter info via the
+  // pre-inserted fixture_match row.
+  const running = db.prepare(`
+    SELECT f.id, f.round_num, f.slot_num, f.home_team_id, f.away_team_id,
+      f.home_score AS home_rounds, f.away_score AS away_rounds,
+      h.name AS home_team_name, a.name AS away_team_name,
+      hu.username AS home_username, au.username AS away_username,
+      s.display_name AS stage_display, s.file_name AS stage_file,
+      fm.home_owned_fighter_id, fm.away_owned_fighter_id,
+      fm.home_rounds AS round_home, fm.away_rounds AS round_away
+    FROM fixture f
+    JOIN team h ON f.home_team_id = h.id
+    JOIN team a ON f.away_team_id = a.id
+    JOIN user_account hu ON h.user_id = hu.id
+    JOIN user_account au ON a.user_id = au.id
+    LEFT JOIN stage s ON f.stage_id = s.id
+    LEFT JOIN fixture_match fm ON fm.fixture_id = f.id AND fm.slot = 1
+    WHERE f.division_id = ? AND f.status = 'running'
+    ORDER BY f.id DESC LIMIT 1
+  `).get(division.id);
+
+  const current = running ? {
+    fixture_id: running.id,
+    round: running.round_num,
+    stage: running.stage_display || running.stage_file || null,
+    home_rounds: running.round_home ?? 0,
+    away_rounds: running.round_away ?? 0,
+    home: {
+      team_id: running.home_team_id,
+      team_name: running.home_team_name,
+      username: running.home_username,
+      fighter: fighter(running.home_owned_fighter_id),
+    },
+    away: {
+      team_id: running.away_team_id,
+      team_name: running.away_team_name,
+      username: running.away_username,
+      fighter: fighter(running.away_owned_fighter_id),
+    },
+  } : null;
+
+  // Next 5 pending fixtures.
+  const upcoming = db.prepare(`
+    SELECT f.id, f.round_num, h.name AS home_team_name, a.name AS away_team_name
+    FROM fixture f
+    JOIN team h ON f.home_team_id = h.id
+    JOIN team a ON f.away_team_id = a.id
+    WHERE f.division_id = ? AND f.status = 'pending'
+    ORDER BY f.round_num, f.slot_num, f.id
+    LIMIT 5
+  `).all(division.id);
+
+  // Last 8 complete fixtures with the fighter used by each side.
+  const recent = db.prepare(`
+    SELECT f.id, f.round_num, f.home_score AS home_rounds, f.away_score AS away_rounds,
+      f.winner_team_id, f.finished_at,
+      h.name AS home_team_name, a.name AS away_team_name,
+      oh.display_name AS home_fighter, oa.display_name AS away_fighter
+    FROM fixture f
+    JOIN team h ON f.home_team_id = h.id
+    JOIN team a ON f.away_team_id = a.id
+    LEFT JOIN fixture_match fm ON fm.fixture_id = f.id AND fm.slot = 1
+    LEFT JOIN owned_fighter oh ON oh.id = fm.home_owned_fighter_id
+    LEFT JOIN owned_fighter oa ON oa.id = fm.away_owned_fighter_id
+    WHERE f.division_id = ? AND f.status = 'complete'
+    ORDER BY f.finished_at DESC, f.id DESC
+    LIMIT 8
+  `).all(division.id);
+
+  // Standings for this tier only.
+  const standings = db.prepare(`
+    SELECT dt.*, t.name AS team_name, u.username
+    FROM division_team dt
+    JOIN team t ON dt.team_id = t.id
+    JOIN user_account u ON t.user_id = u.id
+    WHERE dt.division_id = ?
+    ORDER BY dt.points DESC,
+             (dt.matches_won - dt.matches_lost) DESC,
+             dt.matches_won DESC,
+             dt.fixtures_played ASC,
+             t.name ASC
+  `).all(division.id);
+
+  return {
+    league: leagueRow,
+    division: { tier: division.tier, name: division.name, id: division.id },
+    current,
+    upcoming,
+    recent,
+    standings,
+  };
+}
+
 export function listLeagues(db) {
   return db.prepare(`
     SELECT l.*,
