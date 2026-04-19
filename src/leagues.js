@@ -33,18 +33,56 @@ const PRIZE_DRAW_CENTS = 25;
 const CRASH_SUSPECT_THRESHOLD = 3;
 
 /**
- * Mark a master inactive + retire every active clone so they stop getting
- * picked for fixtures. Without the retire, user/bot rosters keep carrying
- * a broken clone and its next fixture panics again.
+ * Mark a master inactive, retire every active clone, AND replace each
+ * retired clone with a KFM training-dummy in the same slot so the team
+ * stays at 5 active (or keeps its bench/for_sale slot filled). Without
+ * the replacement, deactivating one bad master would drop every
+ * affected team below 5 active → every future fixture forfeits.
+ * Users can later release the KFM and buy a real replacement.
  */
 function deactivateMaster(db, masterId, reason) {
   db.prepare(
     "UPDATE fighter SET active = 0, validated_at = datetime('now'), validation_reason = ? WHERE id = ?"
   ).run(reason, masterId);
-  const { changes } = db.prepare(
-    'UPDATE owned_fighter SET is_retired = 1 WHERE master_fighter_id = ? AND is_retired = 0'
-  ).run(masterId);
-  console.error(`[auto-deactivate] master #${masterId} (${reason}); retired ${changes} clone(s)`);
+  replaceClonesWithKfm(db, masterId, reason);
+}
+
+function replaceClonesWithKfm(db, masterId, reason) {
+  const kfm = db.prepare("SELECT id FROM fighter WHERE file_name = 'kfm' AND is_master = 1").get();
+  if (!kfm) return 0;
+  const clones = db.prepare(
+    'SELECT id, team_id, slot, priority FROM owned_fighter WHERE master_fighter_id = ? AND is_retired = 0'
+  ).all(masterId);
+  if (clones.length === 0) return 0;
+  const retire = db.prepare('UPDATE owned_fighter SET is_retired = 1 WHERE id = ?');
+  const insert = db.prepare(
+    "INSERT INTO owned_fighter (team_id, master_fighter_id, display_name, slot, priority) VALUES (?, ?, 'Training Dummy', ?, ?)"
+  );
+  const history = db.prepare(
+    'INSERT INTO owned_fighter_team_history (owned_fighter_id, team_id, reason) VALUES (?, ?, ?)'
+  );
+  for (const c of clones) {
+    retire.run(c.id);
+    const r = insert.run(c.team_id, kfm.id, c.slot, c.priority);
+    history.run(r.lastInsertRowid, c.team_id, `kfm_replacement:${reason}`);
+  }
+  console.error(`[auto-deactivate] master #${masterId} (${reason}); ${clones.length} clone(s) replaced with KFM`);
+  return clones.length;
+}
+
+export function replaceInactiveMasterClones(db) {
+  // Called at boot. For any clone of an already-inactive master, swap in
+  // a KFM so the team stays at 5 active instead of forfeiting.
+  const bad = db.prepare(`
+    SELECT DISTINCT master_fighter_id FROM owned_fighter
+    WHERE is_retired = 0
+      AND master_fighter_id IN (SELECT id FROM fighter WHERE is_master = 1 AND active = 0)
+  `).all();
+  let total = 0;
+  for (const row of bad) {
+    total += replaceClonesWithKfm(db, row.master_fighter_id, 'boot_sweep');
+  }
+  return total;
 }
 
 /**
