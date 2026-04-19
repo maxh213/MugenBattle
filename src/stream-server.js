@@ -35,7 +35,13 @@ import {
 import { getTeamForUser, getTeamById, setLineup } from './teams.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 import { StreamWorker } from './streamWorker.js';
-import { getLiveLeagueContext, getStandings, latestInterestingLeagueId } from './leagues.js';
+import {
+  getLiveLeagueContext,
+  getStandings,
+  latestInterestingLeagueId,
+  ownedFighterHistory,
+  teamSchedule,
+} from './leagues.js';
 import {
   marketListings,
   buyUnclaimedMaster,
@@ -544,6 +550,84 @@ async function authLogout() {
 refreshAuth();
 </script>`;
 
+const SCOUT_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Scout · MugenBattle</title>
+<style>${COMMON_CSS}
+  .scout-hdr { padding: 14px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 16px; }
+  .scout-hdr h2 { margin: 0 0 4px; font-size: 22px; color: #c9d1d9; }
+  .scout-hdr .user { color: #8b949e; font-size: 13px; }
+  .scout-hdr .badge { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 4px; background: #21262d; color: #6e7681; margin-left: 8px; text-transform: uppercase; letter-spacing: 0.3px; vertical-align: middle; }
+  .roster-section h3 { font-size: 12px; text-transform: uppercase; color: #8b949e; margin: 16px 0 6px; letter-spacing: 0.4px; }
+  .scout-row { display: grid; grid-template-columns: 2fr 2fr 1fr 0.8fr; gap: 12px; padding: 10px 14px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 4px; font-size: 13px; align-items: center; }
+  .scout-row .fr-name { font-weight: 600; color: #c9d1d9; }
+  .scout-row .fr-master { color: #8b949e; font-size: 12px; font-style: italic; }
+  .scout-row .fr-stats { color: #8b949e; font-size: 12px; font-variant-numeric: tabular-nums; text-align: center; }
+  .scout-row .fr-price { color: #f0ae3c; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+</style></head>
+<body style="position:relative">
+${AUTH_BAR_HTML}
+<h1>🔍 Scout</h1>
+<nav>
+  <a href="/">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
+  <a href="/team">My Team</a>
+  <a href="/market">Market</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+
+<div id="root"></div>
+
+${AUTH_MODAL_HTML}
+${AUTH_JS}
+<script>
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
+function fmtCents(n){return n === 0 ? '$0.00' : '$' + (n/100).toFixed(2)}
+const teamId = Number(location.pathname.split('/').pop());
+
+async function load() {
+  const r = await fetch('/api/team/' + teamId);
+  const root = document.getElementById('root');
+  if (!r.ok) {
+    root.innerHTML = '<div style="padding:40px;text-align:center;color:#8b949e">Team not found.</div>';
+    return;
+  }
+  const t = await r.json();
+  const active = t.fighters.filter(f => f.slot === 'active').sort((a,b) => a.priority - b.priority || a.id - b.id);
+  const bench  = t.fighters.filter(f => f.slot === 'bench' ).sort((a,b) => a.id - b.id);
+  const forSale = t.fighters.filter(f => f.slot === 'for_sale');
+  const rowHtml = (f) => {
+    const master = f.master_display_name || f.master_file_name || '—';
+    const right = f.slot === 'for_sale' && f.listing_price_cents != null
+      ? '<div class="fr-price">' + fmtCents(f.listing_price_cents) + '</div>'
+      : '<div class="fr-stats">stamina ' + Number(f.stamina || 0).toFixed(2) + '</div>';
+    return '<div class="scout-row">' +
+      '<div class="fr-name">' + esc(f.display_name) + '</div>' +
+      '<div class="fr-master">' + esc(master) + '</div>' +
+      '<div class="fr-stats">' + f.matches_won + '-' + f.matches_lost + '-' + f.matches_drawn + '</div>' +
+      right +
+    '</div>';
+  };
+  root.innerHTML =
+    '<div class="scout-hdr">' +
+      '<h2>' + esc(t.name) + '</h2>' +
+      '<div class="user">team #' + t.id + '</div>' +
+    '</div>' +
+    '<div class="roster-section">' +
+      '<h3>Active lineup</h3>' +
+      (active.length ? active.map(rowHtml).join('') : '<div style="color:#6e7681;font-size:12px">(none)</div>') +
+    '</div>' +
+    '<div class="roster-section">' +
+      '<h3>Bench</h3>' +
+      (bench.length ? bench.map(rowHtml).join('') : '<div style="color:#6e7681;font-size:12px">(none)</div>') +
+    '</div>' +
+    (forSale.length ? '<div class="roster-section"><h3>For sale</h3>' + forSale.map(rowHtml).join('') + '</div>' : '');
+}
+load();
+</script>
+</body></html>`;
+
 const PYRAMID_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><title>Pyramid · MugenBattle</title>
@@ -625,7 +709,7 @@ async function load() {
           : '';
       return '<div class="prow' + (isMine ? ' mine' : '') + ' pos-' + (idx + 1) + '">' +
         '<div class="pos">' + (idx + 1) + '</div>' +
-        '<div class="tname">' + esc(s.team_name) + badge +
+        '<div class="tname"><a href="/team/' + s.team_id + '" style="color:inherit;text-decoration:none">' + esc(s.team_name) + '</a>' + badge +
           '<span class="user">@' + esc(s.username) + '</span>' +
         '</div>' +
         '<div class="played">' + s.fixtures_played + '</div>' +
@@ -935,6 +1019,25 @@ const TEAM_HTML = `<!doctype html>
   .imports-list .status-approved { color: #3fb950; font-weight: 600; }
   .imports-list .status-rejected { color: #f85149; font-weight: 600; }
   .imports-list .status-other { color: #f0ae3c; }
+  .schedule-row { display: grid; grid-template-columns: 60px 1.5fr 50px 1.5fr 70px 70px; gap: 10px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; font-size: 12px; margin-bottom: 4px; align-items: center; font-variant-numeric: tabular-nums; }
+  .schedule-row .sched-round { color: #8b949e; }
+  .schedule-row .sched-team { text-align: left; }
+  .schedule-row .sched-team.away { text-align: right; }
+  .schedule-row .sched-team .us { color: #58a6ff; font-weight: 600; }
+  .schedule-row .sched-vs { color: #6e7681; text-align: center; }
+  .schedule-row .sched-score { color: #f0ae3c; font-weight: 600; text-align: center; }
+  .schedule-row .sched-score.loss { color: #f85149; }
+  .schedule-row .sched-score.win { color: #3fb950; }
+  .schedule-row .sched-score.draw { color: #8b949e; }
+  .schedule-row .sched-status { color: #6e7681; font-size: 11px; text-align: right; text-transform: uppercase; letter-spacing: 0.4px; }
+  .schedule-row .sched-status.done { color: #3fb950; }
+  .history-list { margin-top: 10px; }
+  .history-row { display: grid; grid-template-columns: 40px 1fr 60px; gap: 8px; padding: 4px 8px; font-size: 11px; border-bottom: 1px solid #21262d; align-items: center; }
+  .history-row .res-w { color: #3fb950; font-weight: 600; }
+  .history-row .res-l { color: #f85149; font-weight: 600; }
+  .history-row .res-d { color: #8b949e; }
+  .history-row .opp { color: #c9d1d9; }
+  .history-row .rounds { color: #6e7681; text-align: right; font-variant-numeric: tabular-nums; }
   .empty-state { text-align: center; padding: 60px 20px; color: #8b949e; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
   .empty-state h2 { color: #c9d1d9; margin-top: 0; }
   .editor { max-width: 820px !important; }
@@ -975,6 +1078,10 @@ ${AUTH_BAR_HTML}
     <span class="label">Wallet</span>
     <span class="balance" id="wallet-balance">—</span>
     <a class="market-link" href="/market">Browse market →</a>
+  </div>
+  <div class="roster-section" id="schedule-section" style="display:none">
+    <h2>Schedule</h2>
+    <div id="schedule"></div>
   </div>
   <div class="team-header">
     <label>Team</label>
@@ -1055,6 +1162,45 @@ async function loadTeam() {
 
   const w = await fetch('/api/me/wallet').then(r => r.ok ? r.json() : null);
   if (w) document.getElementById('wallet-balance').textContent = fmtCents(w.balance_cents);
+
+  await loadSchedule();
+}
+
+async function loadSchedule() {
+  const sch = await fetch('/api/team/' + currentTeam.id + '/schedule').then(r => r.ok ? r.json() : null);
+  const section = document.getElementById('schedule-section');
+  const host = document.getElementById('schedule');
+  if (!sch || (!sch.upcoming.length && !sch.recent.length)) {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+  const rowHtml = (f, isUpcoming) => {
+    const weHome = f.home_team_id === currentTeam.id;
+    const homeCls = weHome ? ' us' : '';
+    const awayCls = !weHome ? ' us' : '';
+    let score = '—';
+    let scoreCls = '';
+    let statusLabel = isUpcoming ? f.status : 'complete';
+    let statusCls = isUpcoming ? '' : 'done';
+    if (f.status === 'complete') {
+      score = f.home_score + '–' + f.away_score;
+      if (f.winner_team_id === currentTeam.id) scoreCls = 'win';
+      else if (f.winner_team_id == null) scoreCls = 'draw';
+      else scoreCls = 'loss';
+    }
+    return '<div class="schedule-row">' +
+      '<div class="sched-round">T' + f.tier + ' · R' + f.round_num + '.' + f.slot_num + '</div>' +
+      '<div class="sched-team"><span class="' + homeCls.trim() + '">' + esc(f.home_name) + '</span></div>' +
+      '<div class="sched-vs">vs</div>' +
+      '<div class="sched-team away"><span class="' + awayCls.trim() + '">' + esc(f.away_name) + '</span></div>' +
+      '<div class="sched-score ' + scoreCls + '">' + score + '</div>' +
+      '<div class="sched-status ' + statusCls + '">' + esc(statusLabel) + '</div>' +
+    '</div>';
+  };
+  host.innerHTML =
+    (sch.upcoming.length ? '<div style="color:#8b949e;font-size:11px;margin-bottom:4px">Upcoming</div>' + sch.upcoming.map(f => rowHtml(f, true)).join('') : '') +
+    (sch.recent.length ? '<div style="color:#8b949e;font-size:11px;margin:8px 0 4px">Recent</div>' + sch.recent.map(f => rowHtml(f, false)).join('') : '');
 }
 
 function renderFighter(f) {
@@ -1228,9 +1374,12 @@ async function openEditor(fighterId) {
     '<div class="row" style="margin-top:10px">' +
       '<button id="edit-ai-save" onclick="saveFighterAI(' + f.id + ')" disabled>Save AI</button>' +
       '<span class="msg" id="edit-ai-msg"></span>' +
-    '</div>';
+    '</div>' +
+    '<div class="ai-hdr">Recent matches</div>' +
+    '<div id="edit-history" class="history-list"><div style="color:#6e7681;font-size:11px">loading…</div></div>';
   document.getElementById('edit-bg').classList.add('open');
   await renderSellSection(f);
+  loadFighterHistory(f.id);
 
   const r = await fetch('/api/owned-fighter/' + fighterId + '/ai');
   if (!r.ok) {
@@ -1335,6 +1484,31 @@ async function unlistFighter(id) {
   } else {
     msg.className = 'msg err'; msg.textContent = body.error || 'error';
   }
+}
+
+async function loadFighterHistory(fighterId) {
+  const host = document.getElementById('edit-history');
+  if (!host) return;
+  const r = await fetch('/api/owned-fighter/' + fighterId + '/history');
+  if (!r.ok) { host.innerHTML = '<div style="color:#6e7681;font-size:11px">(unavailable)</div>'; return; }
+  const rows = await r.json();
+  if (!rows.length) {
+    host.innerHTML = '<div style="color:#6e7681;font-size:11px">No matches yet.</div>';
+    return;
+  }
+  host.innerHTML = rows.map(m => {
+    const me = m.side; // 'home' or 'away'
+    const won = m.winner === me;
+    const lost = m.winner !== 'draw' && m.winner !== me;
+    const resCls = won ? 'res-w' : lost ? 'res-l' : 'res-d';
+    const res = won ? 'W' : lost ? 'L' : 'D';
+    const rounds = (me === 'home' ? m.home_rounds : m.away_rounds) + '-' + (me === 'home' ? m.away_rounds : m.home_rounds);
+    return '<div class="history-row">' +
+      '<div class="' + resCls + '">' + res + '</div>' +
+      '<div class="opp">vs ' + esc(m.opponent) + ' <span style="color:#6e7681">(' + esc(m.opponent_team) + ')</span></div>' +
+      '<div class="rounds">' + rounds + '</div>' +
+    '</div>';
+  }).join('');
 }
 
 async function saveFighterAI(id) {
@@ -2017,6 +2191,12 @@ const server = createServer((req, res) => {
     res.end(PYRAMID_HTML);
     return;
   }
+  const scoutMatch = req.url && req.url.match(/^\/team\/(\d+)$/);
+  if (scoutMatch && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(SCOUT_HTML);
+    return;
+  }
   if (req.url === '/team' || req.url === '/team/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(TEAM_HTML);
@@ -2230,6 +2410,22 @@ const server = createServer((req, res) => {
     if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(listUserImports(db, u.id)));
+    return;
+  }
+  const fighterHistoryMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/history(?:\?.*)?$/);
+  if (fighterHistoryMatch && req.method === 'GET') {
+    const id = Number(fighterHistoryMatch[1]);
+    const db = getDb();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(ownedFighterHistory(db, id, 15)));
+    return;
+  }
+  const teamScheduleMatch = req.url && req.url.match(/^\/api\/team\/(\d+)\/schedule$/);
+  if (teamScheduleMatch && req.method === 'GET') {
+    const id = Number(teamScheduleMatch[1]);
+    const db = getDb();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(teamSchedule(db, id)));
     return;
   }
   const suggestMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/suggested-price$/);

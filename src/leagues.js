@@ -522,6 +522,68 @@ export function computeNextSeasonSeating(db, { divCount, perDiv, promotePerTier 
 }
 
 /**
+ * Recent fixture_match slots for a given owned_fighter. Returns one row
+ * per match it played, with the opponent's display name and the outcome
+ * from this fighter's point of view ('won' | 'lost' | 'drawn').
+ */
+export function ownedFighterHistory(db, ownedFighterId, limit = 20) {
+  return db.prepare(`
+    SELECT fm.id, fm.slot, fm.played_at, fm.winner,
+      fm.home_owned_fighter_id, fm.away_owned_fighter_id,
+      fm.home_rounds, fm.away_rounds,
+      CASE WHEN fm.home_owned_fighter_id = ? THEN 'home' ELSE 'away' END AS side,
+      CASE
+        WHEN fm.home_owned_fighter_id = ? THEN oa.display_name
+        ELSE oh.display_name
+      END AS opponent,
+      CASE
+        WHEN fm.home_owned_fighter_id = ? THEN ta.name
+        ELSE th.name
+      END AS opponent_team,
+      s.display_name AS stage,
+      f.id AS fixture_id, f.division_id
+    FROM fixture_match fm
+    JOIN fixture f ON fm.fixture_id = f.id
+    JOIN owned_fighter oh ON fm.home_owned_fighter_id = oh.id
+    JOIN owned_fighter oa ON fm.away_owned_fighter_id = oa.id
+    JOIN team th ON oh.team_id = th.id
+    JOIN team ta ON oa.team_id = ta.id
+    JOIN stage s ON fm.stage_id = s.id
+    WHERE fm.home_owned_fighter_id = ? OR fm.away_owned_fighter_id = ?
+    ORDER BY fm.id DESC LIMIT ?
+  `).all(ownedFighterId, ownedFighterId, ownedFighterId, ownedFighterId, ownedFighterId, limit);
+}
+
+/**
+ * Upcoming + recently-finished fixtures for a team in its current league.
+ * Upcoming = status='pending' or 'running', by round+slot. Recent = most
+ * recent 5 completed.
+ */
+export function teamSchedule(db, teamId) {
+  const team = db.prepare('SELECT current_league_id FROM team WHERE id = ?').get(teamId);
+  if (!team || !team.current_league_id) return { upcoming: [], recent: [], league_id: null };
+  const select = `
+    SELECT f.id, f.round_num, f.slot_num, f.status, f.home_score, f.away_score,
+      f.winner_team_id, f.home_team_id, f.away_team_id,
+      h.name AS home_name, a.name AS away_name,
+      d.tier, d.name AS division_name,
+      s.display_name AS stage
+    FROM fixture f
+    JOIN division d ON f.division_id = d.id
+    JOIN team h ON f.home_team_id = h.id
+    JOIN team a ON f.away_team_id = a.id
+    LEFT JOIN stage s ON f.stage_id = s.id
+  `;
+  const upcoming = db.prepare(
+    `${select} WHERE d.league_id = ? AND (f.home_team_id = ? OR f.away_team_id = ?) AND f.status != 'complete' ORDER BY f.round_num, f.slot_num, f.id`
+  ).all(team.current_league_id, teamId, teamId);
+  const recent = db.prepare(
+    `${select} WHERE d.league_id = ? AND (f.home_team_id = ? OR f.away_team_id = ?) AND f.status = 'complete' ORDER BY f.id DESC LIMIT 5`
+  ).all(team.current_league_id, teamId, teamId);
+  return { upcoming, recent, league_id: team.current_league_id };
+}
+
+/**
  * ID of the "currently interesting" league: the latest running one, else
  * the latest complete one, else null. Used by the pyramid view.
  */
