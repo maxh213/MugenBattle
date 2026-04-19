@@ -916,10 +916,6 @@ ${AUTH_BAR_HTML}
 <div class="market-grid" id="listings"></div>
 <div id="no-listings" class="empty-state" style="display:none;margin-bottom:16px">No active player listings right now.</div>
 
-<h2 style="font-size:14px;margin:20px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Stages <span id="stages-count" style="color:#6e7681">—</span></h2>
-<div class="market-grid" id="stages"></div>
-<div id="no-stages" class="empty-state" style="display:none;margin-bottom:16px">No stages listed right now.</div>
-
 <h2 style="font-size:14px;margin:20px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Unclaimed masters</h2>
 <div class="market-controls">
   <input type="search" id="q" placeholder="Search by name or author…">
@@ -932,6 +928,10 @@ ${AUTH_BAR_HTML}
   <span class="count" id="count">—</span>
 </div>
 <div class="market-grid" id="grid"></div>
+
+<h2 style="font-size:14px;margin:20px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Stages <span id="stages-count" style="color:#6e7681">—</span></h2>
+<div class="market-grid" id="stages"></div>
+<div id="no-stages" class="empty-state" style="display:none;margin-bottom:16px">No stages listed right now.</div>
 
 ${AUTH_MODAL_HTML}
 ${AUTH_JS}
@@ -1192,7 +1192,12 @@ const TEAM_HTML = `<!doctype html>
   .wallet-row .balance { font-size: 20px; font-weight: 600; color: #3fb950; font-variant-numeric: tabular-nums; }
   .wallet-row .market-link { margin-left: auto; background: transparent; color: #58a6ff; border: 1px solid #58a6ff; padding: 6px 14px; border-radius: 6px; font-size: 13px; text-decoration: none; }
   .wallet-row .market-link:hover { background: #58a6ff; color: #0d1117; }
-  .team-header { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; padding: 14px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
+  .team-header { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; padding: 14px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
+  .rotate-row { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 14px; }
+  .rotate-row .rotate-label { display: flex; gap: 8px; align-items: center; font-size: 13px; color: #c9d1d9; cursor: pointer; font-weight: 600; }
+  .rotate-row .rotate-label input { width: 16px; height: 16px; cursor: pointer; }
+  .rotate-row .rotate-hint { color: #8b949e; font-size: 11px; line-height: 1.45; }
+  .rotate-row .rotate-hint b { color: #c9d1d9; font-variant-numeric: tabular-nums; }
   .team-header label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
   .team-header input { flex: 1; background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 16px; font-weight: 600; }
   .team-header button { background:#238636; color:white; border:1px solid #2ea043; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
@@ -1311,6 +1316,15 @@ ${AUTH_BAR_HTML}
     <input type="text" id="team-name" maxlength="40">
     <button onclick="saveTeamName()">Rename</button>
     <span class="msg" id="team-name-msg"></span>
+  </div>
+
+  <div class="rotate-row">
+    <label class="rotate-label">
+      <input type="checkbox" id="auto-rotate" onchange="saveAutoRotate()">
+      <span>Auto-rotate tired fighters</span>
+    </label>
+    <div class="rotate-hint">When on, a fighter whose stamina drops below <b>0.30</b> (scale 0–1) gets swapped for the rested bench fighter with the highest stamina before each fixture. Stamina drops <b>0.20</b> per match played and recovers <b>0.10 per hour</b>. Turn off if you want a fixed lineup regardless of fatigue.</div>
+    <span class="msg" id="rotate-msg"></span>
   </div>
 
   <div class="roster-section">
@@ -1557,6 +1571,8 @@ function renderSection(id, rows) {
 function renderTeam() {
   const t = currentTeam;
   document.getElementById('team-name').value = t.name || '';
+  const ar = document.getElementById('auto-rotate');
+  if (ar) ar.checked = !!t.auto_rotate;
   const active = t.fighters.filter(f => f.slot === 'active').sort((a,b) => a.priority - b.priority || a.id - b.id);
   const bench  = t.fighters.filter(f => f.slot === 'bench' ).sort((a,b) => a.id - b.id);
   const forSale = t.fighters.filter(f => f.slot === 'for_sale').sort((a,b) => a.id - b.id);
@@ -1566,6 +1582,32 @@ function renderTeam() {
     document.getElementById('forsale-section').style.display = '';
     renderSection('forsale-slots', forSale);
   }
+}
+
+async function saveAutoRotate() {
+  const val = document.getElementById('auto-rotate').checked;
+  const msg = document.getElementById('rotate-msg');
+  msg.className = 'msg'; msg.textContent = 'saving…';
+  // The existing /api/team/:id/lineup endpoint accepts auto_rotate alongside
+  // the full lineup — we just resend the current lineup with the new flag.
+  const active = currentTeam.fighters.filter(f => f.slot === 'active')
+    .sort((a, b) => a.priority - b.priority || a.id - b.id).map(f => f.id);
+  const bench = currentTeam.fighters.filter(f => f.slot === 'bench')
+    .sort((a, b) => a.id - b.id).map(f => f.id);
+  const priority = {};
+  active.forEach((id, i) => (priority[id] = i));
+  const r = await fetch('/api/team/' + currentTeam.id + '/lineup', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ active, bench, priority, auto_rotate: val }),
+  });
+  if (r.ok) {
+    currentTeam.auto_rotate = val ? 1 : 0;
+    msg.className = 'msg ok'; msg.textContent = val ? 'auto-rotate on' : 'auto-rotate off';
+  } else {
+    const body = await r.json().catch(() => ({}));
+    msg.className = 'msg err'; msg.textContent = body.error || 'error';
+  }
+  setTimeout(() => { msg.textContent = ''; }, 2200);
 }
 
 async function saveTeamName() {
