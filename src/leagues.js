@@ -536,9 +536,9 @@ export function computeNextSeasonSeating(db, { divCount, perDiv, promotePerTier 
  */
 export function autoCreateSeason(db, {
   divCount = 3,
-  perDiv = 8,
-  legs = 1,
-  promotePerTier = 2,
+  perDiv = 20,
+  legs = 2,
+  promotePerTier = 3,
   seasonName = null,
 } = {}) {
   const totalSlots = divCount * perDiv;

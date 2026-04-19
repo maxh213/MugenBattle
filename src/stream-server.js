@@ -20,9 +20,9 @@
  *   STREAM_AUTO_SEASONS=1   continuous mode: auto-create next season when
  *                           no league is running. Off by default.
  *   STREAM_AUTO_DIVS        tiers per season (default 3)
- *   STREAM_AUTO_PER_DIV     teams per division (default 8)
- *   STREAM_AUTO_LEGS        round-robin legs (default 1)
- *   STREAM_AUTO_PROMOTE_PER_TIER  top/bottom N per tier (default 2)
+ *   STREAM_AUTO_PER_DIV     teams per division (default 20, PL-sized)
+ *   STREAM_AUTO_LEGS        round-robin legs (default 2 = home+away)
+ *   STREAM_AUTO_PROMOTE_PER_TIER  top/bottom N per tier (default 3)
  */
 
 import { spawn } from 'child_process';
@@ -81,10 +81,12 @@ const SUPERVISOR_POLL_MS = 10_000;
 // one so the stream never idles. Off by default so `node src/stream-server`
 // on a dev laptop doesn't silently burn cycles.
 const AUTO_SEASONS = process.env.STREAM_AUTO_SEASONS === '1';
+// Premier-League-style defaults: 20 teams per tier, home + away (38 fixtures
+// per team), 3 up / 3 down between tiers. Points are already 3 / 1 / 0.
 const AUTO_DIVS = parseInt(process.env.STREAM_AUTO_DIVS || '3', 10);
-const AUTO_PER_DIV = parseInt(process.env.STREAM_AUTO_PER_DIV || '8', 10);
-const AUTO_LEGS = parseInt(process.env.STREAM_AUTO_LEGS || '1', 10);
-const AUTO_PROMOTE_PER_TIER = parseInt(process.env.STREAM_AUTO_PROMOTE_PER_TIER || '2', 10);
+const AUTO_PER_DIV = parseInt(process.env.STREAM_AUTO_PER_DIV || '20', 10);
+const AUTO_LEGS = parseInt(process.env.STREAM_AUTO_LEGS || '2', 10);
+const AUTO_PROMOTE_PER_TIER = parseInt(process.env.STREAM_AUTO_PROMOTE_PER_TIER || '3', 10);
 
 // ---------- Worker pool ----------
 

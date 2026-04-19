@@ -514,9 +514,9 @@ league
   .description('Create a season. Uses prev-season standings for tier assignment (promotion/relegation); bots + new signups fill remaining slots.')
   .option('-n, --name <text>', 'season name')
   .option('-d, --divisions <n>', 'number of divisions (tier 1 = top)', (v) => parseInt(v, 10), 3)
-  .option('-p, --per-division <n>', 'teams per division', (v) => parseInt(v, 10), 8)
-  .option('-l, --legs <n>', 'legs per round-robin (1 = single, 2 = home+away)', (v) => parseInt(v, 10), 1)
-  .option('--promote-per-tier <n>', 'top-N promote / bottom-N relegate between tiers', (v) => parseInt(v, 10), 2)
+  .option('-p, --per-division <n>', 'teams per division', (v) => parseInt(v, 10), 20)
+  .option('-l, --legs <n>', 'legs per round-robin (1 = single, 2 = home+away)', (v) => parseInt(v, 10), 2)
+  .option('--promote-per-tier <n>', 'top-N promote / bottom-N relegate between tiers', (v) => parseInt(v, 10), 3)
   .action((opts) => {
     const db = getDb();
     try {
