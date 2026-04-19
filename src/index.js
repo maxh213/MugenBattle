@@ -31,6 +31,7 @@ import {
   getStandings,
   listLeagues,
 } from './leagues.js';
+import { runLeagueWorker } from './leagueWorker.js';
 import { bootstrapTeamForUser } from './teams.js';
 import { seedBots, retireAllBotRosters, listBots } from './bots.js';
 import { marketListings, priceFor } from './market.js';
@@ -527,13 +528,15 @@ league
       ORDER BY t.id
     `).all();
 
-    if (realTeams.length > totalSlots) {
-      console.error(`${realTeams.length} real teams don't fit in ${totalSlots} slots. Increase --divisions or --per-division.`);
-      return;
-    }
+    // Real teams overflow — the excess waits for the next season. Per the
+    // design: "a user won't join a league until the next one with a free
+    // space for them starts". Bottom-up seating means the oldest teams get
+    // priority (lowest id), so new signups wait if the roster is full.
+    const seatedReal = realTeams.slice(0, totalSlots);
+    const waitingReal = realTeams.length - seatedReal.length;
 
     // Seed bots to cover the remainder (idempotent: tops up to count).
-    const botsNeeded = totalSlots - realTeams.length;
+    const botsNeeded = totalSlots - seatedReal.length;
     const allBots = seedBots(db, botsNeeded);
     const availableBots = allBots.filter((b) => {
       const t = db.prepare('SELECT current_league_id FROM team WHERE id = ?').get(b.team_id);
@@ -542,7 +545,7 @@ league
 
     // Seating order: real teams first (they fill the BOTTOM tier first), then
     // bots fill everything else. Bottom-up = from highest tier number down.
-    const seats = [...realTeams.map((t) => t.id), ...availableBots.map((b) => b.team_id)];
+    const seats = [...seatedReal.map((t) => t.id), ...availableBots.map((b) => b.team_id)];
     // Place into divisions BOTTOM-UP: division divCount first (tier bottom),
     // then next-up, ..., finally tier 1.
     const divisions = [];
@@ -564,7 +567,7 @@ league
         JOIN division d ON f.division_id = d.id WHERE d.league_id = ?
       `).get(leagueId).n;
       console.log(`Created league #${leagueId} "${name}": ${divCount} divisions × ${perDiv} teams = ${totalSlots} slots, ${fixtureCount} fixtures.`);
-      console.log(`  Real teams: ${realTeams.length}; bots: ${availableBots.length}.`);
+      console.log(`  Real teams seated: ${seatedReal.length}${waitingReal > 0 ? ` (${waitingReal} waiting for next season)` : ''}; bots: ${availableBots.length}.`);
       for (const d of divisions) {
         console.log(`  ${d.name}: teams ${d.teamIds.join(', ')}`);
       }
@@ -620,6 +623,35 @@ league
         break;
       }
     }
+  });
+
+league
+  .command('worker <id>')
+  .description('Run all remaining fixtures for a league until complete')
+  .option('--log <path>', 'per-worker Ikemen log file (isolates from other workers)')
+  .option('--display <name>', 'per-worker X DISPLAY (e.g. :100)')
+  .action(async (id, opts) => {
+    const db = getDb();
+    const leagueId = parseInt(id, 10);
+    const ctx = {};
+    if (opts.log) ctx.logPath = opts.log;
+    if (opts.display) ctx.display = opts.display;
+
+    const r = await runLeagueWorker(db, leagueId, ctx, {
+      onFixtureStart: (f) => {
+        const home = db.prepare('SELECT name FROM team WHERE id = ?').get(f.home_team_id);
+        const away = db.prepare('SELECT name FROM team WHERE id = ?').get(f.away_team_id);
+        console.log(`\n[worker ${leagueId}] fixture #${f.id}: ${home.name} vs ${away.name} (R${f.round_num}.${f.slot_num})`);
+      },
+      onFixtureEnd: (f, result) => {
+        console.log(`  → ${result.homeScore}-${result.awayScore}${result.forfeit ? ' (forfeit)' : ''}`);
+      },
+      onError: (f, err) => {
+        console.error(`  fixture #${f.id} failed: ${err.message}`);
+        return true;
+      },
+    });
+    console.log(`\n[worker ${leagueId}] done: ${r.fixturesRun} fixture(s) run${r.stopped ? ' (stopped)' : ''}`);
   });
 
 league
