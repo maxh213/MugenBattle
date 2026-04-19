@@ -18,6 +18,32 @@ const MAX_RETRIES = 3;
 const isWindows = os.platform() === 'win32';
 
 /**
+ * Fake-match mode (MB_MATCH_MODE=fake) short-circuits Ikemen launches with
+ * a deterministic stamina+wins+seed formula. Only used in tests. MB_MATCH_SEED
+ * controls the RNG so results are repeatable.
+ */
+const FAKE_MODE = process.env.MB_MATCH_MODE === 'fake';
+let fakeRngState = Number(process.env.MB_MATCH_SEED || '1');
+function fakeRng() {
+  // mulberry32
+  fakeRngState = (fakeRngState + 0x6D2B79F5) | 0;
+  let t = fakeRngState;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+function fakeDecide(home, away, homeStam, awayStam) {
+  // Strength ≈ stamina (0..1) + master wins bonus (0..1, saturates at 100 wins).
+  const hStrength = homeStam + Math.min(1, (home.masterWins || 0) / 100);
+  const aStrength = awayStam + Math.min(1, (away.masterWins || 0) / 100);
+  const spread = (hStrength - aStrength) + (fakeRng() - 0.5) * 0.6;
+  if (spread > 0.1) return { winner: 'fighter1', fighter1Rounds: 1, fighter2Rounds: 0 };
+  if (spread < -0.1) return { winner: 'fighter2', fighter1Rounds: 0, fighter2Rounds: 1 };
+  return { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
+}
+
+/**
  * Per-worker context for multi-stream league runners:
  *   logPath — unique log file so parallel matches don't stomp each other.
  *   display — X DISPLAY env value (e.g. ":100" for worker 1's Xvfb).
@@ -136,18 +162,28 @@ export async function runOwnedFighterMatch({
   const homeLife = staminaToLife(homeStam);
   const awayLife = staminaToLife(awayStam);
 
-  const homeStage = stageOwnedFighter(db, homeOwnedFighterId);
-  const awayStage = stageOwnedFighter(db, awayOwnedFighterId);
-
-  const { logPath } = resolveCtx(ctx);
   let result;
-  try {
-    await launchEngine(homeStage.charName, awayStage.charName, stageFileName, homeLife, awayLife, ctx);
-    const logContents = await readFile(logPath, 'utf-8');
-    result = parseIkemenResult(logContents);
-  } finally {
-    homeStage.cleanup();
-    awayStage.cleanup();
+  if (FAKE_MODE) {
+    // Deterministic stand-in — no Ikemen spawn, no staging, no log parse.
+    const hm = db.prepare('SELECT matches_won FROM fighter WHERE id = ?').get(home.master_fighter_id);
+    const am = db.prepare('SELECT matches_won FROM fighter WHERE id = ?').get(away.master_fighter_id);
+    result = fakeDecide(
+      { masterWins: hm?.matches_won || 0 },
+      { masterWins: am?.matches_won || 0 },
+      homeStam, awayStam,
+    );
+  } else {
+    const homeStage = stageOwnedFighter(db, homeOwnedFighterId);
+    const awayStage = stageOwnedFighter(db, awayOwnedFighterId);
+    const { logPath } = resolveCtx(ctx);
+    try {
+      await launchEngine(homeStage.charName, awayStage.charName, stageFileName, homeLife, awayLife, ctx);
+      const logContents = await readFile(logPath, 'utf-8');
+      result = parseIkemenResult(logContents);
+    } finally {
+      homeStage.cleanup();
+      awayStage.cleanup();
+    }
   }
 
   // Persist stats + stamina in a single transaction. Master-level counters

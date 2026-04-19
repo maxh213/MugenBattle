@@ -4,14 +4,28 @@ import { fileURLToPath } from 'url';
 import { runMigrations } from './migrations.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = resolve(__dirname, '..', 'mugenbattle.db');
+const DEFAULT_DB_PATH = resolve(__dirname, '..', 'mugenbattle.db');
 
 let db;
 
+/**
+ * Resolve the DB location. `MB_DB_PATH` overrides the bundled file so
+ * tests can point at /tmp/mb-test-*.db or ":memory:". Bare ":memory:"
+ * is treated as a special sentinel for better-sqlite3.
+ */
+function resolveDbPath() {
+  const env = process.env.MB_DB_PATH;
+  if (!env) return DEFAULT_DB_PATH;
+  if (env === ':memory:') return ':memory:';
+  return env;
+}
+
 export function getDb() {
   if (!db) {
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
+    const path = resolveDbPath();
+    db = new Database(path);
+    // WAL isn't supported on :memory: — skip.
+    if (path !== ':memory:') db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     migrate(db);
     runMigrations(db);

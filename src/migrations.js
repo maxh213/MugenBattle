@@ -47,7 +47,7 @@ export function runMigrations(db) {
     });
     try {
       tx();
-      console.log(`[migrate] applied ${file}`);
+      if (process.env.MB_QUIET !== '1') console.log(`[migrate] applied ${file}`);
     } catch (e) {
       throw new Error(`[migrate] ${file} failed: ${e.message}`);
     }

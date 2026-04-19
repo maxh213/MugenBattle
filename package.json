@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "MB_DB_PATH=:memory: MB_MATCH_MODE=fake MB_MATCH_SEED=42 MB_QUIET=1 node --test 'test/*.test.mjs'"
   },
   "keywords": ["mugen", "fighting", "tournament"],
   "author": "",
