@@ -72,6 +72,23 @@ function migrate(db) {
       fought_at TEXT,
       UNIQUE(tournament_id, round, match_index)
     );
+
+    CREATE TABLE IF NOT EXISTS user_account (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE NOT NULL,
+      display_name TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS auth_code (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      code TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_auth_code_email ON auth_code(email);
   `);
 
   addColumnIfMissing(db, 'fighter', 'author', 'TEXT');

@@ -272,3 +272,4 @@ engine/
 bulkgrab/
 .venv/
 scripts/__pycache__/
+.env

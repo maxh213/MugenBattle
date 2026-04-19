@@ -179,6 +179,33 @@ bash /home/$USER/bulkgrab/bulk_install.sh
 .venv/bin/python3 scripts/dedupe_fighters.py --apply    # commit
 ```
 
+## Sign-in (optional)
+
+The streaming dashboard supports passwordless email sign-in via a 6-digit code. No password, no user database to manage — we just match a code against an email. Auth infrastructure is plumbed but nothing is gated behind it yet (future hooks: favorite fighters, voting, comments).
+
+Setup:
+
+```bash
+cp .env.example .env
+# fill in SESSION_SECRET (openssl rand -hex 32) + the four GMAIL_* vars
+```
+
+Dev mode (no Gmail creds): codes are printed to the server console. You can still sign in — just copy the code from the console into the dashboard modal.
+
+Schema (added to `mugenbattle.db`):
+
+```
+user_account  (id, email UNIQUE, display_name, created_at)
+auth_code     (id, email, code, expires_at, used, created_at)
+```
+
+Session: HMAC-signed stateless cookie (`mb_session`), 30-day TTL. Endpoints:
+
+- `POST /api/auth/send-code` — `{ email }` → rate-limited (3/10min)
+- `POST /api/auth/verify-code` — `{ email, code }` → sets `mb_session` cookie
+- `POST /api/auth/logout` — clears cookie
+- `GET /api/auth/me` — `{ authenticated, email, display_name }`
+
 ## Writing AI for passive characters
 
 Many MUGEN chars ship with no custom AI and just stand around. To add an aggressive AI pattern, append `[State -1]` blocks to the char's `.cmd` file with `triggerall = AILevel > 0` and priority-ordered ChangeState triggers based on `P2BodyDist X`, `P2StateType`, `Power`, etc.
@@ -196,6 +223,7 @@ src/
   brackets.js      - Bracket tournament engine (create/run/resume/show)
   validator.js     - Pre-flight char dependency check
   stream-server.js - Headless Xvfb + ffmpeg + HTTP dashboard
+  auth.js          - Passwordless email sign-in (code via Gmail OAuth2)
 scripts/
   extract_portraits.py - SFF v1/v2 portrait extractor (→ engine/chars/<n>/portrait.png)
   grab_v3.py           - MFFA thread scraper + multi-host downloader

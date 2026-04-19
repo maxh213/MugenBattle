@@ -20,6 +20,12 @@ import { createServer } from 'http';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { getDb } from './db.js';
+import {
+  sendCode,
+  verifyCode,
+  currentUser,
+  sessionCookieHeader,
+} from './auth.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -447,10 +453,23 @@ const HTML = `<!doctype html>
   .matchup-matrix .cell-w { color: #3fb950; }
   .matchup-matrix .cell-l { color: #f85149; }
   .matchup-matrix .cell-u { color: #6e7681; }
+  .auth-bar { position: absolute; top: 16px; right: 16px; font-size: 13px; display: flex; align-items: center; gap: 10px; }
+  .auth-bar button { background: #238636; color: white; border: 1px solid #2ea043; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .auth-bar button:hover { background: #2ea043; }
+  .auth-bar .user-email { color: #8b949e; }
+  .auth-bar .logout { background: transparent; color: #8b949e; border: 1px solid #30363d; }
+  .auth-bar .logout:hover { background: #21262d; color: #c9d1d9; }
+  .auth-form { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+  .auth-form input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 8px 12px; font-size: 14px; }
+  .auth-form button { background: #238636; color: white; border: 1px solid #2ea043; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  .auth-form .msg { font-size: 12px; min-height: 1em; }
+  .auth-form .msg.err { color: #f85149; }
+  .auth-form .msg.ok { color: #3fb950; }
   .see-all { display: block; text-align: right; font-size: 11px; color: #58a6ff; margin-top: 6px; }
 </style>
 </head>
-<body>
+<body style="position:relative">
+<div class="auth-bar" id="auth-bar"></div>
 <h1>🥊 MugenBattle Live</h1>
 <nav>
   <a href="/" class="active">Live</a>
@@ -485,6 +504,85 @@ const HTML = `<!doctype html>
   </div>
 </div>
 ${MODAL_HTML}
+<div class="modal-bg" id="auth-modal" onclick="if(event.target===this)closeAuth()">
+  <div class="modal"><div class="modal-shell">
+    <div class="close" onclick="closeAuth()">×</div>
+    <h3>Sign in</h3>
+    <div class="sub">We'll email you a 6-digit code. No password.</div>
+    <div class="auth-form" id="auth-step-email">
+      <input type="email" id="auth-email" placeholder="you@example.com" autocomplete="email">
+      <button onclick="authSendCode()">Send code</button>
+      <div class="msg" id="auth-msg-1"></div>
+    </div>
+    <div class="auth-form" id="auth-step-code" style="display:none">
+      <input type="text" id="auth-code" placeholder="6-digit code" maxlength="6" inputmode="numeric" autocomplete="one-time-code">
+      <button onclick="authVerifyCode()">Verify</button>
+      <div class="msg" id="auth-msg-2"></div>
+    </div>
+  </div></div>
+</div>
+<script>
+function _escAuth(s) { return String(s == null ? '' : s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+async function refreshAuth() {
+  const r = await fetch('/api/auth/me');
+  const me = await r.json();
+  const bar = document.getElementById('auth-bar');
+  if (me.authenticated) {
+    bar.innerHTML = '<span class="user-email">' + _escAuth(me.email) + '</span>' +
+      '<button class="logout" onclick="authLogout()">Sign out</button>';
+  } else {
+    bar.innerHTML = '<button onclick="openAuth()">Sign in</button>';
+  }
+}
+function openAuth() {
+  document.getElementById('auth-step-email').style.display = '';
+  document.getElementById('auth-step-code').style.display = 'none';
+  document.getElementById('auth-msg-1').textContent = '';
+  document.getElementById('auth-msg-2').textContent = '';
+  document.getElementById('auth-modal').classList.add('open');
+  setTimeout(() => document.getElementById('auth-email').focus(), 50);
+}
+function closeAuth() { document.getElementById('auth-modal').classList.remove('open'); }
+async function authSendCode() {
+  const email = document.getElementById('auth-email').value.trim();
+  const msg = document.getElementById('auth-msg-1');
+  msg.className = 'msg'; msg.textContent = 'Sending…';
+  const r = await fetch('/api/auth/send-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
+  const body = await r.json();
+  if (r.ok) {
+    document.getElementById('auth-step-email').style.display = 'none';
+    document.getElementById('auth-step-code').style.display = '';
+    document.getElementById('auth-msg-2').className = 'msg ok';
+    document.getElementById('auth-msg-2').textContent = 'Code sent. Check your email.';
+    setTimeout(() => document.getElementById('auth-code').focus(), 50);
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = body.error || 'Failed to send code';
+  }
+}
+async function authVerifyCode() {
+  const email = document.getElementById('auth-email').value.trim();
+  const code = document.getElementById('auth-code').value.trim();
+  const msg = document.getElementById('auth-msg-2');
+  msg.className = 'msg'; msg.textContent = 'Verifying…';
+  const r = await fetch('/api/auth/verify-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, code }) });
+  const body = await r.json();
+  if (r.ok) {
+    msg.className = 'msg ok';
+    msg.textContent = 'Signed in!';
+    closeAuth();
+    refreshAuth();
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = body.error || 'Failed to verify';
+  }
+}
+async function authLogout() {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  refreshAuth();
+}
+refreshAuth();
+</script>
 <div class="fs-modal" id="fs-modal" onclick="if(event.target===this)closeFullscreen()">
   <div class="fs-close" onclick="closeFullscreen()">×</div>
   <h2 id="fs-title"></h2>
@@ -753,6 +851,23 @@ setInterval(refresh, 2000);
 </body>
 </html>`;
 
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > 16_384) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')); }
+      catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
+
 // ---------- HTTP server ----------
 
 const server = createServer((req, res) => {
@@ -813,6 +928,39 @@ const server = createServer((req, res) => {
     if (!p) { res.writeHead(404); res.end('not found'); return; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(p));
+    return;
+  }
+  if (req.url === '/api/auth/me') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(u ? { authenticated: true, email: u.email, display_name: u.display_name } : { authenticated: false }));
+    return;
+  }
+  if (req.url === '/api/auth/send-code' && req.method === 'POST') {
+    readJsonBody(req).then(async (data) => {
+      const result = await sendCode(getDb(), data.email);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.body));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  if (req.url === '/api/auth/verify-code' && req.method === 'POST') {
+    readJsonBody(req).then((data) => {
+      const result = verifyCode(getDb(), data.email, data.code);
+      const headers = { 'Content-Type': 'application/json' };
+      if (result.cookie) headers['Set-Cookie'] = sessionCookieHeader(result.cookie);
+      res.writeHead(result.status, headers);
+      res.end(JSON.stringify(result.body));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  if (req.url === '/api/auth/logout' && req.method === 'POST') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Set-Cookie': sessionCookieHeader('', { clear: true }),
+    });
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
   const portraitMatch = req.url && req.url.match(/^\/portrait\/([^/]+)\.png$/);
