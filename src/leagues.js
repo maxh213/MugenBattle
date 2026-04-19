@@ -331,6 +331,62 @@ export function getStandings(db, leagueId) {
   return { league, divisions: withStandings, pending };
 }
 
+/**
+ * Rich snapshot of what's currently playing for a worker driving this league.
+ * Returns null if the league has no in-progress fixture right now. Used by
+ * the /leagues dashboard to overlay team names, slot progress, stage etc.
+ */
+export function getLiveLeagueContext(db, leagueId) {
+  const league = db.prepare('SELECT id, name, status FROM league WHERE id = ?').get(leagueId);
+  if (!league) return null;
+
+  const fixture = db.prepare(`
+    SELECT f.*,
+      h.name AS home_name, a.name AS away_name,
+      d.tier, d.name AS division_name,
+      s.file_name AS stage_file, s.display_name AS stage_display
+    FROM fixture f
+    JOIN division d ON f.division_id = d.id
+    JOIN team h ON f.home_team_id = h.id
+    JOIN team a ON f.away_team_id = a.id
+    LEFT JOIN stage s ON f.stage_id = s.id
+    WHERE d.league_id = ? AND f.status = 'running'
+    ORDER BY f.id LIMIT 1
+  `).get(leagueId);
+
+  if (!fixture) return { league, fixture: null };
+
+  const slots = db.prepare(`
+    SELECT slot, winner,
+      (SELECT display_name FROM owned_fighter WHERE id = home_owned_fighter_id) AS home_name,
+      (SELECT display_name FROM owned_fighter WHERE id = away_owned_fighter_id) AS away_name
+    FROM fixture_match WHERE fixture_id = ? ORDER BY slot
+  `).all(fixture.id);
+
+  const slotsDone = slots.length;
+  const currentSlot = slotsDone < 5 ? slotsDone + 1 : null;
+  const homeScore = slots.filter((s) => s.winner === 'home').length;
+  const awayScore = slots.filter((s) => s.winner === 'away').length;
+
+  return {
+    league,
+    fixture: {
+      id: fixture.id,
+      round: fixture.round_num,
+      slot_num: fixture.slot_num,
+      home_team: fixture.home_name,
+      away_team: fixture.away_name,
+      division: { tier: fixture.tier, name: fixture.division_name },
+      stage: fixture.stage_display || fixture.stage_file,
+      slots_done: slotsDone,
+      current_slot: currentSlot,
+      home_score: homeScore,
+      away_score: awayScore,
+      slots,
+    },
+  };
+}
+
 export function listLeagues(db) {
   return db.prepare(`
     SELECT l.*,

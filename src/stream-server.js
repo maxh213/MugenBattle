@@ -35,6 +35,7 @@ import {
 import { getTeamForUser, getTeamById, setLineup } from './teams.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 import { StreamWorker } from './streamWorker.js';
+import { getLiveLeagueContext } from './leagues.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -389,6 +390,113 @@ document.querySelectorAll('th[data-k]').forEach(th => {
 });
 document.getElementById('q').addEventListener('input', render);
 load();
+</script>
+</body></html>`;
+
+const LEAGUES_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Leagues · MugenBattle</title>
+<style>${COMMON_CSS}
+  .workers { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+  .worker { background: #161b22; border: 1px solid #30363d; border-radius: 10px; overflow: hidden; }
+  .worker .stream { background: #000; aspect-ratio: 4 / 3; }
+  .worker .stream img { width: 100%; height: 100%; object-fit: contain; display: block; image-rendering: pixelated; }
+  .worker .idle { display: flex; align-items: center; justify-content: center; height: 100%; color: #6e7681; font-size: 13px; }
+  .worker .overlay { padding: 10px 14px; }
+  .worker .hdr { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+  .worker .lname { font-size: 13px; font-weight: 600; }
+  .worker .tier { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .worker .matchup { font-size: 14px; margin: 2px 0 6px; color: #c9d1d9; }
+  .worker .matchup .score { color: #f0ae3c; font-variant-numeric: tabular-nums; font-weight: 600; margin: 0 8px; }
+  .worker .meta { color: #8b949e; font-size: 11px; display: flex; gap: 12px; flex-wrap: wrap; }
+  .worker .slots { display: flex; gap: 4px; margin-top: 8px; }
+  .worker .chip { font-size: 10px; width: 20px; height: 20px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; background: #0d1117; color: #6e7681; border: 1px solid #21262d; font-weight: 600; }
+  .worker .chip.h { background: #0f3d1c; color: #3fb950; border-color: #1f6d35; }
+  .worker .chip.a { background: #3d0f0f; color: #f85149; border-color: #6d1f1f; }
+  .worker .chip.d { background: #1d2a3a; color: #58a6ff; border-color: #2b4660; }
+  .worker .chip.live { background: #3d2d0f; color: #f0ae3c; border-color: #6d501f; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.5 } }
+  .worker .wid { color: #6e7681; font-size: 10px; text-transform: uppercase; }
+  .empty-state { text-align: center; padding: 40px 20px; color: #6e7681; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
+</style></head>
+<body>
+<h1>📺 Live Leagues</h1>
+<nav>
+  <a href="/">Live (tournament)</a>
+  <a href="/leagues" class="active">Leagues</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+<div id="workers"></div>
+<script>
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
+function chipFor(slotRow, idx, cur) {
+  if (!slotRow) {
+    if (idx === cur) return '<span class="chip live">' + idx + '</span>';
+    return '<span class="chip">' + idx + '</span>';
+  }
+  const cls = slotRow.winner === 'home' ? 'h' : slotRow.winner === 'away' ? 'a' : 'd';
+  const label = slotRow.winner === 'home' ? 'H' : slotRow.winner === 'away' ? 'A' : '·';
+  return '<span class="chip ' + cls + '">' + label + '</span>';
+}
+function render(workers) {
+  const root = document.getElementById('workers');
+  if (!workers.length) {
+    root.innerHTML = '<div class="empty-state">No workers running.</div>';
+    return;
+  }
+  const running = workers.filter(w => w.status !== 'stopped');
+  root.className = 'workers';
+  root.innerHTML = running.map(w => {
+    const ctx = w.context;
+    const streamHtml = '<div class="stream"><img src="/stream/' + w.workerId + '?t=' + Date.now() + '"></div>';
+    if (!ctx || !ctx.fixture) {
+      const msg = ctx && ctx.league
+        ? 'Between fixtures (' + esc(ctx.league.name) + ')'
+        : w.status === 'idle' ? 'Waiting for a league…' : 'Starting up…';
+      return (
+        '<div class="worker">' + streamHtml +
+        '<div class="overlay">' +
+          '<div class="hdr"><span class="wid">Worker #' + w.workerId + ' · ' + esc(w.display) + '</span></div>' +
+          '<div class="meta">' + esc(msg) + '</div>' +
+        '</div></div>'
+      );
+    }
+    const f = ctx.fixture;
+    const chips = [];
+    for (let i = 1; i <= 5; i++) {
+      const row = f.slots.find(s => s.slot === i);
+      chips.push(chipFor(row, i, f.current_slot));
+    }
+    return (
+      '<div class="worker">' + streamHtml +
+      '<div class="overlay">' +
+        '<div class="hdr">' +
+          '<span class="lname">' + esc(ctx.league.name) + '</span>' +
+          '<span class="tier">Tier ' + f.division.tier + ' · ' + esc(f.division.name) + '</span>' +
+        '</div>' +
+        '<div class="matchup">' +
+          esc(f.home_team) +
+          '<span class="score">' + f.home_score + ' – ' + f.away_score + '</span>' +
+          esc(f.away_team) +
+        '</div>' +
+        '<div class="meta">' +
+          '<span>R' + f.round + '.' + f.slot_num + '</span>' +
+          (f.stage ? '<span>Stage: ' + esc(f.stage) + '</span>' : '') +
+          '<span class="wid">Worker #' + w.workerId + '</span>' +
+        '</div>' +
+        '<div class="slots">' + chips.join('') + '</div>' +
+      '</div></div>'
+    );
+  }).join('');
+}
+async function tick() {
+  try {
+    const r = await fetch('/api/workers');
+    render(await r.json());
+  } catch (e) { console.error(e); }
+}
+tick();
+setInterval(tick, 2000);
 </script>
 </body></html>`;
 
@@ -922,7 +1030,12 @@ const server = createServer((req, res) => {
     return;
   }
   if (req.url === '/api/workers') {
-    const data = Array.from(workers.values()).map((w) => w.describe());
+    const db = getDb();
+    const data = Array.from(workers.values()).map((w) => {
+      const base = w.describe();
+      const ctx = w.leagueId ? getLiveLeagueContext(db, w.leagueId) : null;
+      return { ...base, context: ctx };
+    });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
     return;
@@ -945,6 +1058,11 @@ const server = createServer((req, res) => {
     const history = getRecentHistory(8);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ match, leaderboard, tournament, history }));
+    return;
+  }
+  if (req.url === '/leagues' || req.url === '/leagues/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(LEAGUES_HTML);
     return;
   }
   if (req.url === '/leaderboard' || req.url === '/leaderboard/') {
