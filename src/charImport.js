@@ -64,6 +64,8 @@ const DISALLOWED_EXTS = new Set([
 
 let clamScanProbed = false;
 let clamScanAvailable = false;
+let bwrapProbed = false;
+let bwrapAvailable = false;
 
 function sha256File(path) {
   const buf = readFileSync(path);
@@ -250,6 +252,19 @@ async function sandboxTest(db, fileName) {
   // contains any side-effects of a malicious .cmd/.cns/.lua carried in by
   // the uploader — even if Ikemen's Lua VM or a parser bug lets the char
   // execute arbitrary code, it can't touch our DB or source tree.
+  if (!bwrapProbed) {
+    try {
+      await runShell('sh', ['-c', 'command -v bwrap >/dev/null']);
+      bwrapAvailable = true;
+    } catch { bwrapAvailable = false; }
+    bwrapProbed = true;
+  }
+  if (!bwrapAvailable) {
+    return {
+      ok: false,
+      reason: 'bwrap_missing: install bubblewrap (sudo apt install bubblewrap) — sandboxed test-match is mandatory for user imports',
+    };
+  }
   process.env.MATCH_SANDBOX = 'bwrap';
   try {
     return await withSandboxDisplay(async (display) => {

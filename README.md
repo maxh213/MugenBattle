@@ -24,9 +24,10 @@ mkdir engine && cd engine
 # For headless streaming (no game window on your desktop):
 sudo pacman -S xorg-server-xvfb ffmpeg xdotool wmctrl
 
-# For the user character-upload pipeline (required — the importer refuses
-# to run without a working clamscan on PATH):
-sudo pacman -S clamav
+# For the user character-upload pipeline. Both are HARD requirements —
+# importer refuses to run without clamscan on PATH, and rejects the
+# sandbox test if bwrap is missing.
+sudo pacman -S clamav bubblewrap
 sudo freshclam                    # pull signature database
 sudo systemctl enable --now clamav-freshclam.service  # keep it updated
 
