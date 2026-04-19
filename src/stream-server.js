@@ -27,6 +27,8 @@ import {
   currentUser,
   sessionCookieHeader,
 } from './auth.js';
+import { getTeamForUser, getTeamById } from './teams.js';
+import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -887,13 +889,13 @@ setInterval(refresh, 2000);
 </body>
 </html>`;
 
-function readJsonBody(req) {
+function readJsonBody(req, maxBytes = 1_048_576 /* 1 MiB */) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
     req.on('data', (c) => {
       total += c.length;
-      if (total > 16_384) { reject(new Error('body too large')); req.destroy(); return; }
+      if (total > maxBytes) { reject(new Error('body too large')); req.destroy(); return; }
       chunks.push(c);
     });
     req.on('end', () => {
@@ -1020,6 +1022,68 @@ const server = createServer((req, res) => {
       'Set-Cookie': sessionCookieHeader('', { clear: true }),
     });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  if (req.url === '/api/me/team') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const team = getTeamForUser(db, u.id);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(team || { error: 'No team yet' }));
+    return;
+  }
+  const teamMatch = req.url && req.url.match(/^\/api\/team\/(\d+)$/);
+  if (teamMatch) {
+    const team = getTeamById(getDb(), Number(teamMatch[1]));
+    if (!team) { res.writeHead(404); res.end('{"error":"team not found"}'); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(team));
+    return;
+  }
+  const aiGetMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/ai$/);
+  if (aiGetMatch && req.method === 'GET') {
+    const fighterId = Number(aiGetMatch[1]);
+    const db = getDb();
+    // Public read is fine; anyone can see AI. Restrict later if desired.
+    const eff = getEffectiveCmd(db, fighterId);
+    if (!eff) { res.writeHead(404); res.end('{"error":"not found"}'); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(eff));
+    return;
+  }
+  if (aiGetMatch && req.method === 'PUT') {
+    const fighterId = Number(aiGetMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    // Owner check
+    const owner = db.prepare(`
+      SELECT t.user_id FROM owned_fighter of JOIN team t ON of.team_id = t.id WHERE of.id = ?
+    `).get(fighterId);
+    if (!owner) { res.writeHead(404); res.end('{"error":"fighter not found"}'); return; }
+    if (owner.user_id !== u.id) { res.writeHead(403); res.end('{"error":"Not your fighter"}'); return; }
+
+    readJsonBody(req).then((data) => {
+      try {
+        const result = saveCmdOverride(db, fighterId, data.cmd_text);
+        if (result.error) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        }
+      } catch (err) {
+        console.error('[PUT /api/owned-fighter/:id/ai]', err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Internal error', detail: String(err?.message || err) }));
+      }
+    }).catch((err) => {
+      console.error('[PUT readJsonBody]', err);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Bad request', detail: String(err?.message || err) }));
+    });
     return;
   }
   const portraitMatch = req.url && req.url.match(/^\/portrait\/([^/]+)\.png$/);

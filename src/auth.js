@@ -21,6 +21,7 @@ import https from 'https';
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { bootstrapTeamForUser } from './teams.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -180,15 +181,23 @@ export function setUsername(db, userId, username) {
   if (clash) {
     return { status: 409, body: { error: 'That username is taken' } };
   }
+
+  // Setting username completes signup → create team + 5 starter fighters in
+  // the same transaction so we never have a half-setup user.
+  let teamId;
   try {
-    db.prepare('UPDATE user_account SET username = ? WHERE id = ?').run(username, userId);
+    const txn = db.transaction(() => {
+      db.prepare('UPDATE user_account SET username = ? WHERE id = ?').run(username, userId);
+      teamId = bootstrapTeamForUser(db, userId, username + "'s Team");
+    });
+    txn();
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) {
       return { status: 409, body: { error: 'That username is taken' } };
     }
     throw e;
   }
-  return { status: 200, body: { ok: true, username } };
+  return { status: 200, body: { ok: true, username, team_id: teamId } };
 }
 
 export function currentUser(db, req) {

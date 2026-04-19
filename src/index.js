@@ -21,6 +21,7 @@ import {
 } from './brackets.js';
 import { validateAllActive, validateFighter } from './validator.js';
 import { getDb } from './db.js';
+import { credit, assertLedgerIntegrity } from './wallet.js';
 import { closeDb } from './db.js';
 
 program
@@ -336,6 +337,86 @@ tournament
           ? `    ${f1.padEnd(22)} vs ${f2.padEnd(22)} → ${v}${m.stage_name ? `  @ ${m.stage_name}` : ''}`
           : `    ${f1.padEnd(22)} vs ${f2.padEnd(22)}   (pending)`;
         console.log(line);
+      }
+    }
+  });
+
+// --- Users (admin) ---
+
+const users = program.command('users').description('Admin: manage user accounts');
+
+users
+  .command('list')
+  .description('List all users + team + balance')
+  .action(() => {
+    const db = getDb();
+    const rows = db.prepare(`
+      SELECT u.id, u.email, u.username, u.balance_cents, u.is_banned, u.banned_reason,
+        t.id AS team_id, t.name AS team_name,
+        (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id) AS roster_size
+      FROM user_account u
+      LEFT JOIN team t ON t.user_id = u.id
+      ORDER BY u.id
+    `).all();
+    if (rows.length === 0) {
+      console.log('No users yet.');
+      return;
+    }
+    console.log(`\n${'#'.padStart(4)} ${'Username'.padEnd(20)} ${'Email'.padEnd(30)} ${'Balance'.padStart(10)} ${'Team'.padEnd(25)} ${'Roster'.padStart(6)} Ban`);
+    console.log('-'.repeat(110));
+    for (const r of rows) {
+      const ban = r.is_banned ? `BANNED (${r.banned_reason || '?'})` : '';
+      console.log(
+        `${String(r.id).padStart(4)} ${(r.username || '(pending)').padEnd(20)} ${(r.email || '').padEnd(30)} ${String(r.balance_cents).padStart(10)} ${(r.team_name || '—').slice(0, 25).padEnd(25)} ${String(r.roster_size || 0).padStart(6)} ${ban}`
+      );
+    }
+  });
+
+users
+  .command('ban <username>')
+  .description('Ban a user')
+  .option('-r, --reason <text>', 'reason for the ban', 'TOS violation')
+  .action((username, opts) => {
+    const db = getDb();
+    const r = db.prepare('UPDATE user_account SET is_banned = 1, banned_reason = ? WHERE username = ?').run(opts.reason, username);
+    console.log(r.changes ? `Banned ${username}.` : `No user named "${username}".`);
+  });
+
+users
+  .command('unban <username>')
+  .description('Unban a user')
+  .action((username) => {
+    const db = getDb();
+    const r = db.prepare('UPDATE user_account SET is_banned = 0, banned_reason = NULL WHERE username = ?').run(username);
+    console.log(r.changes ? `Unbanned ${username}.` : `No user named "${username}".`);
+  });
+
+users
+  .command('credit')
+  .description('Credit or debit a user\'s balance (records to ledger)')
+  .requiredOption('-u, --username <name>', 'username')
+  .requiredOption('-c, --cents <n>', 'cents (positive credit, negative debit)', (v) => parseInt(v, 10))
+  .option('-r, --reason <text>', 'reason string for the ledger', 'admin')
+  .action((opts) => {
+    const db = getDb();
+    const u = db.prepare('SELECT id FROM user_account WHERE username = ?').get(opts.username);
+    if (!u) { console.log(`No user named "${opts.username}".`); return; }
+    const newBal = credit(db, u.id, opts.cents, opts.reason);
+    console.log(`${opts.username} balance: ${newBal} cents`);
+  });
+
+users
+  .command('check-ledger')
+  .description('Assert ledger sums match materialised balances')
+  .action(() => {
+    const db = getDb();
+    const bad = assertLedgerIntegrity(db);
+    if (bad.length === 0) {
+      console.log('OK — all balances match ledger sums.');
+    } else {
+      console.log(`MISMATCH on ${bad.length} user(s):`);
+      for (const r of bad) {
+        console.log(`  ${r.username} (id=${r.id}): materialised=${r.materialised} ledger=${r.ledger_sum}`);
       }
     }
   });
