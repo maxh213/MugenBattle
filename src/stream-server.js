@@ -694,6 +694,8 @@ const PYRAMID_HTML = `<!doctype html>
   .tier.t1 .hdr .tier-n { color: #f0ae3c; }
   .tier .rows { display: grid; gap: 4px; }
   .prow { display: grid; grid-template-columns: 30px 2.4fr 50px 50px 50px 70px 60px; gap: 8px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; align-items: center; font-size: 13px; font-variant-numeric: tabular-nums; position: relative; }
+  .prow.champion { border-left: 3px solid #ffd700; background: linear-gradient(90deg, rgba(255,215,0,0.14) 0%, #161b22 45%); }
+  .prow.champion .pos { color: #ffd700; font-weight: 700; }
   .prow.promote { border-left: 3px solid #3fb950; background: linear-gradient(90deg, rgba(63,185,80,0.10) 0%, #161b22 40%); }
   .prow.relegate { border-left: 3px solid #f85149; background: linear-gradient(90deg, rgba(248,81,73,0.10) 0%, #161b22 40%); }
   .prow.drop { border-left: 3px solid #f0ae3c; background: linear-gradient(90deg, rgba(240,174,60,0.12) 0%, #161b22 40%); }
@@ -706,6 +708,7 @@ const PYRAMID_HTML = `<!doctype html>
   .zone-key .swatch.promote { background: #3fb950; }
   .zone-key .swatch.relegate { background: #f85149; }
   .zone-key .swatch.drop { background: #f0ae3c; }
+  .zone-key .swatch.champion { background: #ffd700; }
   .prow .pos { color: #6e7681; }
   .prow.pos-1 .pos { color: #f0ae3c; font-weight: 600; }
   .prow .tname { font-weight: 600; color: #c9d1d9; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -765,6 +768,7 @@ async function load() {
       (data.pending > 0 ? '<span class="pending">' + data.pending + ' fixtures pending</span>' : '') +
     '</div>' +
     '<div class="zone-key">' +
+      '<div class="k"><span class="swatch champion"></span>Champion (tier 1 #1)</div>' +
       '<div class="k"><span class="swatch promote"></span>Promotion (top ' + K + ')</div>' +
       '<div class="k"><span class="swatch relegate"></span>Relegation (bottom ' + K + ')</div>' +
       '<div class="k"><span class="swatch drop"></span>Drop &amp; sit out (bottom ' + K + ' of bottom tier)</div>' +
@@ -787,7 +791,8 @@ async function load() {
       //   bottom K of tiers 1..(N-1) → relegate
       //   bottom K of tier N → drop (sit out one season)
       let zone = '';
-      if (pos <= K && d.tier > 1) zone = 'promote';
+      if (d.tier === 1 && pos === 1) zone = 'champion';
+      else if (pos <= K && d.tier > 1) zone = 'promote';
       else if (pos > n - K && d.tier < divCount) zone = 'relegate';
       else if (pos > n - K && d.tier === divCount) zone = 'drop';
 
@@ -1063,6 +1068,10 @@ const TEAM_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><title>My Team · MugenBattle</title>
 <style>${COMMON_CSS}
+  .wait-banner { padding: 14px 18px; background: #1d2a3a; border: 1px solid #30436a; border-left: 3px solid #58a6ff; border-radius: 10px; margin-bottom: 14px; color: #c9d1d9; font-size: 13px; line-height: 1.5; }
+  .wait-banner .head { font-size: 14px; font-weight: 600; color: #c9d1d9; margin-bottom: 4px; }
+  .wait-banner .eta { color: #58a6ff; font-weight: 600; }
+  .wait-banner .meta { color: #8b949e; font-size: 12px; margin-top: 4px; }
   .wallet-row { display: flex; gap: 18px; align-items: center; padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 14px; }
   .wallet-row .label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
   .wallet-row .balance { font-size: 20px; font-weight: 600; color: #3fb950; font-variant-numeric: tabular-nums; }
@@ -1162,6 +1171,7 @@ ${AUTH_BAR_HTML}
 </div>
 
 <div id="team-root" style="display:none">
+  <div id="wait-banner" class="wait-banner" style="display:none"></div>
   <div class="wallet-row">
     <span class="label">Wallet</span>
     <span class="balance" id="wallet-balance">—</span>
@@ -1252,6 +1262,46 @@ async function loadTeam() {
   if (w) document.getElementById('wallet-balance').textContent = fmtCents(w.balance_cents);
 
   await loadSchedule();
+  await loadWaitState();
+}
+
+function fmtEta(seconds) {
+  if (seconds < 120) return 'under a minute';
+  if (seconds < 3600) return '~' + Math.max(1, Math.round(seconds / 60)) + ' minutes';
+  if (seconds < 3600 * 24) {
+    const h = seconds / 3600;
+    return '~' + (h < 2 ? h.toFixed(1) : Math.round(h)) + ' hours';
+  }
+  return '~' + Math.round(seconds / 86400) + ' days';
+}
+
+async function loadWaitState() {
+  const host = document.getElementById('wait-banner');
+  if (!host) return;
+  const r = await fetch('/api/me/wait');
+  if (!r.ok) { host.style.display = 'none'; return; }
+  const w = await r.json();
+  if (!w.waiting) { host.style.display = 'none'; return; }
+  host.style.display = '';
+  if (w.reason === 'no_running_league') {
+    host.innerHTML =
+      '<div class="head">Your team is on the bench</div>' +
+      'No league is running right now. Your team will be seated the moment the next season kicks off.';
+    return;
+  }
+  if (w.reason === 'next_season') {
+    const eta = fmtEta(w.eta_seconds || 0);
+    const ahead = w.ahead_in_queue || 0;
+    const queueMsg = ahead === 0
+      ? 'You\'re first in the queue — guaranteed a seat in the next season\'s bottom tier.'
+      : ahead + ' real player' + (ahead === 1 ? '' : 's') + ' ahead of you in the queue.';
+    host.innerHTML =
+      '<div class="head">Waiting for next league</div>' +
+      'Your team will join the next league when the current one finishes — estimated <span class="eta">' + eta + '</span> from now.' +
+      '<div class="meta">' + queueMsg + ' New signups take bot slots first, so if the bottom tier has room you\'ll take a bot\'s seat; otherwise you wait one cycle and come in at the NEXT season.</div>';
+    return;
+  }
+  host.innerHTML = '<div class="head">Waiting</div>' + 'Your team is between seasons.';
 }
 
 async function loadSchedule() {
@@ -2395,6 +2445,51 @@ const server = createServer((req, res) => {
     const team = getTeamForUser(db, u.id);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(team || { error: 'No team yet' }));
+    return;
+  }
+  if (req.url === '/api/me/wait') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const team = db.prepare('SELECT id, current_league_id FROM team WHERE user_id = ?').get(u.id);
+    if (!team) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ waiting: null, reason: 'no_team' })); return;
+    }
+    if (team.current_league_id) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ waiting: false, league_id: team.current_league_id })); return;
+    }
+    // ETA: remaining fixtures of the current running league × ~50s per
+    // fixture / worker count. Matches the real cadence at 3 workers.
+    const running = db.prepare("SELECT id FROM league WHERE status = 'running' ORDER BY id DESC LIMIT 1").get();
+    if (!running) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ waiting: true, reason: 'no_running_league' })); return;
+    }
+    const { n: remaining } = db.prepare(`
+      SELECT COUNT(*) AS n FROM fixture f
+      JOIN division d ON f.division_id = d.id
+      WHERE d.league_id = ? AND f.status != 'complete'
+    `).get(running.id);
+    // Count real waitlist to give "Nth in queue" colour.
+    const ahead = db.prepare(`
+      SELECT COUNT(*) AS n FROM team t
+      JOIN user_account u ON t.user_id = u.id
+      WHERE u.is_bot = 0 AND t.current_league_id IS NULL
+        AND (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id AND is_retired = 0 AND slot = 'active') >= 5
+        AND t.id < ?
+    `).get(team.id).n;
+    const etaSeconds = Math.round((remaining / Math.max(1, WORKER_COUNT)) * 50);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      waiting: true,
+      reason: 'next_season',
+      eta_seconds: etaSeconds,
+      remaining_fixtures: remaining,
+      current_league_id: running.id,
+      ahead_in_queue: ahead,
+    }));
     return;
   }
   if (req.url === '/api/me/wallet') {

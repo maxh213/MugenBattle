@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import { readFile } from 'fs/promises';
+import { readFileSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
@@ -123,17 +124,54 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
     if (display) env.DISPLAY = display;
     if (speed) env.MATCH_SPEED = String(speed);
 
+    // Patterns that mean "this char just broke Ikemen, won't recover":
+    //   - Go runtime panics (stderr)
+    //   - Ikemen Lua error modal (written to the log file, process stays alive)
+    //   - Any "I.K.E.M.E.N Error" banner
+    // On any of these, SIGKILL within ~1s so the stream doesn't show the
+    // modal for the full 120s exec timeout.
+    const ERROR_RX = /panic:|runtime error:|fatal error:|I\.K\.E\.M\.E\.N Error/;
+
     const child = execFile(cmd, args, {
       timeout: 120_000,
       killSignal: 'SIGKILL',
       env,
     }, (error, stdout, stderr) => {
+      clearInterval(logPoller);
       if (error) {
+        // Attach the log contents so callers can regex for the offending
+        // char's dir. Ikemen's Lua modal error gets logged but NOT written
+        // to stderr, so err.message alone wouldn't identify the char.
+        try { error.matchLog = readFileSync(logPath, 'utf-8'); } catch { error.matchLog = ''; }
+        if (error.matchLog) error.message = `${error.message}\n${error.matchLog.slice(-2000)}`;
         reject(error);
       } else {
         resolve(stdout);
       }
     });
+
+    // Watch stderr for Go panics (written immediately on crash).
+    let stderrBuf = '';
+    child.stderr?.on('data', (chunk) => {
+      stderrBuf += chunk;
+      if (stderrBuf.length > 200_000) stderrBuf = stderrBuf.slice(-100_000);
+      if (ERROR_RX.test(stderrBuf)) {
+        try { child.kill('SIGKILL'); } catch {}
+      }
+    });
+
+    // Poll the match log — catches Ikemen's Lua modal errors that hang the
+    // process waiting for an OK click.
+    const logPoller = setInterval(() => {
+      try {
+        const content = readFileSync(logPath, 'utf-8');
+        if (ERROR_RX.test(content)) {
+          clearInterval(logPoller);
+          try { child.kill('SIGKILL'); } catch {}
+        }
+      } catch {}
+    }, 1000);
+
     return child;
   });
 }

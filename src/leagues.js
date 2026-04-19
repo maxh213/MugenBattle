@@ -31,8 +31,13 @@ const PRIZE_DRAW_CENTS = 25;
  * narrow it to exactly one master, do nothing.
  */
 function deactivateIfIdentifiable(db, errMsg) {
+  // Ikemen references the offending char via paths like
+  //   chars/stg_<uuid>_<master>/<file>.cns
+  //   chars/stg_<uuid>_<master>/Txt/SomeConfig.Txt   (nested subdirs)
+  // We just want the <master> token; everything after the master/ slash is
+  // best-effort ignored.
   const deep = new Set();
-  const re = /chars\/stg_[a-f0-9]+_([^/\s]+)\/[^/\s]+\.(?:cns|cmd|st|lua|def)/g;
+  const re = /chars\/stg_[a-f0-9]+_([^/\s]+)\//g;
   let m;
   while ((m = re.exec(errMsg)) !== null) deep.add(m[1]);
   if (deep.size !== 1) return;
