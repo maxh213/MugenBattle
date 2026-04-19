@@ -16,7 +16,7 @@ import { credit } from './wallet.js';
 const KFM_FILE_NAME = 'kfm';
 const PRICE_FREE_THRESHOLD = 2;
 const PRICE_PER_WIN_CENTS = 100;
-const MAX_BENCH_SIZE = 2;
+const MAX_BENCH_SIZE = 5;
 const MIN_LIST_PRICE_CENTS = 0;
 const MAX_LIST_PRICE_CENTS = 1_000_000; // $10k sanity cap
 

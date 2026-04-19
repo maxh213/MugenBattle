@@ -3,7 +3,7 @@
  *
  * Invariants:
  *  - One team per user (team.UNIQUE(user_id)).
- *  - Active slot count = 5 exactly for league-eligible teams. 0..2 bench, 0..n for_sale
+ *  - Active slot count = 5 exactly for league-eligible teams. 0..5 bench, 0..n for_sale
  *    (but for_sale implies the fighter was benched first — moving to for_sale
  *    must leave active at 5, enforced at listing time).
  *  - Master fighters (fighter.is_master=1) are never modified; user changes
@@ -76,11 +76,11 @@ export function getTeamForUser(db, userId) {
 }
 
 /**
- * Rewrite a team's lineup. Enforces: exactly 5 active, 0..2 bench, at most 1
+ * Rewrite a team's lineup. Enforces: exactly 5 active, 0..5 bench, at most 1
  * for_sale (stays as-is if present), priority numbers distinct within active,
  * and every id belongs to the team.
  *
- * Body: { active: [id*5], bench: [id*0..2], priority: {id: n}, auto_rotate: bool }
+ * Body: { active: [id*5], bench: [id*0..5], priority: {id: n}, auto_rotate: bool }
  * Anything in slot='for_sale' stays in place; the caller doesn't mention those.
  */
 export function setLineup(db, teamId, body) {
@@ -92,8 +92,8 @@ export function setLineup(db, teamId, body) {
   if (active.length !== 5) {
     return { status: 400, body: { error: 'Lineup must have exactly 5 active fighters' } };
   }
-  if (bench.length > 2) {
-    return { status: 400, body: { error: 'At most 2 bench fighters allowed' } };
+  if (bench.length > 5) {
+    return { status: 400, body: { error: 'At most 5 bench fighters allowed' } };
   }
   if (new Set([...active, ...bench]).size !== active.length + bench.length) {
     return { status: 400, body: { error: 'Duplicate IDs across active/bench' } };

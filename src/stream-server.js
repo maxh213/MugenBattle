@@ -1293,12 +1293,12 @@ async function loadWaitState() {
     const eta = fmtEta(w.eta_seconds || 0);
     const ahead = w.ahead_in_queue || 0;
     const queueMsg = ahead === 0
-      ? 'You\'re first in the queue — guaranteed a seat in the next season\'s bottom tier.'
+      ? 'You\\'re first in the queue — guaranteed a seat in the next season\\'s bottom tier.'
       : ahead + ' real player' + (ahead === 1 ? '' : 's') + ' ahead of you in the queue.';
     host.innerHTML =
       '<div class="head">Waiting for next league</div>' +
       'Your team will join the next league when the current one finishes — estimated <span class="eta">' + eta + '</span> from now.' +
-      '<div class="meta">' + queueMsg + ' New signups take bot slots first, so if the bottom tier has room you\'ll take a bot\'s seat; otherwise you wait one cycle and come in at the NEXT season.</div>';
+      '<div class="meta">' + queueMsg + ' New signups take bot slots first, so if the bottom tier has room you\\'ll take a bot\\'s seat; otherwise you wait one cycle and come in at the NEXT season.</div>';
     return;
   }
   host.innerHTML = '<div class="head">Waiting</div>' + 'Your team is between seasons.';
@@ -1452,7 +1452,7 @@ async function dropOn(e, targetId) {
   if (!src || !tgt) return;
   if (src.slot === 'for_sale' || tgt.slot === 'for_sale') return;
 
-  // Swap slots + priorities. Keeps "exactly 5 active, 0..2 bench" because
+  // Swap slots + priorities. Keeps "exactly 5 active, 0..5 bench" because
   // we're only ever swapping one-for-one.
   const srcSlot = src.slot;
   const srcPri = src.priority;
