@@ -76,9 +76,16 @@ function runShell(cmd, args, opts = {}) {
     let stdout = '', stderr = '';
     child.stdout?.on('data', (d) => (stdout += d));
     child.stderr?.on('data', (d) => (stderr += d));
-    child.on('exit', (code) => {
-      if (code === 0) resolveP({ stdout, stderr });
-      else reject(new Error(`${cmd} exited ${code}: ${(stderr || stdout).slice(0, 400)}`));
+    // 'close' fires after stdio is drained — 'exit' can land before the
+    // last stdout chunks arrive, which dropped the signature name on the
+    // floor for fast-exiting tools like clamscan.
+    child.on('close', (code) => {
+      if (code === 0) { resolveP({ stdout, stderr }); return; }
+      const err = new Error(`${cmd} exited ${code}: ${(stdout || stderr).slice(0, 400)}`);
+      err.stdout = stdout;
+      err.stderr = stderr;
+      err.exitCode = code;
+      reject(err);
     });
     child.on('error', reject);
   });
@@ -194,9 +201,13 @@ async function virusScan(dir) {
     const { stdout } = await runShell('clamscan', ['--no-summary', '-r', dir]);
     return { ok: true, output: stdout };
   } catch (err) {
-    // clamscan returns exit 1 when a signature is found; runShell rejects.
-    const msg = String(err.message);
-    const hit = msg.match(/([^\s:]+):\s+([^\s]+)\s+FOUND/);
+    if (err.exitCode !== 1) {
+      // Exit 2+ = clamscan itself crashed (DB missing, permissions, etc).
+      return { error: 'clamscan_failed', reason: String(err.message).split('\n')[0].slice(0, 200) };
+    }
+    // Signature found — search the full stdout for the hit line.
+    const text = String(err.stdout || err.message);
+    const hit = text.match(/([^\s:]+):\s+(\S+)\s+FOUND/);
     return {
       error: 'virus_detected',
       reason: hit ? `${hit[2]} in ${basename(hit[1])}` : 'clamscan reported a hit',
