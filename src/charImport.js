@@ -43,9 +43,27 @@ const PROJECT_ROOT = resolve(__dirname, '..');
 const CHARS_DIR = join(PROJECT_ROOT, 'engine', 'chars');
 const TMP_ROOT = '/tmp';
 
-const MAX_ZIP_BYTES = 100 * 1024 * 1024;  // 100 MB cap
+const MAX_ZIP_BYTES = 100 * 1024 * 1024;      // upload size cap (compressed)
+const MAX_EXTRACTED_BYTES = 200 * 1024 * 1024; // zip-bomb cap (uncompressed, total)
+const MAX_FILE_BYTES = 50 * 1024 * 1024;       // per-file cap
 const SANDBOX_DISPLAY_BASE = 300;
 const SANDBOX_LOG_MAX_CHARS = 8_000;
+
+/**
+ * Extensions that have no business inside a MUGEN character zip. Hits here
+ * trip an immediate rejection — no further scanning needed. Intentionally
+ * denylist-based (not allowlist) because MUGEN chars pack a long tail of
+ * legitimate file types: sprites, sounds, palettes, readmes, fonts, etc.
+ */
+const DISALLOWED_EXTS = new Set([
+  'exe', 'dll', 'so', 'dylib', 'msi', 'app', 'deb', 'rpm', 'scr', 'lnk', 'desktop',
+  'bat', 'ps1', 'vbs', 'sh', 'bash', 'zsh', 'command',
+  'js', 'mjs', 'cjs', 'py', 'rb', 'pl', 'php', 'jar',
+  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'dmg',
+]);
+
+let clamScanProbed = false;
+let clamScanAvailable = false;
 
 function sha256File(path) {
   const buf = readFileSync(path);
@@ -110,6 +128,80 @@ function findCharDir(extractDir) {
 
 function isValidFileName(name) {
   return /^[A-Za-z0-9_.\- ]{1,64}$/.test(name) && !name.includes('..');
+}
+
+/**
+ * Walk the extracted tree checking for disallowed extensions, per-file
+ * size cap, and total-size cap (zip-bomb protection). Returns { ok } or
+ * { error, reason }.
+ */
+function scanExtractedTree(extractDir) {
+  let total = 0;
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const r = walk(full);
+        if (r && r.error) return r;
+        continue;
+      }
+      if (!entry.isFile()) continue;  // symlinks etc — skip
+      const stat = statSync(full);
+      if (stat.size > MAX_FILE_BYTES) {
+        return { error: 'file_too_large', reason: `${entry.name} is ${stat.size} bytes (cap ${MAX_FILE_BYTES})` };
+      }
+      total += stat.size;
+      if (total > MAX_EXTRACTED_BYTES) {
+        return { error: 'extracted_too_large', reason: `total > ${MAX_EXTRACTED_BYTES} bytes (zip bomb?)` };
+      }
+      const ext = entry.name.includes('.') ? entry.name.split('.').pop().toLowerCase() : '';
+      if (DISALLOWED_EXTS.has(ext)) {
+        return { error: 'disallowed_extension', reason: `${entry.name} (.${ext} not permitted)` };
+      }
+    }
+    return null;
+  };
+  const res = walk(extractDir);
+  if (res && res.error) return res;
+  return { ok: true, total_bytes: total };
+}
+
+/**
+ * Run ClamAV against the extracted dir. `clamscan` is a hard requirement
+ * for the import pipeline — we refuse to install user-uploaded content
+ * without an active AV scan. Install on Linux via
+ * `sudo apt install clamav && sudo freshclam`.
+ *
+ * Returns { ok, output } on clean, { error, reason } on hit OR missing tool.
+ */
+async function virusScan(dir) {
+  if (!clamScanProbed) {
+    try {
+      await runShell('sh', ['-c', 'command -v clamscan >/dev/null']);
+      clamScanAvailable = true;
+    } catch {
+      clamScanAvailable = false;
+    }
+    clamScanProbed = true;
+  }
+  if (!clamScanAvailable) {
+    return {
+      error: 'clamscan_missing',
+      reason: 'clamscan not found on PATH — install clamav (sudo apt install clamav && sudo freshclam) and retry',
+    };
+  }
+  try {
+    const { stdout } = await runShell('clamscan', ['--no-summary', '-r', dir]);
+    return { ok: true, output: stdout };
+  } catch (err) {
+    // clamscan returns exit 1 when a signature is found; runShell rejects.
+    const msg = String(err.message);
+    const hit = msg.match(/([^\s:]+):\s+([^\s]+)\s+FOUND/);
+    return {
+      error: 'virus_detected',
+      reason: hit ? `${hit[2]} in ${basename(hit[1])}` : 'clamscan reported a hit',
+    };
+  }
 }
 
 /**
@@ -229,7 +321,14 @@ export async function importCharFromZip(db, { zipPath, originalFilename, userId 
       return fail(`extract_failed: ${err.message.split('\n')[0]}`);
     }
 
-    // 2. Find char dir + file_name
+    // 2. Safety scan BEFORE we touch engine/chars/. Denylist extensions +
+    //    per-file + total size caps (zip bomb) + optional ClamAV.
+    const tree = scanExtractedTree(extractDir);
+    if (tree.error) return fail(`${tree.error}: ${tree.reason}`);
+    const av = await virusScan(extractDir);
+    if (av.error) return fail(`${av.error}: ${av.reason}`);
+
+    // 3. Find char dir + file_name
     const shape = findCharDir(extractDir);
     if (shape.error) return fail(shape.error);
     const { charDir, fileName } = shape;
@@ -237,7 +336,7 @@ export async function importCharFromZip(db, { zipPath, originalFilename, userId 
 
     db.prepare('UPDATE character_import SET file_name = ? WHERE id = ?').run(fileName, importId);
 
-    // 3. Name conflict check
+    // 4. Name conflict check
     targetDir = join(CHARS_DIR, fileName);
     if (existsSync(targetDir)) return fail('name_conflict', { });
     const existing = db.prepare('SELECT id FROM fighter WHERE file_name = ?').get(fileName);

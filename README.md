@@ -24,6 +24,12 @@ mkdir engine && cd engine
 # For headless streaming (no game window on your desktop):
 sudo pacman -S xorg-server-xvfb ffmpeg xdotool wmctrl
 
+# For the user character-upload pipeline (required — the importer refuses
+# to run without a working clamscan on PATH):
+sudo pacman -S clamav
+sudo freshclam                    # pull signature database
+sudo systemctl enable --now clamav-freshclam.service  # keep it updated
+
 # For the bulk import pipeline (pulling chars from MUGEN Free For All etc):
 sudo pacman -S unrar p7zip
 paru -S megatools   # for Mega.nz downloads (from AUR)
