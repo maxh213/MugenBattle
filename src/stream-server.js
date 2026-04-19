@@ -35,7 +35,7 @@ import {
 import { getTeamForUser, getTeamById, setLineup } from './teams.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 import { StreamWorker } from './streamWorker.js';
-import { getLiveLeagueContext } from './leagues.js';
+import { getLiveLeagueContext, getStandings, latestInterestingLeagueId } from './leagues.js';
 import {
   marketListings,
   buyUnclaimedMaster,
@@ -355,6 +355,7 @@ const LEADERBOARD_HTML = `<!doctype html>
 <nav>
   <a href="/">Live</a>
   <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/leaderboard" class="active">Leaderboard</a>
 </nav>
@@ -543,6 +544,117 @@ async function authLogout() {
 refreshAuth();
 </script>`;
 
+const PYRAMID_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Pyramid · MugenBattle</title>
+<style>${COMMON_CSS}
+  .tier { margin-bottom: 18px; }
+  .tier .hdr { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+  .tier .hdr .tname { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.4px; }
+  .tier .hdr .tier-n { font-size: 20px; font-weight: 600; color: #c9d1d9; font-variant-numeric: tabular-nums; }
+  .tier.t1 .hdr .tier-n { color: #f0ae3c; }
+  .tier .rows { display: grid; gap: 4px; }
+  .prow { display: grid; grid-template-columns: 30px 2.4fr 50px 50px 50px 70px 60px; gap: 8px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; align-items: center; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .prow.mine { border-color: #58a6ff; background: #1d2a3e; }
+  .prow .pos { color: #6e7681; }
+  .prow.pos-1 .pos { color: #f0ae3c; font-weight: 600; }
+  .prow .tname { font-weight: 600; color: #c9d1d9; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prow .tname .user { color: #8b949e; font-weight: 400; font-size: 12px; margin-left: 6px; }
+  .prow .tname .badge { display: inline-block; font-size: 9px; padding: 1px 5px; border-radius: 4px; background: #30363d; color: #8b949e; margin-left: 6px; vertical-align: middle; text-transform: uppercase; letter-spacing: 0.3px; }
+  .prow .tname .badge.me { background: #58a6ff; color: #0d1117; font-weight: 600; }
+  .prow .tname .badge.bot { background: #21262d; color: #6e7681; }
+  .prow .pts { font-size: 15px; font-weight: 600; color: #f0ae3c; text-align: right; }
+  .prow .played { text-align: center; color: #8b949e; }
+  .prow .rec { text-align: center; color: #8b949e; font-size: 12px; }
+  .prow .diff { text-align: right; color: #8b949e; font-size: 12px; }
+  .prow .diff.pos { color: #3fb950; }
+  .prow .diff.neg { color: #f85149; }
+  .league-hdr { display: flex; align-items: baseline; gap: 14px; margin-bottom: 14px; padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
+  .league-hdr .name { font-size: 18px; font-weight: 600; color: #c9d1d9; }
+  .league-hdr .status { font-size: 11px; padding: 2px 8px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .league-hdr .status.running { background: #0f3d1c; color: #3fb950; }
+  .league-hdr .status.complete { background: #1d2a3a; color: #58a6ff; }
+  .league-hdr .pending { color: #8b949e; font-size: 12px; margin-left: auto; }
+  .empty-state { text-align: center; padding: 60px 20px; color: #8b949e; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
+  .legend { padding: 8px 14px; background: #0d1117; border-radius: 6px; color: #6e7681; font-size: 11px; margin-top: 12px; display: flex; gap: 16px; }
+</style></head>
+<body style="position:relative">
+${AUTH_BAR_HTML}
+<h1>🏛️ Pyramid</h1>
+<nav>
+  <a href="/">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/pyramid" class="active">Pyramid</a>
+  <a href="/team">My Team</a>
+  <a href="/market">Market</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+
+<div id="root"></div>
+
+${AUTH_MODAL_HTML}
+${AUTH_JS}
+<script>
+function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
+
+async function load() {
+  const r = await fetch('/api/pyramid');
+  const data = await r.json();
+  const root = document.getElementById('root');
+  if (!data.league) {
+    root.innerHTML = '<div class="empty-state"><h2>No leagues yet</h2><p>Run <code>mugenbattle league create</code> to start one.</p></div>';
+    return;
+  }
+  const statusCls = data.league.status;
+  const header =
+    '<div class="league-hdr">' +
+      '<span class="name">' + esc(data.league.name) + '</span>' +
+      '<span class="status ' + statusCls + '">' + statusCls + '</span>' +
+      (data.pending > 0 ? '<span class="pending">' + data.pending + ' fixtures pending</span>' : '') +
+    '</div>';
+
+  const tiers = data.divisions.map((d, i) => {
+    const rowsHtml = d.standings.map((s, idx) => {
+      const diff = s.matches_won - s.matches_lost;
+      const diffCls = diff > 0 ? 'pos' : diff < 0 ? 'neg' : '';
+      const isMine = data.viewer_team_id === s.team_id;
+      const badge = isMine
+        ? '<span class="badge me">you</span>'
+        : s.username && s.username.startsWith('bot_')
+          ? '<span class="badge bot">bot</span>'
+          : '';
+      return '<div class="prow' + (isMine ? ' mine' : '') + ' pos-' + (idx + 1) + '">' +
+        '<div class="pos">' + (idx + 1) + '</div>' +
+        '<div class="tname">' + esc(s.team_name) + badge +
+          '<span class="user">@' + esc(s.username) + '</span>' +
+        '</div>' +
+        '<div class="played">' + s.fixtures_played + '</div>' +
+        '<div class="rec">' + s.fixtures_won + '-' + s.fixtures_drawn + '-' + s.fixtures_lost + '</div>' +
+        '<div class="rec">' + s.matches_won + '-' + s.matches_lost + '</div>' +
+        '<div class="diff ' + diffCls + '">' + (diff > 0 ? '+' : '') + diff + '</div>' +
+        '<div class="pts">' + s.points + '</div>' +
+      '</div>';
+    }).join('');
+    return '<div class="tier t' + d.tier + '">' +
+      '<div class="hdr">' +
+        '<span class="tier-n">Tier ' + d.tier + '</span>' +
+        '<span class="tname">' + esc(d.name) + '</span>' +
+      '</div>' +
+      '<div class="rows">' + rowsHtml + '</div>' +
+    '</div>';
+  }).join('');
+
+  root.innerHTML = header + tiers +
+    '<div class="legend">' +
+      '<span>Columns: pos · team · played · W-D-L · match W-L · diff · pts</span>' +
+    '</div>';
+}
+
+load();
+setInterval(load, 5000);
+</script>
+</body></html>`;
+
 const MARKET_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><title>Market · MugenBattle</title>
@@ -580,6 +692,7 @@ ${AUTH_BAR_HTML}
 <nav>
   <a href="/">Live</a>
   <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market" class="active">Market</a>
   <a href="/leaderboard">Leaderboard</a>
@@ -840,6 +953,7 @@ ${AUTH_BAR_HTML}
 <nav>
   <a href="/">Live</a>
   <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
   <a href="/team" class="active">My Team</a>
   <a href="/market">Market</a>
   <a href="/leaderboard">Leaderboard</a>
@@ -1227,6 +1341,7 @@ ${AUTH_BAR_HTML}
 <nav>
   <a href="/">Live (tournament)</a>
   <a href="/leagues" class="active">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market">Market</a>
   <a href="/leaderboard">Leaderboard</a>
@@ -1384,6 +1499,7 @@ ${AUTH_BAR_HTML}
 <nav>
   <a href="/" class="active">Live</a>
   <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market">Market</a>
   <a href="/leaderboard">Leaderboard</a>
@@ -1741,6 +1857,25 @@ const server = createServer((req, res) => {
     req.on('close', detach);
     return;
   }
+  if (req.url === '/api/pyramid') {
+    const db = getDb();
+    const leagueId = latestInterestingLeagueId(db);
+    if (!leagueId) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ league: null, divisions: [], viewer_team_id: null }));
+      return;
+    }
+    const data = getStandings(db, leagueId);
+    const me = currentUser(db, req);
+    let viewerTeamId = null;
+    if (me) {
+      const row = db.prepare('SELECT id FROM team WHERE user_id = ?').get(me.id);
+      viewerTeamId = row?.id ?? null;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ...data, viewer_team_id: viewerTeamId }));
+    return;
+  }
   if (req.url === '/api/workers') {
     const db = getDb();
     const data = Array.from(workers.values()).map((w) => {
@@ -1775,6 +1910,11 @@ const server = createServer((req, res) => {
   if (req.url === '/leagues' || req.url === '/leagues/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(LEAGUES_HTML);
+    return;
+  }
+  if (req.url === '/pyramid' || req.url === '/pyramid/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(PYRAMID_HTML);
     return;
   }
   if (req.url === '/team' || req.url === '/team/') {

@@ -521,6 +521,21 @@ export function computeNextSeasonSeating(db, { divCount, perDiv, promotePerTier 
   return { divisions, dropped };
 }
 
+/**
+ * ID of the "currently interesting" league: the latest running one, else
+ * the latest complete one, else null. Used by the pyramid view.
+ */
+export function latestInterestingLeagueId(db) {
+  const running = db.prepare(
+    "SELECT id FROM league WHERE status = 'running' ORDER BY id DESC LIMIT 1"
+  ).get();
+  if (running) return running.id;
+  const complete = db.prepare(
+    "SELECT id FROM league WHERE status = 'complete' ORDER BY id DESC LIMIT 1"
+  ).get();
+  return complete?.id ?? null;
+}
+
 export function listLeagues(db) {
   return db.prepare(`
     SELECT l.*,
