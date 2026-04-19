@@ -170,6 +170,85 @@ test('listLeagues exposes progress counters', async () => {
   assert.equal(afterRun.status, 'complete');
 });
 
+test('head-to-head breaks ties on pts+diff+wins', async () => {
+  const db = getDb();
+  // Hand-roll a league we can control the outcomes of. 3 teams in 1 div,
+  // each plays each once. We stuff fixture_match counts by fiat.
+  const leagueId = db.prepare(
+    "INSERT INTO league (name, status, started_at) VALUES ('H2H', 'running', datetime('now'))"
+  ).run().lastInsertRowid;
+  const divId = db.prepare(
+    "INSERT INTO division (league_id, tier, name) VALUES (?, 1, 'Division 1')"
+  ).run(leagueId).lastInsertRowid;
+
+  // Three teams: A, B, C. We rig the standings so A and B both have
+  // pts=3, matches 1W-1L (diff=0, wins=1), and C is third. H2H between
+  // A and B has A winning → A should sort above B.
+  function mkBot(n) {
+    const uid = db.prepare("INSERT INTO user_account (email, username, is_bot) VALUES (?, ?, 1)").run(`t${n}@x`, `t${n}`).lastInsertRowid;
+    const tid = db.prepare('INSERT INTO team (user_id, name) VALUES (?, ?)').run(uid, `Team ${n}`).lastInsertRowid;
+    db.prepare('INSERT INTO division_team (division_id, team_id) VALUES (?, ?)').run(divId, tid);
+    return tid;
+  }
+  const A = mkBot('A');
+  const B = mkBot('B');
+  const C = mkBot('C');
+
+  function applyFixture(home, away, hWins, aWins) {
+    const wt = hWins > aWins ? home : aWins > hWins ? away : null;
+    db.prepare(
+      "INSERT INTO fixture (division_id, round_num, slot_num, home_team_id, away_team_id, status, home_score, away_score, winner_team_id) VALUES (?, ?, ?, ?, ?, 'complete', ?, ?, ?)"
+    ).run(divId, 1, 1, home, away, hWins, aWins, wt);
+    const pts = (t, h, a) => (h > a ? 3 : a > h ? 0 : 1);
+    db.prepare(
+      "UPDATE division_team SET points = points + ?, fixtures_played = fixtures_played + 1, fixtures_won = fixtures_won + ?, fixtures_lost = fixtures_lost + ?, fixtures_drawn = fixtures_drawn + ?, matches_won = matches_won + ?, matches_lost = matches_lost + ? WHERE division_id = ? AND team_id = ?"
+    ).run(pts(home, hWins, aWins), hWins > aWins ? 1 : 0, aWins > hWins ? 1 : 0, hWins === aWins ? 1 : 0, hWins, aWins, divId, home);
+    db.prepare(
+      "UPDATE division_team SET points = points + ?, fixtures_played = fixtures_played + 1, fixtures_won = fixtures_won + ?, fixtures_lost = fixtures_lost + ?, fixtures_drawn = fixtures_drawn + ?, matches_won = matches_won + ?, matches_lost = matches_lost + ? WHERE division_id = ? AND team_id = ?"
+    ).run(pts(away, aWins, hWins), aWins > hWins ? 1 : 0, hWins > aWins ? 1 : 0, hWins === aWins ? 1 : 0, aWins, hWins, divId, away);
+  }
+  // A 3-2 B (A wins this head-to-head)
+  applyFixture(A, B, 3, 2);
+  // A 0-5 C, B 5-0 C  → A beat B, B beat C, C lost to both
+  applyFixture(A, C, 0, 5);
+  applyFixture(B, C, 5, 0);
+  // After:
+  //   A: pts=3 (1W 1L), matches 3+0=3 won, 2+5=7 lost, diff=-4
+  //   B: pts=3 (1W 1L), matches 2+5=7 won, 3+0=3 lost, diff=+4
+  //   C: pts=3 (1W 1L), matches 5+0=5 won, 0+5=5 lost, diff=0
+  // Tie on pts only; diff splits them cleanly (B > C > A).
+  //
+  // That's fine for the test — what we want to verify is that if pts+diff+wins
+  // ALL match, H2H kicks in. So let's add another fixture to neutralise the diff.
+
+  // Make all 3 have identical pts, diff, and wins: we'll tweak so that each
+  // has pts=3, wins=5, losses=5 (diff=0). Adjust B and A.
+  db.prepare(
+    "UPDATE division_team SET matches_won = 5, matches_lost = 5 WHERE division_id = ? AND team_id = ?"
+  ).run(divId, A);
+  db.prepare(
+    "UPDATE division_team SET matches_won = 5, matches_lost = 5 WHERE division_id = ? AND team_id = ?"
+  ).run(divId, B);
+  db.prepare(
+    "UPDATE division_team SET matches_won = 5, matches_lost = 5 WHERE division_id = ? AND team_id = ?"
+  ).run(divId, C);
+
+  const data = getStandings(db, leagueId);
+  const ranks = data.divisions[0].standings.map((s) => s.team_id);
+
+  // All tied on pts+diff+wins → H2H mini-league decides. From the fixtures:
+  //   A vs B → A scored 3, B scored 2 → A won
+  //   A vs C → A scored 0, C scored 5 → C won
+  //   B vs C → B scored 5, C scored 0 → B won
+  // Mini-table: A 1W 1L (pts 3), B 1W 1L (pts 3), C 1W 1L (pts 3).
+  // All tied in mini-pts too, fall through to mini-diff:
+  //   A mini-diff: 3-2 + 0-5 = +3 - 5 = -2
+  //   B mini-diff: 2-3 + 5-0 = -1 + 5 = +4
+  //   C mini-diff: 5-0 + 0-5 = +5 - 5 = 0
+  // So B > C > A.
+  assert.deepEqual(ranks, [B, C, A]);
+});
+
 test('autoCreateSeason runs twice back-to-back (continuous mode)', async () => {
   const db = getDb();
   // Season 1: seeds bots from scratch, hadPrevSeason=false.

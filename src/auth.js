@@ -123,7 +123,7 @@ export function sendCode(db, email) {
   db.prepare('INSERT INTO auth_code (email, code, expires_at) VALUES (?, ?, ?)').run(email, code, expiresAt);
 
   // Send email — fire-and-forget but catch errors so we can report them
-  return sendGmailCode(email, code).then(
+  return sendLoginCode(email, code).then(
     () => ({ status: 200, body: { ok: true } }),
     (e) => {
       console.error('[auth] email send failed:', e.message);
@@ -231,11 +231,70 @@ export function sessionCookieHeader(value, { clear = false } = {}) {
   return `mb_session=${value}; ${attrs.join('; ')}`;
 }
 
-// ------ Gmail OAuth2 send ------
+// ------ Mailer router ------
 
 function isDev() {
   return process.env.NODE_ENV !== 'production';
 }
+
+/**
+ * Dispatch a login-code email to the configured provider. EMAIL_PROVIDER
+ * picks between 'resend' (default when RESEND_API_KEY set), 'gmail'
+ * (legacy), or prints to stdout in dev mode when nothing is configured.
+ */
+export async function sendLoginCode(email, code) {
+  const provider = (process.env.EMAIL_PROVIDER || '').toLowerCase();
+  if (provider === 'resend' || (!provider && process.env.RESEND_API_KEY)) {
+    return sendViaResend(email, code);
+  }
+  if (provider === 'gmail' || (!provider && process.env.GMAIL_REFRESH_TOKEN)) {
+    return sendGmailCode(email, code);
+  }
+  if (isDev()) {
+    console.log(`[auth DEV] Login code for ${email}: ${code}`);
+    return;
+  }
+  throw new Error('No email provider configured (set EMAIL_PROVIDER + credentials)');
+}
+
+// ------ Resend ------
+
+async function sendViaResend(email, code) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    if (isDev()) {
+      console.log(`[auth DEV] Login code for ${email}: ${code} (RESEND_API_KEY not set)`);
+      return;
+    }
+    throw new Error('RESEND_API_KEY not configured');
+  }
+  const from = process.env.EMAIL_FROM || 'noreply@mugenbattle.com';
+  const payload = JSON.stringify({
+    from: `MugenBattle <${from}>`,
+    to: [email],
+    subject: `MugenBattle login code: ${code}`,
+    text: [
+      `Your MugenBattle login code is: ${code}`,
+      '',
+      'This code expires in 10 minutes.',
+      '',
+      "If you didn't request this, you can ignore this email.",
+    ].join('\n'),
+  });
+  await httpsRequest({
+    hostname: 'api.resend.com',
+    path: '/emails',
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+    },
+  }, payload);
+  if (isDev()) console.log(`[auth] Login code sent to ${email} via Resend`);
+}
+
+// ------ Gmail OAuth2 send (legacy) ------
 
 function httpsRequest(opts, body) {
   return new Promise((resolve, reject) => {

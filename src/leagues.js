@@ -369,9 +369,8 @@ export function getStandings(db, leagueId) {
   const league = db.prepare('SELECT * FROM league WHERE id = ?').get(leagueId);
   if (!league) return null;
   const divisions = db.prepare('SELECT * FROM division WHERE league_id = ? ORDER BY tier').all(leagueId);
-  const withStandings = divisions.map((d) => ({
-    ...d,
-    standings: db.prepare(`
+  const withStandings = divisions.map((d) => {
+    const base = db.prepare(`
       SELECT dt.*, t.name AS team_name, u.username
       FROM division_team dt
       JOIN team t ON dt.team_id = t.id
@@ -382,14 +381,78 @@ export function getStandings(db, leagueId) {
                dt.matches_won DESC,
                dt.fixtures_played ASC,
                t.name ASC
-    `).all(d.id),
-  }));
+    `).all(d.id);
+    return { ...d, standings: applyHeadToHead(db, base) };
+  });
   const pending = db.prepare(`
     SELECT COUNT(*) AS n FROM fixture f
     JOIN division d ON f.division_id = d.id
     WHERE d.league_id = ? AND f.status != 'complete'
   `).get(leagueId).n;
   return { league, divisions: withStandings, pending };
+}
+
+/**
+ * Re-rank any run of teams still tied on (points, match-diff, match-wins)
+ * by a mini-league of just their head-to-head fixtures. Matches the
+ * Premier League's 4th-tiebreaker rule. Teams that aren't in a tied run
+ * stay in their base-sort position.
+ */
+function applyHeadToHead(db, rows) {
+  if (rows.length < 2) return rows;
+  const out = [];
+  let i = 0;
+  while (i < rows.length) {
+    let j = i + 1;
+    while (
+      j < rows.length &&
+      rows[j].points === rows[i].points &&
+      (rows[j].matches_won - rows[j].matches_lost) === (rows[i].matches_won - rows[i].matches_lost) &&
+      rows[j].matches_won === rows[i].matches_won
+    ) j++;
+    if (j === i + 1) {
+      out.push(rows[i]);
+    } else {
+      const group = rows.slice(i, j);
+      out.push(...sortByHeadToHead(db, group));
+    }
+    i = j;
+  }
+  return out;
+}
+
+function sortByHeadToHead(db, group) {
+  const ids = group.map((g) => g.team_id);
+  const placeholders = ids.map(() => '?').join(',');
+  const fixtures = db.prepare(`
+    SELECT home_team_id, away_team_id, home_score, away_score, winner_team_id
+    FROM fixture
+    WHERE status = 'complete'
+      AND home_team_id IN (${placeholders})
+      AND away_team_id IN (${placeholders})
+  `).all(...ids, ...ids);
+
+  const mini = new Map(ids.map((id) => [id, { points: 0, wins: 0, losses: 0 }]));
+  for (const f of fixtures) {
+    const h = mini.get(f.home_team_id);
+    const a = mini.get(f.away_team_id);
+    h.wins += f.home_score; h.losses += f.away_score;
+    a.wins += f.away_score; a.losses += f.home_score;
+    if (f.winner_team_id === f.home_team_id) h.points += 3;
+    else if (f.winner_team_id === f.away_team_id) a.points += 3;
+    else { h.points += 1; a.points += 1; }
+  }
+
+  return group.slice().sort((ra, rb) => {
+    const a = mini.get(ra.team_id);
+    const b = mini.get(rb.team_id);
+    if (a.points !== b.points) return b.points - a.points;
+    const ad = a.wins - a.losses;
+    const bd = b.wins - b.losses;
+    if (ad !== bd) return bd - ad;
+    if (a.wins !== b.wins) return b.wins - a.wins;
+    return (ra.team_name || '').localeCompare(rb.team_name || '');
+  });
 }
 
 /**
