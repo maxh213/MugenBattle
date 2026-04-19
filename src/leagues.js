@@ -20,6 +20,29 @@ import { selectLineup } from './teams.js';
 import { runOwnedFighterMatch } from './match.js';
 
 /**
+ * Best-effort: look for `chars/stg_<uuid>_<master>/something.(cns|cmd|st|lua)`
+ * in the error. Ikemen's own parse/runtime errors reference the specific file
+ * so the master in that path is almost certainly the culprit. If we can't
+ * narrow it to exactly one master, do nothing.
+ */
+function deactivateIfIdentifiable(db, errMsg) {
+  const deep = new Set();
+  const re = /chars\/stg_[a-f0-9]+_([^/\s]+)\/[^/\s]+\.(?:cns|cmd|st|lua|def)/g;
+  let m;
+  while ((m = re.exec(errMsg)) !== null) deep.add(m[1]);
+  if (deep.size !== 1) return;
+  const [fileName] = deep;
+  const row = db
+    .prepare('SELECT id, active FROM fighter WHERE file_name = ? AND is_master = 1')
+    .get(fileName);
+  if (!row || row.active === 0) return;
+  db.prepare(
+    "UPDATE fighter SET active = 0, validated_at = datetime('now'), validation_reason = ? WHERE id = ?"
+  ).run('runtime_crash', row.id);
+  console.error(`[auto-deactivate] master "${fileName}" flagged runtime_crash`);
+}
+
+/**
  * Create a season from an ordered list of divisions. Each division carries
  * its own list of team IDs (top division first = tier 1). Generates the
  * full fixture list up-front.
@@ -189,11 +212,13 @@ export async function runFixture(db, fixtureId, ctx) {
       });
     } catch (err) {
       // A single character can crash Ikemen ("Invalid state: ..." loops,
-      // missing sprite pointers, etc). Don't abort the fixture — record
-      // the slot as a 0-0 draw and continue. The broken char stays on the
-      // roster; a separate validator pass can mark it inactive later.
+      // missing sprite pointers, malformed .cns at a specific line etc).
+      // Don't abort the fixture — record the slot as a 0-0 draw and continue.
       console.error(`[fixture ${fixture.id} slot ${i + 1}] match error: ${err.message.split('\n')[0]}`);
       r = { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
+      // If the error names a specific char's file (e.g. chars/stg_.../X.cns:N),
+      // deactivate that master so it doesn't keep getting drawn into rosters.
+      deactivateIfIdentifiable(db, err.message || '');
     }
 
     let winner;

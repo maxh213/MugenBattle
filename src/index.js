@@ -658,12 +658,14 @@ league
   .description('Run all remaining fixtures for a league until complete')
   .option('--log <path>', 'per-worker Ikemen log file (isolates from other workers)')
   .option('--display <name>', 'per-worker X DISPLAY (e.g. :100)')
+  .option('--speed <pct>', 'Ikemen speed (10-200) or "speedtest" for ~100x. Smokes only.')
   .action(async (id, opts) => {
     const db = getDb();
     const leagueId = parseInt(id, 10);
     const ctx = {};
     if (opts.log) ctx.logPath = opts.log;
     if (opts.display) ctx.display = opts.display;
+    if (opts.speed) ctx.speed = opts.speed;
 
     const r = await runLeagueWorker(db, leagueId, ctx, {
       onFixtureStart: (f) => {

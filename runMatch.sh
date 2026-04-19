@@ -36,6 +36,16 @@ EXTRA_ARGS=()
 if [ -n "$4" ]; then EXTRA_ARGS+=(-p1.life "$4"); fi
 if [ -n "$5" ]; then EXTRA_ARGS+=(-p2.life "$5"); fi
 
+# Smoke-test acceleration. MATCH_SPEED=200 caps at Ikemen's -speed limit;
+# MATCH_SPEED=speedtest switches to -speedtest (~100x). Unset = normal.
+if [ -n "$MATCH_SPEED" ]; then
+  if [ "$MATCH_SPEED" = "speedtest" ]; then
+    EXTRA_ARGS+=(-speedtest)
+  else
+    EXTRA_ARGS+=(-speed "$MATCH_SPEED")
+  fi
+fi
+
 $ENGINE \
   -p1 "$1" \
   -p2 "$2" \
