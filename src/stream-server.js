@@ -65,6 +65,7 @@ import {
   unlistStage,
   buyListedStage,
   priceForStage,
+  releaseOwnedFighter,
 } from './market.js';
 import { importCharFromZip, listUserImports } from './charImport.js';
 import { writeFileSync, unlinkSync } from 'fs';
@@ -1736,15 +1737,17 @@ async function renderSellSection(f) {
   const host = document.getElementById('edit-sell');
   if (!host) return;
   if (f.slot === 'active') {
-    host.innerHTML = '<label>Market</label><span style="color:#6e7681;font-size:12px">Bench this fighter first to list it for sale.</span>';
+    host.innerHTML = '<label>Market</label><span style="color:#6e7681;font-size:12px">Bench this fighter first to list or release.</span>';
     return;
   }
+  const releaseBtn = '<button onclick="releaseFighter(' + f.id + ')" style="background:transparent;color:#f85149;border:1px solid #f85149">Release</button>';
   if (f.slot === 'for_sale') {
     const price = Number(f.listing_price_cents || 0);
     host.innerHTML =
       '<label>Market</label>' +
       '<span style="font-size:13px">Listed at <b>' + fmtCents(price) + '</b></span>' +
       '<button onclick="unlistFighter(' + f.id + ')">Unlist</button>' +
+      releaseBtn +
       '<span class="msg" id="edit-sell-msg"></span>';
     return;
   }
@@ -1759,7 +1762,24 @@ async function renderSellSection(f) {
     '<input type="number" id="edit-price" min="0" step="1" value="' + suggested + '" style="max-width:120px">' +
     '<span style="color:#8b949e;font-size:11px">¢ · suggested ' + fmtCents(suggested) + '</span>' +
     '<button onclick="listFighter(' + f.id + ')">List for sale</button>' +
+    releaseBtn +
     '<span class="msg" id="edit-sell-msg"></span>';
+}
+
+async function releaseFighter(id) {
+  if (!confirm('Release this fighter to the market pool? You won\\'t get any money back. The master becomes available to other players.')) return;
+  const msg = document.getElementById('edit-sell-msg');
+  msg.className = 'msg'; msg.textContent = '…';
+  const r = await fetch('/api/owned-fighter/' + id + '/release', { method: 'POST' });
+  const body = await r.json();
+  if (r.ok) {
+    // Drop it from local state and close the editor.
+    currentTeam.fighters = currentTeam.fighters.filter(x => x.id !== id);
+    renderTeam();
+    closeEditor();
+  } else {
+    msg.className = 'msg err'; msg.textContent = body.error || 'error';
+  }
 }
 
 async function listFighter(id) {
@@ -2751,6 +2771,17 @@ const server = createServer((req, res) => {
     const result = unlistFromSale(db, u.id, id);
     const status = result.ok ? 200 : 400;
     res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+  const releaseMatch = req.url && req.url.match(/^\/api\/owned-fighter\/(\d+)\/release$/);
+  if (releaseMatch && req.method === 'POST') {
+    const id = Number(releaseMatch[1]);
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const result = releaseOwnedFighter(db, u.id, id);
+    res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
     return;
   }

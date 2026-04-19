@@ -426,6 +426,30 @@ export function buyListedStage(db, buyerUserId, stageId) {
 }
 
 /**
+ * Give up a fighter without selling — retire the owned clone, returning its
+ * master to the unclaimed pool. Only bench or for_sale fighters; active
+ * fighters must be benched first (else the 5-active invariant breaks).
+ */
+export function releaseOwnedFighter(db, userId, ownedFighterId) {
+  const tx = db.transaction(() => {
+    const row = db.prepare(`
+      SELECT of.id, of.slot, of.is_retired, t.user_id
+      FROM owned_fighter of JOIN team t ON of.team_id = t.id
+      WHERE of.id = ?
+    `).get(ownedFighterId);
+    if (!row) return { error: 'not_found' };
+    if (row.user_id !== userId) return { error: 'not_your_fighter' };
+    if (row.is_retired) return { error: 'already_retired' };
+    if (row.slot === 'active') return { error: 'active_slot' };
+    db.prepare(
+      'UPDATE owned_fighter SET is_retired = 1, slot = \'bench\', listing_price_cents = NULL WHERE id = ?'
+    ).run(ownedFighterId);
+    return { ok: true };
+  });
+  return tx();
+}
+
+/**
  * All user-listed fighters currently for sale. Joined with master + seller
  * info so the market UI can render without extra fetches.
  */
