@@ -46,15 +46,33 @@ if [ -n "$MATCH_SPEED" ]; then
   fi
 fi
 
-$ENGINE \
-  -p1 "$1" \
-  -p2 "$2" \
-  -p1.ai 8 \
-  -p2.ai 8 \
-  -rounds 1 \
-  -s "$3" \
-  -log "$LOG_FILE" \
-  -nosound \
-  -nojoy \
-  -windowed \
-  "${EXTRA_ARGS[@]}"
+IKE_ARGS=(-p1 "$1" -p2 "$2" -p1.ai 8 -p2.ai 8 -rounds 1 -s "$3"
+          -log "$LOG_FILE" -nosound -nojoy -windowed "${EXTRA_ARGS[@]}")
+
+# MATCH_SANDBOX=bwrap runs Ikemen under bubblewrap: no network, separate pid
+# namespace, read-only view of the host filesystem (engine dir RO; a tmpfs
+# overlays engine/save so Ikemen can still scratch replays/configs without
+# touching our real dir), with only the log file bind-mounted writable.
+# Used by the user-character-import sandbox test.
+if [ "$MATCH_SANDBOX" = "bwrap" ]; then
+  # Make sure the log file exists before bind-mounting it.
+  : > "$LOG_FILE"
+  exec bwrap \
+    --unshare-net --unshare-pid --die-with-parent --new-session \
+    --ro-bind /usr /usr \
+    --ro-bind /etc /etc \
+    --symlink usr/lib /lib \
+    --symlink usr/lib /lib64 \
+    --ro-bind "$ENGINE_DIR" "$ENGINE_DIR" \
+    --tmpfs "$ENGINE_DIR/save" \
+    --tmpfs /tmp \
+    --ro-bind /tmp/.X11-unix /tmp/.X11-unix \
+    --bind "$LOG_FILE" "$LOG_FILE" \
+    --dev /dev \
+    --proc /proc \
+    --setenv DISPLAY "${DISPLAY:-:0}" \
+    --chdir "$ENGINE_DIR" \
+    "$ENGINE" "${IKE_ARGS[@]}"
+fi
+
+$ENGINE "${IKE_ARGS[@]}"

@@ -245,6 +245,12 @@ async function sandboxTest(db, fileName) {
   const stageRow = db.prepare("SELECT file_name FROM stage WHERE active = 1 ORDER BY RANDOM() LIMIT 1").get();
   if (!stageRow) return { ok: false, reason: 'no_active_stages' };
   const logPath = `/tmp/mb-sandbox-${fileName}-${randomUUID().slice(0, 6)}.log`;
+  // Run the test match under bubblewrap: no network, separate pid namespace,
+  // engine dir RO, /tmp tmpfs, only the log file bind-mounted writable. This
+  // contains any side-effects of a malicious .cmd/.cns/.lua carried in by
+  // the uploader — even if Ikemen's Lua VM or a parser bug lets the char
+  // execute arbitrary code, it can't touch our DB or source tree.
+  process.env.MATCH_SANDBOX = 'bwrap';
   try {
     return await withSandboxDisplay(async (display) => {
       try {
@@ -261,6 +267,7 @@ async function sandboxTest(db, fileName) {
       }
     });
   } finally {
+    delete process.env.MATCH_SANDBOX;
     try { unlinkSync(logPath); } catch {}
   }
 }
