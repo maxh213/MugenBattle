@@ -124,6 +124,18 @@ async function bootWorkers() {
   })();
   if (reset > 0) console.log(`[boot] reset ${reset} stuck 'running' fixture(s) to 'pending'`);
 
+  // Retire clones of any already-inactive master. Without this a roster
+  // could still include a previously auto-deactivated char and keep
+  // crashing fixtures until next season's bot rotation.
+  const retired = db.prepare(`
+    UPDATE owned_fighter SET is_retired = 1
+    WHERE is_retired = 0
+      AND master_fighter_id IN (SELECT id FROM fighter WHERE is_master = 1 AND active = 0)
+  `).run();
+  if (retired.changes > 0) {
+    console.log(`[boot] retired ${retired.changes} clone(s) of deactivated masters`);
+  }
+
   for (let i = 1; i <= WORKER_COUNT; i++) {
     const w = new StreamWorker({
       workerId: i,

@@ -30,26 +30,60 @@ const PRIZE_DRAW_CENTS = 25;
  * so the master in that path is almost certainly the culprit. If we can't
  * narrow it to exactly one master, do nothing.
  */
+const CRASH_SUSPECT_THRESHOLD = 3;
+
+/**
+ * Mark a master inactive + retire every active clone so they stop getting
+ * picked for fixtures. Without the retire, user/bot rosters keep carrying
+ * a broken clone and its next fixture panics again.
+ */
+function deactivateMaster(db, masterId, reason) {
+  db.prepare(
+    "UPDATE fighter SET active = 0, validated_at = datetime('now'), validation_reason = ? WHERE id = ?"
+  ).run(reason, masterId);
+  const { changes } = db.prepare(
+    'UPDATE owned_fighter SET is_retired = 1 WHERE master_fighter_id = ? AND is_retired = 0'
+  ).run(masterId);
+  console.error(`[auto-deactivate] master #${masterId} (${reason}); retired ${changes} clone(s)`);
+}
+
+/**
+ * Parse the error message for a chars/stg_<uuid>_<master>/ path. If exactly
+ * one master is named, flip it inactive + retire its clones. Returns true
+ * if a master was deactivated, false if we couldn't identify one.
+ */
 function deactivateIfIdentifiable(db, errMsg) {
-  // Ikemen references the offending char via paths like
-  //   chars/stg_<uuid>_<master>/<file>.cns
-  //   chars/stg_<uuid>_<master>/Txt/SomeConfig.Txt   (nested subdirs)
-  // We just want the <master> token; everything after the master/ slash is
-  // best-effort ignored.
   const deep = new Set();
   const re = /chars\/stg_[a-f0-9]+_([^/\s]+)\//g;
   let m;
   while ((m = re.exec(errMsg)) !== null) deep.add(m[1]);
-  if (deep.size !== 1) return;
+  if (deep.size !== 1) return false;
   const [fileName] = deep;
   const row = db
     .prepare('SELECT id, active FROM fighter WHERE file_name = ? AND is_master = 1')
     .get(fileName);
-  if (!row || row.active === 0) return;
-  db.prepare(
-    "UPDATE fighter SET active = 0, validated_at = datetime('now'), validation_reason = ? WHERE id = ?"
-  ).run('runtime_crash', row.id);
-  console.error(`[auto-deactivate] master "${fileName}" flagged runtime_crash`);
+  if (!row || row.active === 0) return true; // already deactivated, count as handled
+  deactivateMaster(db, row.id, 'runtime_crash');
+  return true;
+}
+
+/**
+ * When we can't tell which combatant crashed (deep Ikemen panic with no
+ * char path), bump a suspect counter on BOTH masters. Once a master hits
+ * CRASH_SUSPECT_THRESHOLD, deactivate — any master consistently present
+ * in mystery crashes is the likely cause.
+ */
+function chargeCrashSuspects(db, homeMasterId, awayMasterId) {
+  const inc = db.prepare('UPDATE fighter SET crash_suspect_count = crash_suspect_count + 1 WHERE id = ?');
+  const get = db.prepare('SELECT id, file_name, crash_suspect_count, active FROM fighter WHERE id = ?');
+  for (const mid of [homeMasterId, awayMasterId]) {
+    if (!mid) continue;
+    inc.run(mid);
+    const row = get.get(mid);
+    if (row && row.active === 1 && row.crash_suspect_count >= CRASH_SUSPECT_THRESHOLD) {
+      deactivateMaster(db, row.id, `repeated_crash:${row.crash_suspect_count}`);
+    }
+  }
 }
 
 /**
@@ -234,9 +268,14 @@ export async function runFixture(db, fixtureId, ctx) {
       // Don't abort the fixture — record the slot as a 0-0 draw and continue.
       console.error(`[fixture ${fixture.id} slot ${i + 1}] match error: ${err.message.split('\n')[0]}`);
       r = { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
-      // If the error names a specific char's file (e.g. chars/stg_.../X.cns:N),
-      // deactivate that master so it doesn't keep getting drawn into rosters.
-      deactivateIfIdentifiable(db, err.message || '');
+      // If the error names a specific char's path, deactivate that master
+      // outright. If it doesn't (deep Ikemen panic with no char token), we
+      // can't tell who's at fault — charge both as suspects. Repeat
+      // offenders auto-deactivate at the crash_suspect threshold.
+      const identified = deactivateIfIdentifiable(db, err.message || '');
+      if (!identified) {
+        chargeCrashSuspects(db, h.master_fighter_id, a.master_fighter_id);
+      }
     }
 
     let winner;

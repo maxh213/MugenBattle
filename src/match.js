@@ -161,7 +161,8 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
     });
 
     // Poll the match log — catches Ikemen's Lua modal errors that hang the
-    // process waiting for an OK click.
+    // process waiting for an OK click. 250ms gives a ~4-frame visible modal
+    // at 15fps capture; much tighter than 1s.
     const logPoller = setInterval(() => {
       try {
         const content = readFileSync(logPath, 'utf-8');
@@ -170,7 +171,7 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
           try { child.kill('SIGKILL'); } catch {}
         }
       } catch {}
-    }, 1000);
+    }, 250);
 
     return child;
   });
