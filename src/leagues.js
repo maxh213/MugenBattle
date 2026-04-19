@@ -177,13 +177,25 @@ export async function runFixture(db, fixtureId, ctx) {
   for (let i = 0; i < 5; i++) {
     const h = homeLineup[i];
     const a = awayLineup[i];
-    const r = await runOwnedFighterMatch({
-      db,
-      homeOwnedFighterId: h.id,
-      awayOwnedFighterId: a.id,
-      stageFileName: stageRow.file_name,
-      ctx,
-    });
+
+    let r;
+    try {
+      r = await runOwnedFighterMatch({
+        db,
+        homeOwnedFighterId: h.id,
+        awayOwnedFighterId: a.id,
+        stageFileName: stageRow.file_name,
+        ctx,
+      });
+    } catch (err) {
+      // A single character can crash Ikemen ("Invalid state: ..." loops,
+      // missing sprite pointers, etc). Don't abort the fixture — record
+      // the slot as a 0-0 draw and continue. The broken char stays on the
+      // roster; a separate validator pass can mark it inactive later.
+      console.error(`[fixture ${fixture.id} slot ${i + 1}] match error: ${err.message.split('\n')[0]}`);
+      r = { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
+    }
+
     let winner;
     if (r.winner === 'fighter1') { homeScore++; winner = 'home'; }
     else if (r.winner === 'fighter2') { awayScore++; winner = 'away'; }
@@ -385,6 +397,80 @@ export function getLiveLeagueContext(db, leagueId) {
       slots,
     },
   };
+}
+
+/**
+ * Given the most-recent completed league, compute the next season's seating
+ * by standard promotion/relegation:
+ *   - top K of each tier promote up (tier 1 stays at tier 1)
+ *   - bottom K of each tier relegate down
+ *   - bottom K of the BOTTOM tier drop out (returned as `dropped` — caller
+ *     leaves them at current_league_id=NULL so they wait for the next cycle).
+ *
+ * Returns { divisions: [{name, teamIds:[]}, ...], dropped: [teamIds] }
+ * with divCount tiers. Each tier's teamIds may be < perDiv — the caller fills
+ * gaps with bots + new signups.
+ *
+ * Returns null if there's no prior completed league (fresh-start case).
+ * Assumes the new season's divCount matches the prev league's divCount;
+ * falls back to null if they differ.
+ */
+export function computeNextSeasonSeating(db, { divCount, perDiv, promotePerTier = 2 }) {
+  const prev = db.prepare(`
+    SELECT id FROM league WHERE status = 'complete' ORDER BY id DESC LIMIT 1
+  `).get();
+  if (!prev) return null;
+
+  const prevDivs = db.prepare(`
+    SELECT id, tier FROM division WHERE league_id = ? ORDER BY tier
+  `).all(prev.id);
+  if (prevDivs.length !== divCount) return null;
+
+  const standingsByTier = {};
+  for (const d of prevDivs) {
+    standingsByTier[d.tier] = db.prepare(`
+      SELECT dt.team_id FROM division_team dt
+      WHERE dt.division_id = ?
+      ORDER BY dt.points DESC,
+               (dt.matches_won - dt.matches_lost) DESC,
+               dt.matches_won DESC,
+               dt.fixtures_played ASC,
+               dt.team_id
+    `).all(d.id).map((r) => r.team_id);
+  }
+
+  const divisions = [];
+  for (let i = 0; i < divCount; i++) {
+    divisions.push({ name: `Division ${i + 1}`, teamIds: [] });
+  }
+  const dropped = [];
+
+  for (let tier = 1; tier <= divCount; tier++) {
+    const rows = standingsByTier[tier] || [];
+    // Don't promote more than we can meaningfully partition — if a division
+    // only had 2 teams and promotePerTier=2, halve it so mid isn't empty.
+    const K = Math.max(0, Math.min(promotePerTier, Math.floor(rows.length / 2)));
+    const topK = K > 0 ? rows.slice(0, K) : [];
+    const bottomK = K > 0 ? rows.slice(-K) : [];
+    const mid = K > 0 ? rows.slice(K, rows.length - K) : rows;
+
+    // stayers and promotees
+    if (tier === 1) {
+      divisions[0].teamIds.push(...topK, ...mid);
+      if (divCount >= 2) divisions[1].teamIds.push(...bottomK);
+      else divisions[0].teamIds.push(...bottomK);
+    } else if (tier === divCount) {
+      divisions[tier - 2].teamIds.push(...topK);
+      divisions[tier - 1].teamIds.push(...mid);
+      dropped.push(...bottomK);
+    } else {
+      divisions[tier - 2].teamIds.push(...topK);
+      divisions[tier - 1].teamIds.push(...mid);
+      divisions[tier].teamIds.push(...bottomK);
+    }
+  }
+
+  return { divisions, dropped };
 }
 
 export function listLeagues(db) {

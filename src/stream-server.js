@@ -63,13 +63,23 @@ let audioFfmpeg;
 
 async function bootWorkers() {
   // Crash recovery: any fixture left in 'running' from a previous boot gets
-  // pushed back to 'pending' so a worker picks it up fresh. Losing mid-match
-  // progress is cheap here — 5 matches × ~10s per fixture.
+  // pushed back to 'pending' so a worker picks it up fresh. We also delete
+  // any partial fixture_match rows so the re-run doesn't hit a UNIQUE
+  // (fixture_id, slot) collision. Losing mid-match progress is cheap —
+  // 5 matches × ~10s.
   const db = getDb();
-  const reset = db.prepare("UPDATE fixture SET status = 'pending', started_at = NULL WHERE status = 'running'").run();
-  if (reset.changes > 0) {
-    console.log(`[boot] reset ${reset.changes} stuck 'running' fixture(s) to 'pending'`);
-  }
+  const reset = db.transaction(() => {
+    const stuck = db.prepare("SELECT id FROM fixture WHERE status = 'running'").all();
+    if (stuck.length === 0) return 0;
+    const delMatch = db.prepare('DELETE FROM fixture_match WHERE fixture_id = ?');
+    const setPending = db.prepare("UPDATE fixture SET status = 'pending', started_at = NULL WHERE id = ?");
+    for (const f of stuck) {
+      delMatch.run(f.id);
+      setPending.run(f.id);
+    }
+    return stuck.length;
+  })();
+  if (reset > 0) console.log(`[boot] reset ${reset} stuck 'running' fixture(s) to 'pending'`);
 
   for (let i = 1; i <= WORKER_COUNT; i++) {
     const w = new StreamWorker({
