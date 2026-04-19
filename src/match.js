@@ -12,26 +12,41 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(__dirname, '..');
-const LOG_FILE = join(PROJECT_ROOT, 'matchData.log');
+const DEFAULT_LOG_FILE = join(PROJECT_ROOT, 'matchData.log');
 const MAX_RETRIES = 3;
 
 const isWindows = os.platform() === 'win32';
+
+/**
+ * Per-worker context for multi-stream league runners:
+ *   logPath — unique log file so parallel matches don't stomp each other.
+ *   display — X DISPLAY env value (e.g. ":100" for worker 1's Xvfb).
+ * Both optional; when omitted we fall back to the historical single-writer
+ * defaults — safe for CLI one-shots and the existing tournament flow.
+ */
+function resolveCtx(ctx = {}) {
+  return {
+    logPath: ctx.logPath || DEFAULT_LOG_FILE,
+    display: ctx.display || process.env.DISPLAY || null,
+  };
+}
 
 /**
  * Launch a match between two fighters on a stage.
  * Supports both MUGEN (Windows) and Ikemen GO (Linux).
  * Returns the parsed result: { winner: 'fighter1'|'fighter2'|'draw', fighter1Rounds, fighter2Rounds }
  */
-export async function runMatch(fighter1, fighter2, stage) {
+export async function runMatch(fighter1, fighter2, stage, ctx) {
+  const { logPath } = resolveCtx(ctx);
   let lastError;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const stdout = await launchEngine(fighter1, fighter2, stage);
+      const stdout = await launchEngine(fighter1, fighter2, stage, null, null, ctx);
       if (isWindows) {
         return parseMugenResult(stdout);
       } else {
-        const logContents = await readFile(LOG_FILE, 'utf-8');
+        const logContents = await readFile(logPath, 'utf-8');
         return parseIkemenResult(logContents);
       }
     } catch (err) {
@@ -59,7 +74,8 @@ function isDeterministicFailure(err) {
   );
 }
 
-function launchEngine(fighter1, fighter2, stage, p1Life, p2Life) {
+function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
+  const { logPath, display } = resolveCtx(ctx);
   return new Promise((resolve, reject) => {
     let cmd, args;
 
@@ -76,7 +92,14 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life) {
       if (p2Life != null) args.push(String(p2Life));
     }
 
-    const child = execFile(cmd, args, { timeout: 120_000, killSignal: 'SIGKILL' }, (error, stdout, stderr) => {
+    const env = { ...process.env, MATCH_LOG_FILE: logPath };
+    if (display) env.DISPLAY = display;
+
+    const child = execFile(cmd, args, {
+      timeout: 120_000,
+      killSignal: 'SIGKILL',
+      env,
+    }, (error, stdout, stderr) => {
       if (error) {
         reject(error);
       } else {
@@ -100,6 +123,7 @@ export async function runOwnedFighterMatch({
   homeOwnedFighterId,
   awayOwnedFighterId,
   stageFileName,
+  ctx,
 }) {
   const home = db.prepare('SELECT * FROM owned_fighter WHERE id = ?').get(homeOwnedFighterId);
   const away = db.prepare('SELECT * FROM owned_fighter WHERE id = ?').get(awayOwnedFighterId);
@@ -113,10 +137,11 @@ export async function runOwnedFighterMatch({
   const homeStage = stageOwnedFighter(db, homeOwnedFighterId);
   const awayStage = stageOwnedFighter(db, awayOwnedFighterId);
 
+  const { logPath } = resolveCtx(ctx);
   let result;
   try {
-    await launchEngine(homeStage.charName, awayStage.charName, stageFileName, homeLife, awayLife);
-    const logContents = await readFile(LOG_FILE, 'utf-8');
+    await launchEngine(homeStage.charName, awayStage.charName, stageFileName, homeLife, awayLife, ctx);
+    const logContents = await readFile(logPath, 'utf-8');
     result = parseIkemenResult(logContents);
   } finally {
     homeStage.cleanup();

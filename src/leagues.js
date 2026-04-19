@@ -143,7 +143,7 @@ export function pickNextFixture(db, { leagueId } = {}) {
   return db.prepare(`${base} ORDER BY d.tier, f.round_num, f.slot_num, f.id LIMIT 1`).get();
 }
 
-export async function runFixture(db, fixtureId) {
+export async function runFixture(db, fixtureId, ctx) {
   const fixture = db.prepare('SELECT * FROM fixture WHERE id = ?').get(fixtureId);
   if (!fixture) throw new Error(`Fixture ${fixtureId} not found`);
   if (fixture.status !== 'pending') {
@@ -182,6 +182,7 @@ export async function runFixture(db, fixtureId) {
       homeOwnedFighterId: h.id,
       awayOwnedFighterId: a.id,
       stageFileName: stageRow.file_name,
+      ctx,
     });
     let winner;
     if (r.winner === 'fighter1') { homeScore++; winner = 'home'; }

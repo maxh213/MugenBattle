@@ -3,10 +3,17 @@
 # Launches an Ikemen GO match with AI-controlled players and outputs the results.
 # p1_life / p2_life are optional starting-life overrides (integer, typically 400-1000).
 # When omitted, Ikemen uses each char's default.
+#
+# Per-worker isolation (for M6 multi-stream):
+#   MATCH_LOG_FILE  — where Ikemen writes the match log. Defaults to
+#                     matchData.log in the repo root (historical behaviour).
+#                     Two parallel workers MUST set different paths.
+#   DISPLAY         — X display to render into. Inherited from the env;
+#                     each Xvfb-backed worker sets its own (e.g. :100, :101).
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENGINE_DIR="$SCRIPT_DIR/engine"
-LOG_FILE="$SCRIPT_DIR/matchData.log"
+LOG_FILE="${MATCH_LOG_FILE:-$SCRIPT_DIR/matchData.log}"
 
 # Clear previous log
 > "$LOG_FILE"
