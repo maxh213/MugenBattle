@@ -38,7 +38,16 @@ import {
   currentUser,
   sessionCookieHeader,
 } from './auth.js';
-import { getTeamForUser, getTeamById, setLineup } from './teams.js';
+import { getTeamForUser, getTeamById, setLineup, topUpRoster, listOpenNotices, dismissNotice } from './teams.js';
+import { tickBotMarket } from './botMarket.js';
+import {
+  listExhibitionFighters,
+  enqueueExhibition,
+  getExhibition,
+  claimNextPendingExhibition,
+  listExhibitionsForUser,
+  resetStuckExhibitions,
+} from './exhibition.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 import { StreamWorker } from './streamWorker.js';
 import {
@@ -71,6 +80,7 @@ import {
   releaseStage,
 } from './market.js';
 import { importCharFromZip, listUserImports } from './charImport.js';
+import { follow, unfollow, listFollows } from './follow.js';
 import { writeFileSync, unlinkSync } from 'fs';
 import { randomUUID } from 'crypto';
 
@@ -88,7 +98,19 @@ const FPS = parseInt(process.env.STREAM_FPS || '15', 10);
 // and Ikemen process so they don't stomp each other.
 const WORKER_COUNT = Math.max(1, parseInt(process.env.STREAM_WORKERS || '1', 10));
 const DISPLAY_BASE = parseInt(process.env.STREAM_DISPLAY_BASE || '99', 10);
+// Dedicated exhibition workers run user-requested ad-hoc matches off the
+// /exhibition page. They never run league fixtures so the league pool keeps
+// chugging undisturbed. Each gets its own Xvfb/ffmpeg.
+const EXHIBITION_WORKER_COUNT = Math.max(0, parseInt(process.env.EXHIBITION_WORKERS || '1', 10));
 const SUPERVISOR_POLL_MS = 10_000;
+// Faster cadence for exhibition supervisor — feels snappier when you click
+// "Spar" and a worker is sitting idle waiting.
+const EXHIBITION_SUPERVISOR_POLL_MS = 1500;
+// Bot transfer-market tick: each tick a small fraction of bot teams scout
+// the market and may sell/buy. Default 5min so activity is visible but
+// not chaotic. Set BOT_MARKET_DISABLED=1 to turn it off entirely.
+const BOT_MARKET_TICK_MS = parseInt(process.env.BOT_MARKET_TICK_MS || '300000', 10);
+const BOT_MARKET_DISABLED = process.env.BOT_MARKET_DISABLED === '1';
 // Continuous-seasons mode: when no league is running, auto-create the next
 // one so the stream never idles. Off by default so `node src/stream-server`
 // on a dev laptop doesn't silently burn cycles.
@@ -156,9 +178,29 @@ async function bootWorkers() {
     console.log(`[boot] swapped ${swapped} clone(s) of deactivated masters with KFM`);
   }
 
+  // Boot-time roster sweep: any team in a running league with fewer than 5
+  // active non-retired fighters gets topped up from the oldest unclaimed
+  // pool. Without this, a team could sit empty for many fixtures before its
+  // own slot in the worker queue came up — long enough that the user sees
+  // the empty roster on /team and assumes it's broken.
+  const shortTeams = db.prepare(`
+    SELECT t.id, t.name FROM team t
+    JOIN division_team dt ON dt.team_id = t.id
+    JOIN division d ON d.id = dt.division_id
+    JOIN league l ON l.id = d.league_id
+    WHERE l.status = 'running'
+      AND (SELECT COUNT(*) FROM owned_fighter
+           WHERE team_id = t.id AND is_retired = 0 AND slot = 'active') < 5
+  `).all();
+  for (const t of shortTeams) {
+    const r = topUpRoster(db, t.id);
+    if (r.added > 0) console.log(`[boot] auto-replenished ${r.added} fighter(s) for team #${t.id} (${t.name})`);
+  }
+
   for (let i = 1; i <= WORKER_COUNT; i++) {
     const w = new StreamWorker({
       workerId: i,
+      kind: 'league',
       display: `:${DISPLAY_BASE + i}`,
       size: SIZE,
       fps: FPS,
@@ -171,6 +213,29 @@ async function bootWorkers() {
       console.error(`[boot] worker ${i} failed to start: ${err.message}`);
     }
   }
+
+  // Exhibition workers live on displays past the league worker range so
+  // their X11 sockets and worker IDs never collide. workerId 100+ is
+  // reserved for exhibitions (we'd never spin up 100+ league workers).
+  const stuckEx = resetStuckExhibitions(db);
+  if (stuckEx > 0) console.log(`[boot] reset ${stuckEx} stuck 'running' exhibition(s) to 'failed'`);
+  for (let i = 1; i <= EXHIBITION_WORKER_COUNT; i++) {
+    const id = 100 + i;
+    const w = new StreamWorker({
+      workerId: id,
+      kind: 'exhibition',
+      display: `:${DISPLAY_BASE + WORKER_COUNT + i}`,
+      size: SIZE,
+      fps: FPS,
+      logPath: `/tmp/mb-exhibition-${i}.log`,
+    });
+    workers.set(id, w);
+    try {
+      await w.start();
+    } catch (err) {
+      console.error(`[boot] exhibition worker ${id} failed to start: ${err.message}`);
+    }
+  }
 }
 
 /**
@@ -181,9 +246,10 @@ async function bootWorkers() {
 function startSupervisor() {
   setInterval(() => {
     const db = getDb();
+    const leagueWorkers = Array.from(workers.values()).filter((w) => w.kind === 'league');
     // Track claimed divisions — each worker runs one division of one league.
     const claimedDivs = new Set(
-      Array.from(workers.values()).map((w) => w.divisionId).filter((x) => x != null)
+      leagueWorkers.map((w) => w.divisionId).filter((x) => x != null)
     );
     let leagues = db.prepare(`
       SELECT id FROM league WHERE status = 'running' ORDER BY id
@@ -226,7 +292,7 @@ function startSupervisor() {
       }
     }
 
-    for (const w of workers.values()) {
+    for (const w of leagueWorkers) {
       if (w.status !== 'idle') continue;
       const next = candidates.shift();
       if (!next) break;
@@ -234,6 +300,54 @@ function startSupervisor() {
       w.assignLeague(db, next.leagueId, next.divisionId);
     }
   }, SUPERVISOR_POLL_MS);
+}
+
+/**
+ * Bot market supervisor: every BOT_MARKET_TICK_MS, a small random subset of
+ * bot teams scouts the market and may buy/sell. Reuses the same buy/sell
+ * functions humans use, so listings, prices, and balances stay coherent.
+ */
+function startBotMarketSupervisor() {
+  if (BOT_MARKET_DISABLED) {
+    console.log('[bot-market] disabled via BOT_MARKET_DISABLED=1');
+    return;
+  }
+  const tick = () => {
+    try {
+      const stats = tickBotMarket(getDb());
+      if (stats.sold || stats.bought) {
+        console.log(`[bot-market] ${stats.considered}/${stats.bots} acted · ${stats.sold} listed · ${stats.bought} bought`);
+        for (const line of stats.log) console.log(`[bot-market] ${line}`);
+      }
+    } catch (err) {
+      console.error(`[bot-market] tick failed: ${err.message}`);
+    }
+  };
+  setInterval(tick, BOT_MARKET_TICK_MS);
+  // Don't run immediately on boot — let the league supervisor get its claim
+  // pass in first so the first tick happens after the simulation is warm.
+  setTimeout(tick, BOT_MARKET_TICK_MS);
+  console.log(`[bot-market] tick every ${Math.round(BOT_MARKET_TICK_MS / 1000)}s`);
+}
+
+/**
+ * Exhibition supervisor: dedicated workers (kind='exhibition') only. Polls
+ * frequently because exhibitions are user-triggered — feels broken if a
+ * sparring request sits 10s before claiming a worker.
+ */
+function startExhibitionSupervisor() {
+  if (EXHIBITION_WORKER_COUNT === 0) return;
+  setInterval(() => {
+    const db = getDb();
+    const exWorkers = Array.from(workers.values()).filter((w) => w.kind === 'exhibition');
+    for (const w of exWorkers) {
+      if (w.status !== 'idle') continue;
+      const claimed = claimNextPendingExhibition(db, w.workerId);
+      if (!claimed) break; // queue empty, no point checking other workers
+      console.log(`[ex-supervisor] exhibition ${claimed.id} → worker ${w.workerId}`);
+      w.assignExhibition(db, claimed.id);
+    }
+  }, EXHIBITION_SUPERVISOR_POLL_MS);
 }
 
 function startAudio() {
@@ -684,6 +798,8 @@ ${AUTH_BAR_HTML}
   <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades">Trades</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -740,6 +856,497 @@ async function load() {
     (forSale.length ? '<div class="roster-section"><h3>For sale</h3>' + forSale.map(rowHtml).join('') + '</div>' : '');
 }
 load();
+</script>
+</body></html>`;
+
+const TRADES_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Trades · MugenBattle</title>
+<style>${COMMON_CSS}
+  .tr-controls { display: flex; gap: 12px; margin-bottom: 12px; align-items: center; font-size: 12px; color: #8b949e; }
+  .tr-pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #3fb950; animation: tr-pulse 1.6s infinite; }
+  @keyframes tr-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .tr-feed { display: flex; flex-direction: column; gap: 6px; }
+  .tr-row { display: grid; grid-template-columns: 110px 32px 1fr 90px 100px; gap: 12px; align-items: center;
+    padding: 10px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; font-size: 13px; }
+  .tr-row.fresh { border-color: #3fb950; background: #1b2620; animation: tr-flash 1.2s ease-out; }
+  @keyframes tr-flash { 0% { background: #2d4434; } 100% { background: #1b2620; } }
+  .tr-row .when { color: #6e7681; font-size: 11px; }
+  .tr-row .pic { width: 32px; height: 32px; image-rendering: pixelated; object-fit: contain;
+    background: #0d1117; border-radius: 4px; }
+  .tr-row .pic.empty { background: #0d1117; }
+  .tr-row .desc { color: #c9d1d9; line-height: 1.3; }
+  .tr-row .desc .actor { color: #58a6ff; }
+  .tr-row .desc .bot { color: #8b949e; font-size: 10px; padding: 1px 4px; background: #21262d; border-radius: 3px; margin-left: 3px; vertical-align: middle; }
+  .tr-row .desc .arrow { color: #8b949e; margin: 0 6px; }
+  .tr-row .desc .master { color: #c9d1d9; font-weight: 600; }
+  .tr-row .desc .author { color: #6e7681; font-size: 11px; }
+  .tr-row .price { font-variant-numeric: tabular-nums; text-align: right; color: #3fb950; font-weight: 600; }
+  .tr-row .price.free { color: #6e7681; }
+  .tr-row .kind { text-align: right; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: #8b949e; }
+  .tr-row .kind.buy_unclaimed { color: #d29922; }
+  .tr-row .kind.buy_listing { color: #58a6ff; }
+  .tr-row .kind.release { color: #db6d28; }
+  .tr-row.release .price { color: #6e7681; }
+  @media (max-width: 700px) {
+    .tr-row { grid-template-columns: 32px 1fr 80px; gap: 8px; }
+    .tr-row .when, .tr-row .kind { display: none; }
+  }
+  .tr-empty { color: #6e7681; padding: 30px; text-align: center; font-size: 13px; }
+</style></head>
+<body>
+<h1>📈 Trades</h1>
+<nav>
+  <a href="/">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
+  <a href="/team">My Team</a>
+  <a href="/market">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades" class="active">Trades</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+<div class="tr-controls">
+  <span class="tr-pulse"></span>
+  <span id="tr-status">Loading…</span>
+  <span style="color:#6e7681">Polls every 8s · most recent first</span>
+</div>
+<div class="tr-feed" id="tr-feed"></div>
+
+<script>
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+let lastSeenId = 0;
+
+function relTime(iso) {
+  const t = new Date(iso.replace(' ', 'T') + 'Z').getTime();
+  const dt = (Date.now() - t) / 1000;
+  if (dt < 5) return 'just now';
+  if (dt < 60) return Math.floor(dt) + 's ago';
+  if (dt < 3600) return Math.floor(dt/60) + 'm ago';
+  if (dt < 86400) return Math.floor(dt/3600) + 'h ago';
+  return Math.floor(dt/86400) + 'd ago';
+}
+
+function userTag(u) {
+  if (!u) return '<span style="color:#6e7681">(unknown)</span>';
+  const bot = u.is_bot ? '<span class="bot">BOT</span>' : '';
+  return '<span class="actor">@' + esc(u.username) + '</span>' + bot;
+}
+
+function rowHtml(t, isFresh) {
+  const pic = t.master
+    ? '<img class="pic" src="/portrait/' + encodeURIComponent(t.master.file_name) + '.png" onerror="this.classList.add(\\'empty\\');this.removeAttribute(\\'src\\')">'
+    : '<div class="pic empty"></div>';
+  const masterLabel = t.master
+    ? '<span class="master">' + esc(t.master.display_name || t.master.file_name) + '</span>'
+      + (t.master.author ? ' <span class="author">· ' + esc(t.master.author) + '</span>' : '')
+    : '<span style="color:#6e7681">(unknown fighter)</span>';
+
+  let descHtml, priceTxt, priceCls, kindLabel;
+  if (t.kind === 'buy_unclaimed') {
+    descHtml = userTag(t.buyer) + ' bought ' + masterLabel + ' from the unclaimed pool';
+    kindLabel = 'unclaimed';
+  } else if (t.kind === 'release') {
+    descHtml = userTag(t.seller) + ' released ' + masterLabel + ' back to the unclaimed pool';
+    kindLabel = 'released';
+  } else {
+    descHtml = userTag(t.buyer) + ' bought ' + masterLabel
+      + '<span class="arrow">←</span>' + userTag(t.seller);
+    kindLabel = 'listing';
+  }
+  if (t.kind === 'release') { priceTxt = '—'; priceCls = 'free'; }
+  else if (t.price_cents > 0) { priceTxt = '$' + (t.price_cents/100).toFixed(2); priceCls = ''; }
+  else { priceTxt = 'free'; priceCls = 'free'; }
+  return '<div class="tr-row ' + t.kind + (isFresh ? ' fresh' : '') + '" data-id="' + t.id + '">' +
+    '<div class="when" title="' + esc(t.created_at) + '">' + relTime(t.created_at) + '</div>' +
+    pic +
+    '<div class="desc">' + descHtml + '</div>' +
+    '<div class="price ' + priceCls + '">' + priceTxt + '</div>' +
+    '<div class="kind ' + t.kind + '">' + kindLabel + '</div>' +
+  '</div>';
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/trades?limit=50');
+    if (!r.ok) throw new Error('http ' + r.status);
+    const trades = await r.json();
+    const host = document.getElementById('tr-feed');
+    if (!trades.length) {
+      host.innerHTML = '<div class="tr-empty">No trades yet — waiting for the first market move…</div>';
+      document.getElementById('tr-status').textContent = 'Waiting…';
+      return;
+    }
+    const newestId = trades[0].id;
+    host.innerHTML = trades.map((t) => rowHtml(t, t.id > lastSeenId && lastSeenId > 0)).join('');
+    lastSeenId = newestId;
+    document.getElementById('tr-status').textContent = 'Last update: ' + new Date().toLocaleTimeString();
+  } catch (err) {
+    document.getElementById('tr-status').textContent = 'Refresh failed: ' + err.message;
+  }
+}
+
+refresh();
+setInterval(refresh, 8000);
+</script>
+</body></html>`;
+
+const EXHIBITION_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Exhibition · MugenBattle</title>
+<style>${COMMON_CSS}
+  .ex-row { display: grid; grid-template-columns: 1fr 80px 1fr; gap: 16px; align-items: stretch; }
+  @media (max-width: 800px) { .ex-row { grid-template-columns: 1fr; } }
+  .ex-side { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; }
+  .ex-side h2 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #8b949e; }
+  .ex-vs { display: flex; align-items: center; justify-content: center; font-size: 22px; color: #6e7681; }
+  .ex-tabs { display: flex; gap: 0; margin-bottom: 8px; border-bottom: 1px solid #30363d; }
+  .ex-tab { padding: 6px 10px; font-size: 12px; color: #8b949e; cursor: pointer; border-bottom: 2px solid transparent; }
+  .ex-tab.active { color: #c9d1d9; border-bottom-color: #58a6ff; }
+  .ex-tab .count { color: #6e7681; margin-left: 4px; }
+  .ex-search { width: 100%; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; font-size: 12px; margin-bottom: 8px; box-sizing: border-box; }
+  .ex-list { max-height: 360px; overflow-y: auto; border: 1px solid #21262d; border-radius: 6px; }
+  .ex-item { padding: 8px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .ex-item:last-child { border-bottom: 0; }
+  .ex-item:hover { background: #1d232b; }
+  .ex-item.selected { background: #1f6feb33; border-color: #1f6feb; }
+  .ex-item.mine { background: #2da44e1a; }
+  .ex-item.mine.selected { background: #2da44e44; }
+  .ex-item .name { color: #c9d1d9; font-weight: 600; }
+  .ex-item .meta { color: #8b949e; font-size: 11px; }
+  .ex-item .stats { color: #6e7681; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .ex-selected { margin-top: 10px; padding: 8px 10px; background: #0d1117; border-radius: 6px; min-height: 32px; font-size: 12px; }
+  .ex-selected.empty { color: #6e7681; font-style: italic; }
+  .ex-actions { margin: 18px 0; display: flex; gap: 12px; align-items: center; justify-content: center; }
+  .ex-btn { background: #238636; color: #fff; border: 0; padding: 10px 22px; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .ex-btn:disabled { background: #30363d; color: #6e7681; cursor: not-allowed; }
+  .ex-btn:hover:not(:disabled) { background: #2ea043; }
+  .ex-status { font-size: 12px; color: #8b949e; }
+  .ex-stream-wrap { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; margin-top: 18px; }
+  .ex-stream-wrap.hidden { display: none; }
+  .ex-stream-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .ex-stream-hdr h2 { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #8b949e; }
+  .ex-stream { background: #000; aspect-ratio: 4 / 3; max-width: 800px; margin: 0 auto; }
+  .ex-stream img { width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; display: block; }
+  .ex-stream .placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: #6e7681; font-size: 14px; }
+  .ex-result { padding: 12px; background: #0d1117; border-radius: 6px; margin-top: 10px; font-size: 13px; }
+  .ex-result .winner { color: #3fb950; font-weight: 600; }
+  .ex-result .loser  { color: #f85149; }
+  .ex-result .draw   { color: #d29922; }
+  .ex-history { margin-top: 22px; }
+  .ex-history h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #8b949e; margin: 0 0 8px; }
+  .ex-history-row { display: grid; grid-template-columns: 90px 1fr 60px 1fr 50px; gap: 8px; padding: 6px 4px; border-bottom: 1px solid #21262d; font-size: 12px; align-items: center; }
+  .ex-history-row .res.W { color: #3fb950; }
+  .ex-history-row .res.L { color: #f85149; }
+  .ex-history-row .res.D { color: #d29922; }
+  .ex-history-row .res.F { color: #6e7681; }
+  .ex-history-row .when { color: #6e7681; font-size: 11px; }
+  .live-pill-ex { display: inline-block; padding: 2px 8px; background: #da3633; color: #fff; border-radius: 999px; font-size: 11px; font-weight: 600; animation: live-pulse 1.6s infinite; }
+  @keyframes live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+</style></head>
+<body>
+<h1>🥋 Exhibition</h1>
+<nav>
+  <a href="/">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
+  <a href="/team">My Team</a>
+  <a href="/market">Market</a>
+  <a href="/exhibition" class="active">Exhibition</a>
+  <a href="/trades">Trades</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+
+<div class="panel" style="margin-bottom: 16px;">
+  <p style="margin: 0; font-size: 13px; color: #8b949e;">
+    Pick any two fighters and run a one-off match. Both sides fight at full life — W/L/D records and master stats update, but stamina is untouched so testing your team won't burn their rest. League standings aren't affected.
+    Released fighters aren't selectable; buy them back from the market to spar with that master again.
+  </p>
+</div>
+
+<div class="ex-row">
+  <div class="ex-side">
+    <h2>Home (P1)</h2>
+    <div class="ex-tabs" data-side="home">
+      <div class="ex-tab active" data-bucket="mine">My team <span class="count" id="home-count-mine">0</span></div>
+      <div class="ex-tab" data-bucket="others">Other teams <span class="count" id="home-count-others">0</span></div>
+      <div class="ex-tab" data-bucket="market">Market <span class="count" id="home-count-market">0</span></div>
+    </div>
+    <input type="search" class="ex-search" id="home-search" placeholder="Search fighter or character...">
+  <div class="ex-list" id="home-list"></div>
+    <div class="ex-selected empty" id="home-selected">No fighter selected.</div>
+  </div>
+  <div class="ex-vs">VS</div>
+  <div class="ex-side">
+    <h2>Away (P2)</h2>
+    <div class="ex-tabs" data-side="away">
+      <div class="ex-tab active" data-bucket="mine">My team <span class="count" id="away-count-mine">0</span></div>
+      <div class="ex-tab" data-bucket="others">Other teams <span class="count" id="away-count-others">0</span></div>
+      <div class="ex-tab" data-bucket="market">Market <span class="count" id="away-count-market">0</span></div>
+    </div>
+    <input type="search" class="ex-search" id="away-search" placeholder="Search fighter or character...">
+  <div class="ex-list" id="away-list"></div>
+    <div class="ex-selected empty" id="away-selected">No fighter selected.</div>
+  </div>
+</div>
+
+<div class="ex-actions">
+  <button class="ex-btn" id="spar-btn" disabled>Start match</button>
+  <span class="ex-status" id="spar-status"></span>
+</div>
+
+<div class="ex-stream-wrap hidden" id="stream-wrap">
+  <div class="ex-stream-hdr">
+    <h2>Match</h2>
+    <span id="stream-state"></span>
+  </div>
+  <div class="ex-stream" id="stream-host"><div class="placeholder">Waiting for worker…</div></div>
+  <div id="result-host"></div>
+</div>
+
+<div class="ex-history" id="history-host"></div>
+
+<script>
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+const state = {
+  mine: [], others: [], market: [], recent: [],
+  signedIn: false,
+  activeTab: { home: 'mine', away: 'mine' },
+  search: { home: '', away: '' },
+  selection: { home: null, away: null },
+  pollTimer: null,
+};
+
+async function loadFighters() {
+  const r = await fetch('/api/exhibition/fighters');
+  if (!r.ok) return;
+  const d = await r.json();
+  state.mine = d.mine || [];
+  state.others = d.others || [];
+  state.market = d.market || [];
+  state.recent = d.recent || [];
+  state.signedIn = !!d.signed_in;
+  // If user has no team or isn't signed in, default to "Other teams" tab.
+  if (state.mine.length === 0) state.activeTab = { home: 'others', away: 'others' };
+  document.getElementById('home-count-mine').textContent = state.mine.length;
+  document.getElementById('home-count-others').textContent = state.others.length;
+  document.getElementById('home-count-market').textContent = state.market.length;
+  document.getElementById('away-count-mine').textContent = state.mine.length;
+  document.getElementById('away-count-others').textContent = state.others.length;
+  document.getElementById('away-count-market').textContent = state.market.length;
+  for (const side of ['home', 'away']) {
+    const tabs = document.querySelectorAll('.ex-tabs[data-side="' + side + '"] .ex-tab');
+    tabs.forEach((t) => t.classList.toggle('active', t.dataset.bucket === state.activeTab[side]));
+    renderList(side);
+  }
+  renderHistory();
+}
+
+function rosterFor(bucket) {
+  if (bucket === 'mine') return state.mine;
+  if (bucket === 'others') return state.others;
+  if (bucket === 'market') return state.market;
+  return [];
+}
+
+function filterRoster(rows, q) {
+  const ql = q.trim().toLowerCase();
+  if (!ql) return rows;
+  return rows.filter((r) =>
+    (r.display_name || '').toLowerCase().includes(ql) ||
+    (r.master_display_name || '').toLowerCase().includes(ql) ||
+    (r.team_name || '').toLowerCase().includes(ql) ||
+    (r.master_author || '').toLowerCase().includes(ql)
+  );
+}
+
+function rowHtml(r, side) {
+  const sel = state.selection[side]?.owned_fighter_id === r.owned_fighter_id ? ' selected' : '';
+  const mineCls = state.mine.find((m) => m.owned_fighter_id === r.owned_fighter_id) ? ' mine' : '';
+  const stam = Math.round((r.stamina || 0) * 100);
+  return '<div class="ex-item' + mineCls + sel + '" data-id="' + r.owned_fighter_id + '">' +
+    '<div>' +
+      '<div class="name">' + esc(r.display_name) + '</div>' +
+      '<div class="meta">' + esc(r.master_display_name || '') + (r.master_author ? ' · ' + esc(r.master_author) : '') + ' · <span style="color:#8b949e">' + esc(r.team_name) + '</span></div>' +
+    '</div>' +
+    '<div class="stats">' + r.matches_won + 'W ' + r.matches_lost + 'L ' + r.matches_drawn + 'D · ' + stam + '%</div>' +
+  '</div>';
+}
+
+function renderList(side) {
+  const list = document.getElementById(side + '-list');
+  const bucket = state.activeTab[side];
+  const rows = filterRoster(rosterFor(bucket), state.search[side]);
+  list.innerHTML = rows.length
+    ? rows.map((r) => rowHtml(r, side)).join('')
+    : '<div style="padding:12px;color:#6e7681;text-align:center;font-size:12px">No fighters match.</div>';
+  list.querySelectorAll('.ex-item').forEach((el) => {
+    el.addEventListener('click', () => {
+      const id = Number(el.dataset.id);
+      const all = [...state.mine, ...state.others, ...state.market];
+      const f = all.find((x) => x.owned_fighter_id === id);
+      if (!f) return;
+      state.selection[side] = f;
+      renderList(side);
+      renderSelected(side);
+      updateSparBtn();
+    });
+  });
+}
+
+function renderSelected(side) {
+  const host = document.getElementById(side + '-selected');
+  const f = state.selection[side];
+  if (!f) {
+    host.classList.add('empty');
+    host.textContent = 'No fighter selected.';
+    return;
+  }
+  host.classList.remove('empty');
+  const stam = Math.round((f.stamina || 0) * 100);
+  host.innerHTML = '<b>' + esc(f.display_name) + '</b> ' +
+    '<span style="color:#8b949e">· ' + esc(f.master_display_name || '') + (f.master_author ? ' (' + esc(f.master_author) + ')' : '') + '</span><br>' +
+    '<span style="color:#6e7681">' + esc(f.team_name) + ' · ' + f.matches_won + 'W ' + f.matches_lost + 'L ' + f.matches_drawn + 'D · stamina ' + stam + '%</span>';
+}
+
+function updateSparBtn() {
+  const btn = document.getElementById('spar-btn');
+  const h = state.selection.home;
+  const a = state.selection.away;
+  if (!h || !a) { btn.disabled = true; return; }
+  if (h.owned_fighter_id === a.owned_fighter_id) {
+    btn.disabled = true;
+    document.getElementById('spar-status').textContent = 'Pick two different fighters.';
+    return;
+  }
+  if (!state.signedIn) {
+    btn.disabled = true;
+    document.getElementById('spar-status').textContent = 'Sign in to start exhibition matches.';
+    return;
+  }
+  document.getElementById('spar-status').textContent = '';
+  btn.disabled = false;
+}
+
+document.querySelectorAll('.ex-tabs').forEach((tabs) => {
+  tabs.querySelectorAll('.ex-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const side = tabs.dataset.side;
+      state.activeTab[side] = tab.dataset.bucket;
+      tabs.querySelectorAll('.ex-tab').forEach((t) => t.classList.toggle('active', t === tab));
+      renderList(side);
+    });
+  });
+});
+
+['home', 'away'].forEach((side) => {
+  document.getElementById(side + '-search').addEventListener('input', (e) => {
+    state.search[side] = e.target.value;
+    renderList(side);
+  });
+});
+
+document.getElementById('spar-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('spar-btn');
+  btn.disabled = true;
+  document.getElementById('spar-status').textContent = 'Queuing…';
+  const r = await fetch('/api/exhibition', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      home_owned_fighter_id: state.selection.home.owned_fighter_id,
+      away_owned_fighter_id: state.selection.away.owned_fighter_id,
+    }),
+  });
+  if (!r.ok) {
+    document.getElementById('spar-status').textContent = 'Queue failed (' + r.status + ').';
+    btn.disabled = false;
+    return;
+  }
+  const { id } = await r.json();
+  document.getElementById('spar-status').textContent = 'Queued #' + id;
+  document.getElementById('stream-wrap').classList.remove('hidden');
+  document.getElementById('result-host').innerHTML = '';
+  document.getElementById('stream-host').innerHTML = '<div class="placeholder">Waiting for worker…</div>';
+  document.getElementById('stream-state').innerHTML = '';
+  pollExhibition(id);
+});
+
+let attachedWorkerId = null;
+async function pollExhibition(id) {
+  const tick = async () => {
+    const r = await fetch('/api/exhibition/' + id);
+    if (!r.ok) return;
+    const ex = await r.json();
+    if (ex.status === 'pending') {
+      document.getElementById('stream-state').textContent = 'Waiting for worker…';
+    } else if (ex.status === 'running') {
+      document.getElementById('stream-state').innerHTML = '<span class="live-pill-ex">● LIVE</span>';
+      if (ex.stream_worker_id && ex.stream_worker_id !== attachedWorkerId) {
+        attachedWorkerId = ex.stream_worker_id;
+        document.getElementById('stream-host').innerHTML = '<img src="/stream/' + ex.stream_worker_id + '" alt="">';
+      }
+    } else if (ex.status === 'complete' || ex.status === 'failed') {
+      attachedWorkerId = null;
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+      renderResult(ex);
+      // Refresh fighter stats since records and stamina just changed.
+      loadFighters();
+      document.getElementById('spar-btn').disabled = false;
+      document.getElementById('spar-status').textContent = ex.status === 'complete' ? 'Match #' + id + ' complete.' : 'Match #' + id + ' failed.';
+    }
+  };
+  state.pollTimer = setInterval(tick, 1500);
+  tick();
+}
+
+function renderResult(ex) {
+  const host = document.getElementById('result-host');
+  if (ex.status === 'failed') {
+    host.innerHTML = '<div class="ex-result"><span style="color:#f85149">Match failed:</span> ' + esc(ex.error || 'unknown') + '</div>';
+    document.getElementById('stream-host').innerHTML = '<div class="placeholder">Match failed.</div>';
+    return;
+  }
+  const winnerId = ex.winner_owned_fighter_id;
+  const homeWon = winnerId === ex.home_owned_fighter_id;
+  const awayWon = winnerId === ex.away_owned_fighter_id;
+  const homeName = ex.home_master_name || ex.home_name;
+  const awayName = ex.away_master_name || ex.away_name;
+  let body;
+  if (homeWon) body = '<span class="winner">' + esc(homeName) + '</span> defeated <span class="loser">' + esc(awayName) + '</span>';
+  else if (awayWon) body = '<span class="winner">' + esc(awayName) + '</span> defeated <span class="loser">' + esc(homeName) + '</span>';
+  else body = '<span class="draw">Draw</span> · ' + esc(homeName) + ' vs ' + esc(awayName);
+  const stage = ex.stage_display ? ' · stage ' + esc(ex.stage_display) + (ex.stage_author ? ' (by ' + esc(ex.stage_author) + ')' : '') : '';
+  host.innerHTML = '<div class="ex-result">' + body + stage + '</div>';
+  document.getElementById('stream-host').innerHTML = '<div class="placeholder">Match complete.</div>';
+}
+
+function renderHistory() {
+  const host = document.getElementById('history-host');
+  if (!state.recent.length) { host.innerHTML = ''; return; }
+  const items = state.recent.map((r) => {
+    let res = 'F'; let label = 'FAILED';
+    if (r.status === 'complete') {
+      if (r.winner_owned_fighter_id === r.home_owned_fighter_id) { res = 'W'; label = 'P1 WIN'; }
+      else if (r.winner_owned_fighter_id === r.away_owned_fighter_id) { res = 'L'; label = 'P2 WIN'; }
+      else { res = 'D'; label = 'DRAW'; }
+    } else if (r.status === 'pending' || r.status === 'running') {
+      label = r.status.toUpperCase();
+    }
+    const when = r.finished_at || r.started_at || r.created_at || '';
+    return '<div class="ex-history-row">' +
+      '<span class="when">' + esc(when.replace('T', ' ').replace('Z', '')) + '</span>' +
+      '<span>' + esc(r.home_name) + ' <span style="color:#6e7681">(' + esc(r.home_team_name) + ')</span></span>' +
+      '<span class="res ' + res + '" style="text-align:center">' + label + '</span>' +
+      '<span style="text-align:right">' + esc(r.away_name) + ' <span style="color:#6e7681">(' + esc(r.away_team_name) + ')</span></span>' +
+      '<span class="when" style="text-align:right">#' + r.id + '</span>' +
+    '</div>';
+  }).join('');
+  host.innerHTML = '<h2>Recent exhibitions</h2>' + items;
+}
+
+loadFighters();
 </script>
 </body></html>`;
 
@@ -800,6 +1407,8 @@ ${AUTH_BAR_HTML}
   <a href="/pyramid" class="active">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades">Trades</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -918,6 +1527,11 @@ const MARKET_HTML = `<!doctype html>
   .market-card button:hover { background: #2ea043; }
   .market-card button:disabled { background: #21262d; border-color: #30363d; color: #6e7681; cursor: not-allowed; }
   .market-card.bought { opacity: 0.5; pointer-events: none; }
+  .market-card { position: relative; }
+  .market-card.followed { border-color: #f0ae3c; box-shadow: 0 0 0 1px rgba(240, 174, 60, 0.25); }
+  .market-card .card-star { position: absolute; top: 6px; right: 6px; background: transparent; border: 0; color: #6e7681; font-size: 16px; cursor: pointer; padding: 2px 6px; line-height: 1; }
+  .market-card .card-star:hover { color: #f0ae3c; }
+  .market-card .card-star.on { color: #f0ae3c; }
   .market-card.stage-card-market { flex-direction: column; padding: 0; overflow: hidden; gap: 0; }
   .market-card.stage-card-market .stage-preview { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #0d1117; border-bottom: 1px solid #30363d; display: block; image-rendering: pixelated; }
   .market-card.stage-card-market .body { padding: 10px 12px; }
@@ -935,6 +1549,8 @@ ${AUTH_BAR_HTML}
   <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market" class="active">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades">Trades</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -952,10 +1568,11 @@ ${AUTH_BAR_HTML}
 <div class="market-grid" id="listings"></div>
 <div id="no-listings" class="empty-state" style="display:none;margin-bottom:16px">No active player listings right now.</div>
 
-<h2 style="font-size:14px;margin:20px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Unclaimed masters</h2>
+<h2 style="font-size:14px;margin:20px 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px">Unclaimed fighters</h2>
 <div class="market-controls">
   <input type="search" id="q" placeholder="Search by name or author…">
   <select id="sort">
+    <option value="latest_desc">Latest added</option>
     <option value="price_asc">Price ↑</option>
     <option value="price_desc">Price ↓</option>
     <option value="wins_desc">Wins ↓</option>
@@ -998,7 +1615,7 @@ async function refreshWallet() {
 
 async function loadMarket() {
   const [m, listings, stages, stageListings] = await Promise.all([
-    fetch('/api/market?limit=500').then(r => r.json()),
+    fetch('/api/market').then(r => r.json()),
     fetch('/api/market/listings?limit=200').then(r => r.json()),
     fetch('/api/market/stages?limit=200').then(r => r.json()),
     fetch('/api/market/stage-listings?limit=100').then(r => r.json()),
@@ -1159,18 +1776,28 @@ function render() {
                             (m.author || '').toLowerCase().includes(q));
   }
   rows.sort((a, b) => {
+    // Followed masters always sort to the top — the whole reason for stars.
+    if (!!a.followed !== !!b.followed) return a.followed ? -1 : 1;
+    if (sort === 'latest_desc') return (b.created_at || '').localeCompare(a.created_at || '') || (b.id - a.id);
     if (sort === 'price_asc') return a.price_cents - b.price_cents || (a.display_name||'').localeCompare(b.display_name||'');
     if (sort === 'price_desc') return b.price_cents - a.price_cents;
     if (sort === 'wins_desc') return b.matches_won - a.matches_won;
     return (a.display_name || a.file_name || '').localeCompare(b.display_name || b.file_name || '');
   });
   document.getElementById('count').textContent = rows.length + ' available';
-  document.getElementById('grid').innerHTML = rows.slice(0, 400).map(cardHtml).join('');
+  document.getElementById('grid').innerHTML = rows.map(cardHtml).join('');
 }
 
 function cardHtml(m) {
   const canBuy = !!(me && me.authenticated && !me.needs_username);
-  return '<div class="market-card" data-id="' + m.id + '">' +
+  const followCls = m.followed ? ' followed' : '';
+  const starOn = m.followed ? ' on' : '';
+  const starGlyph = m.followed ? '★' : '☆';
+  const starTip = m.followed
+    ? 'Unfollow this fighter — won\\'t auto-pin to top anymore'
+    : 'Follow this fighter — pins them to the top of the market';
+  return '<div class="market-card' + followCls + '" data-id="' + m.id + '">' +
+    '<button class="card-star star' + starOn + '" title="' + starTip + '" aria-label="' + starTip + '" onclick="toggleMarketFollow(' + m.id + ', event)">' + starGlyph + '</button>' +
     '<img class="port" src="/portrait/' + encodeURIComponent(m.file_name) + '.png" onerror="this.style.visibility=\\'hidden\\'">' +
     '<div class="body">' +
       '<div class="name">' + esc(m.display_name || m.file_name) + '</div>' +
@@ -1184,6 +1811,20 @@ function cardHtml(m) {
       '</div>' +
       '<div class="market-msg" id="msg-' + m.id + '"></div>' +
     '</div></div>';
+}
+
+async function toggleMarketFollow(masterId, evt) {
+  if (evt) { evt.stopPropagation(); evt.preventDefault(); }
+  if (!me || !me.authenticated) { alert('Sign in to follow.'); return; }
+  const m = all.find(x => x.id === masterId);
+  if (!m) return;
+  m.followed = !m.followed;
+  if (m.followed) {
+    fetch('/api/follow', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ kind: 'master', id: masterId }) });
+  } else {
+    fetch('/api/follow/master/' + masterId, { method: 'DELETE' });
+  }
+  render();
 }
 
 async function buy(masterId, btn) {
@@ -1225,6 +1866,12 @@ const TEAM_HTML = `<!doctype html>
   .wait-banner .head { font-size: 14px; font-weight: 600; color: #c9d1d9; margin-bottom: 4px; }
   .wait-banner .eta { color: #58a6ff; font-weight: 600; }
   .wait-banner .meta { color: #8b949e; font-size: 12px; margin-top: 4px; }
+  .notice { padding: 12px 16px; background: #2d2616; border: 1px solid #5a4a1f; border-left: 3px solid #f0ae3c; border-radius: 8px; margin-bottom: 10px; color: #c9d1d9; font-size: 13px; position: relative; }
+  .notice .head { font-weight: 600; color: #f0ae3c; margin-bottom: 4px; font-size: 13px; }
+  .notice ul { margin: 6px 0 0; padding-left: 18px; color: #c9d1d9; }
+  .notice li { font-size: 12px; }
+  .notice .dismiss { position: absolute; top: 8px; right: 10px; background: transparent; border: 0; color: #8b949e; cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 6px; }
+  .notice .dismiss:hover { color: #c9d1d9; }
   .wallet-row { display: flex; gap: 18px; align-items: center; padding: 12px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 14px; }
   .wallet-row .label { color: #8b949e; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
   .wallet-row .balance { font-size: 20px; font-weight: 600; color: #3fb950; font-variant-numeric: tabular-nums; }
@@ -1292,13 +1939,18 @@ const TEAM_HTML = `<!doctype html>
   .schedule-row .sched-team { text-align: left; }
   .schedule-row .sched-team.away { text-align: right; }
   .schedule-row .sched-team .us { color: #58a6ff; font-weight: 600; }
+  .schedule-row .sched-team .sched-team-link { color: #c9d1d9; text-decoration: none; }
+  .schedule-row .sched-team .sched-team-link:hover { color: #58a6ff; text-decoration: underline; }
   .schedule-row .sched-vs { color: #6e7681; text-align: center; }
   .schedule-row .sched-score { color: #f0ae3c; font-weight: 600; text-align: center; }
   .schedule-row .sched-score.loss { color: #f85149; }
   .schedule-row .sched-score.win { color: #3fb950; }
   .schedule-row .sched-score.draw { color: #8b949e; }
-  .schedule-row .sched-status { color: #6e7681; font-size: 11px; text-align: right; text-transform: uppercase; letter-spacing: 0.4px; }
-  .schedule-row .sched-status.done { color: #3fb950; }
+  .schedule-row .sched-status { color: #6e7681; font-size: 11px; text-align: right; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; }
+  .schedule-row .sched-status.win { color: #3fb950; }
+  .schedule-row .sched-status.loss { color: #f85149; }
+  .schedule-row .sched-status.draw { color: #8b949e; }
+  .schedule-row .sched-status.running { color: #f0ae3c; }
   .history-list { margin-top: 10px; }
   .history-row { display: grid; grid-template-columns: 40px 1fr 60px; gap: 8px; padding: 4px 8px; font-size: 11px; border-bottom: 1px solid #21262d; align-items: center; }
   .history-row .res-w { color: #3fb950; font-weight: 600; }
@@ -1344,6 +1996,8 @@ ${AUTH_BAR_HTML}
   <a href="/pyramid">Pyramid</a>
   <a href="/team" class="active">My Team</a>
   <a href="/market">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades">Trades</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -1354,6 +2008,7 @@ ${AUTH_BAR_HTML}
 
 <div id="team-root" style="display:none">
   <div id="wait-banner" class="wait-banner" style="display:none"></div>
+  <div id="notices-host"></div>
   <div class="wallet-row">
     <span class="label">Wallet</span>
     <span class="balance" id="wallet-balance">—</span>
@@ -1608,21 +2263,33 @@ async function loadSchedule() {
     const weHome = f.home_team_id === currentTeam.id;
     const homeCls = weHome ? ' us' : '';
     const awayCls = !weHome ? ' us' : '';
+    const homeId = f.home_team_id;
+    const awayId = f.away_team_id;
+    // Wrap each team name in a link to its profile, except OUR team — that's
+    // already this page. The opposing-team link is the colorblind-safe path
+    // to scouting them after a fixture surprises us.
+    const teamCell = (cls, id, name) => id === currentTeam.id
+      ? '<span class="' + cls.trim() + '">' + esc(name) + '</span>'
+      : '<a class="' + cls.trim() + ' sched-team-link" href="/team/' + id + '">' + esc(name) + '</a>';
     let score = '—';
     let scoreCls = '';
-    let statusLabel = isUpcoming ? f.status : 'complete';
-    let statusCls = isUpcoming ? '' : 'done';
-    if (f.status === 'complete') {
+    let statusLabel, statusCls;
+    if (isUpcoming) {
+      statusLabel = f.status === 'running' ? 'live' : 'pending';
+      statusCls = f.status === 'running' ? 'running' : '';
+    } else {
+      // Explicit win/draw/loss label so the row reads correctly without
+      // relying on the green/red score color (colorblind-safe).
       score = f.home_score + '–' + f.away_score;
-      if (f.winner_team_id === currentTeam.id) scoreCls = 'win';
-      else if (f.winner_team_id == null) scoreCls = 'draw';
-      else scoreCls = 'loss';
+      if (f.winner_team_id === currentTeam.id) { scoreCls = 'win'; statusLabel = 'won'; statusCls = 'win'; }
+      else if (f.winner_team_id == null) { scoreCls = 'draw'; statusLabel = 'drew'; statusCls = 'draw'; }
+      else { scoreCls = 'loss'; statusLabel = 'lost'; statusCls = 'loss'; }
     }
     return '<div class="schedule-row">' +
       '<div class="sched-round">L' + f.tier + ' · R' + f.round_num + '.' + f.slot_num + '</div>' +
-      '<div class="sched-team"><span class="' + homeCls.trim() + '">' + esc(f.home_name) + '</span></div>' +
+      '<div class="sched-team">' + teamCell(homeCls, homeId, f.home_name) + '</div>' +
       '<div class="sched-vs">vs</div>' +
-      '<div class="sched-team away"><span class="' + awayCls.trim() + '">' + esc(f.away_name) + '</span></div>' +
+      '<div class="sched-team away">' + teamCell(awayCls, awayId, f.away_name) + '</div>' +
       '<div class="sched-score ' + scoreCls + '">' + score + '</div>' +
       '<div class="sched-status ' + statusCls + '">' + esc(statusLabel) + '</div>' +
     '</div>';
@@ -1664,8 +2331,39 @@ function renderSection(id, rows) {
     : '<div class="roster-empty">(none)</div>';
 }
 
+function renderNotices() {
+  const host = document.getElementById('notices-host');
+  if (!host) return;
+  const notices = (currentTeam && currentTeam.notices) || [];
+  if (!notices.length) { host.innerHTML = ''; return; }
+  host.innerHTML = notices.map((n) => {
+    if (n.kind === 'auto_replenish') {
+      const added = (n.body && n.body.added) || [];
+      const items = added.map((a) =>
+        '<li>' + esc(a.master_display_name || a.master_file_name || a.display_name) + '</li>'
+      ).join('');
+      return '<div class="notice">' +
+        '<button class="dismiss" title="Dismiss" onclick="dismissNoticeUI(' + n.id + ')">×</button>' +
+        '<div class="head">Roster auto-refilled</div>' +
+        'Your active roster was below 5 fighters when a fixture was due, so we drew the oldest unclaimed masters from the market to bring you back up to a full team:' +
+        '<ul>' + items + '</ul>' +
+      '</div>';
+    }
+    return '';
+  }).join('');
+}
+
+async function dismissNoticeUI(id) {
+  await fetch('/api/me/team/notices/' + id + '/dismiss', { method: 'POST' });
+  if (currentTeam && currentTeam.notices) {
+    currentTeam.notices = currentTeam.notices.filter((n) => n.id !== id);
+  }
+  renderNotices();
+}
+
 function renderTeam() {
   const t = currentTeam;
+  renderNotices();
   document.getElementById('team-name').value = t.name || '';
   const ar = document.getElementById('auto-rotate');
   if (ar) ar.checked = !!t.auto_rotate;
@@ -1857,7 +2555,7 @@ async function openEditor(fighterId) {
         ? '<img src="' + portraitSrc + '" style="width:72px;height:72px;image-rendering:pixelated;background:#0d1117;border:1px solid #30363d;border-radius:6px;object-fit:contain" onerror="this.style.visibility=\\'hidden\\'">'
         : '') +
       '<div style="flex:1"><h3 style="margin:0">' + esc(f.display_name) + '</h3>' +
-      '<div class="sub">Master: ' + esc(f.master_display_name || f.master_file_name) + ' · ' + esc(f.slot) + ' · priority ' + f.priority + '</div></div>' +
+      '<div class="sub">Character: ' + esc(f.master_display_name || f.master_file_name) + ' · ' + esc(f.slot) + ' · priority ' + f.priority + '</div></div>' +
     '</div>' +
     '<div class="stats">' +
       '<div class="stat"><div class="v">' + f.matches_won + '</div><div class="l">Wins</div></div>' +
@@ -1891,7 +2589,7 @@ async function openEditor(fighterId) {
   }
   const ai = await r.json();
   document.querySelector('.ai-hdr').textContent =
-    'AI &middot; ' + (ai.source === 'override' ? 'your override v' + ai.version : 'stock master');
+    'AI &middot; ' + (ai.source === 'override' ? 'your override v' + ai.version : 'stock character');
   const ta = document.getElementById('edit-cmd');
   ta.value = ai.cmd_text;
   ta.disabled = false;
@@ -2135,6 +2833,8 @@ ${AUTH_BAR_HTML}
   <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades">Trades</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div id="workers"></div>
@@ -2155,7 +2855,7 @@ function overlayHtml(w) {
   return (
     '<div class="hdr">' +
       '<span class="lname">' + esc(ctx.league.name) + '</span>' +
-      '<span class="tier">League ' + f.division.tier + ' · ' + esc(f.division.name) + '</span>' +
+      '<span class="tier">League ' + f.division.tier + '</span>' +
     '</div>' +
     '<div class="matchup">' +
       esc(f.home_team) +
@@ -2299,6 +2999,8 @@ ${AUTH_BAR_HTML}
   <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades">Trades</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div class="grid">
@@ -2618,6 +3320,7 @@ const HTML = `<!doctype html>
   .side-card .portrait { width: 120px; height: 120px; align-self: center; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; image-rendering: pixelated; object-fit: contain; }
   .side-card .fighter-name { font-size: 14px; font-weight: 600; color: #c9d1d9; text-align: center; }
   .side-card .fighter-master { font-size: 11px; color: #8b949e; text-align: center; font-style: italic; }
+  .side-card .fighter-author { font-size: 10px; color: #6e7681; text-align: center; margin-top: -4px; }
   .side-card .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; font-size: 11px; }
   .side-card .stat { background: #0d1117; padding: 6px 2px; border-radius: 4px; text-align: center; }
   .side-card .stat .v { font-size: 15px; font-weight: 600; color: #c9d1d9; display: block; font-variant-numeric: tabular-nums; }
@@ -2629,7 +3332,28 @@ const HTML = `<!doctype html>
   .stream-col .stream .placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: #6e7681; font-size: 13px; }
   .stream-col .score-strip { text-align: center; padding: 10px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; }
   .stream-col .score-strip .score { font-size: 26px; font-weight: 600; color: #f0ae3c; font-variant-numeric: tabular-nums; }
+  .stream-col .score-strip .live-pill { font-size: 16px; color: #f85149; letter-spacing: 1px; cursor: help; animation: live-pulse 1.6s ease-in-out infinite; }
+  @keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
   .stream-col .score-strip .meta { color: #8b949e; font-size: 11px; margin-top: 4px; }
+  /* Head-to-head panel under the stream — prior fixtures between the two
+     teams currently in the ring. Read like "W · our P4 Hero · 2-1 · their Ryu". */
+  .stream-col .h2h:empty { display: none; }
+  .stream-col .h2h { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 1100px) { .stream-col .h2h { grid-template-columns: 1fr; } }
+  .stream-col .h2h .h2h-block { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 10px 12px; }
+  .stream-col .h2h .h2h-head { color: #8b949e; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px; }
+  .stream-col .h2h .h2h-empty { color: #6e7681; font-size: 12px; }
+  .stream-col .h2h .h2h-row { display: grid; grid-template-columns: 22px 1fr 60px 1fr 60px; gap: 8px; align-items: center; padding: 4px 2px; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .stream-col .h2h .h2h-row:last-child { border-bottom: 0; }
+  .stream-col .h2h .h2h-res { font-weight: 600; text-align: center; font-size: 11px; }
+  .stream-col .h2h .h2h-row.w .h2h-res { color: #3fb950; }
+  .stream-col .h2h .h2h-row.l .h2h-res { color: #f85149; }
+  .stream-col .h2h .h2h-row.d .h2h-res { color: #8b949e; }
+  .stream-col .h2h .h2h-fighter { color: #c9d1d9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stream-col .h2h .h2h-them { color: #8b949e; text-align: right; }
+  .stream-col .h2h .h2h-score { text-align: center; font-variant-numeric: tabular-nums; color: #c9d1d9; }
+  .stream-col .h2h .h2h-loc { color: #6e7681; font-size: 10px; text-align: right; }
+  .side-card .team-pos { color: #58a6ff; font-size: 11px; font-variant-numeric: tabular-nums; margin-top: -2px; }
   .sidebar-3 { display: grid; grid-template-columns: 1.2fr 1fr 1.2fr; gap: 14px; }
   @media (max-width: 1100px) { .sidebar-3 { grid-template-columns: 1fr; } }
   .sidebar-3 .panel { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 12px; }
@@ -2644,6 +3368,22 @@ const HTML = `<!doctype html>
   .sidebar-3 .l { color: #f85149; }
   .sidebar-3 .d { color: #8b949e; }
   .sidebar-3 .fighter-cell { color: #8b949e; font-size: 10px; font-style: italic; }
+  /* Follow / star button + followed-team highlight. The highlight is a subtle
+     yellow tint with a leading ★ glyph — visible without dominating the row,
+     and consistent across every team-name surface (cards, sidebar, schedule). */
+  .star { background: transparent; border: 0; color: #6e7681; cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1; transition: color 0.1s, transform 0.1s; }
+  .star:hover { color: #f0ae3c; transform: scale(1.15); }
+  .star.on { color: #f0ae3c; }
+  /* Team star sits inline with the team name; fighter star is inline with the
+     fighter name. Both are slightly smaller than the line-height so the row
+     stays balanced. */
+  .side-card .team-name .star { font-size: 14px; vertical-align: middle; }
+  .side-card .fighter-row { display: flex; align-items: center; justify-content: center; gap: 4px; }
+  .side-card .fighter-row .star { font-size: 13px; }
+  .team-link { color: inherit; text-decoration: none; }
+  .team-link:hover { text-decoration: underline; }
+  .team-link.followed { color: #f0ae3c; font-weight: 600; }
+  .team-link.followed::before { content: '★ '; font-size: 0.9em; }
 </style></head>
 <body style="position:relative">
 ${AUTH_BAR_HTML}
@@ -2654,6 +3394,8 @@ ${AUTH_BAR_HTML}
   <a href="/pyramid">Pyramid</a>
   <a href="/team">My Team</a>
   <a href="/market">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades">Trades</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -2667,6 +3409,7 @@ ${AUTH_BAR_HTML}
       <div class="score" id="score">— –  —</div>
       <div class="meta" id="score-meta">&nbsp;</div>
     </div>
+    <div class="h2h" id="h2h"></div>
   </div>
   <div class="side-card" id="away-card"><div class="empty">Loading…</div></div>
 </div>
@@ -2682,17 +3425,100 @@ ${AUTH_MODAL_HTML}
 ${AUTH_JS}
 <script>
 function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
-let activeTier = 1;
+// Restore the last league the user was watching so the Live page lands on
+// the same tab next time. Clamped to [1,3] so a stale value (or a future
+// schema change) can't leave the tab in an invalid state.
+const LIVE_LAST_TIER_KEY = 'mb.live.activeTier';
+let activeTier = (() => {
+  try {
+    const v = parseInt(localStorage.getItem(LIVE_LAST_TIER_KEY) || '1', 10);
+    return Number.isInteger(v) && v >= 1 && v <= 3 ? v : 1;
+  } catch { return 1; }
+})();
 let currentWorkerId = null;
+// Followed targets — kept as Sets so every team-name render can do an O(1)
+// membership check. Reloaded from the server only on auth changes; toggle
+// updates the local sets optimistically so the UI reacts immediately.
+const followed = { masters: new Set(), teams: new Set() };
+
+async function loadFollows() {
+  followed.masters.clear();
+  followed.teams.clear();
+  if (!window.__authState || !window.__authState.authenticated) return;
+  try {
+    const r = await fetch('/api/follow');
+    if (!r.ok) return;
+    const j = await r.json();
+    (j.masters || []).forEach(id => followed.masters.add(id));
+    (j.teams || []).forEach(id => followed.teams.add(id));
+  } catch {}
+}
+
+async function toggleFollow(kind, id, evt) {
+  if (evt) { evt.stopPropagation(); evt.preventDefault(); }
+  if (!window.__authState || !window.__authState.authenticated) {
+    alert('Sign in to follow.');
+    return;
+  }
+  const set = kind === 'master' ? followed.masters : followed.teams;
+  const wasFollowing = set.has(id);
+  if (wasFollowing) {
+    set.delete(id);
+    fetch('/api/follow/' + kind + '/' + id, { method: 'DELETE' });
+  } else {
+    set.add(id);
+    fetch('/api/follow', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, id }),
+    });
+  }
+  refresh();
+}
+
+function teamLabel(id, name) {
+  const cls = followed.teams.has(id) ? ' followed' : '';
+  return '<a class="team-link' + cls + '" href="/team/' + id + '">' + esc(name) + '</a>';
+}
+
+// Star button. Tooltip is purpose-specific because team-follow and master-
+// follow do different things — team-follow is cosmetic (highlight the name
+// wherever it appears); master-follow is utility (surface to the top of the
+// market when the fighter is listed). Hollow ☆ vs filled ★ shows state at
+// a glance even without hover.
+function starBtn(kind, id, label) {
+  const on = (kind === 'master' ? followed.masters : followed.teams).has(id);
+  const glyph = on ? '★' : '☆';
+  let tip;
+  if (kind === 'team') {
+    tip = on
+      ? 'Unfollow ' + label + ' (currently highlighted everywhere)'
+      : 'Follow ' + label + ' — highlights the team name everywhere it appears';
+  } else {
+    tip = on
+      ? 'Unfollow ' + label + ' — won\\'t auto-surface to the market top anymore'
+      : 'Follow ' + label + ' — pins them to the top of the market if listed';
+  }
+  return '<button class="star' + (on ? ' on' : '') + '" data-kind="' + kind +
+    '" title="' + tip + '" aria-label="' + tip +
+    '" onclick="toggleFollow(\\'' + kind + '\\',' + id + ',event)">' + glyph + '</button>';
+}
 
 function renderTabs(league) {
   const tabs = document.getElementById('tier-tabs');
   tabs.innerHTML = '';
-  for (let t = 1; t <= 3; t++) {
+  // Render one tab per tier the league actually has. Falls back to 3 if
+  // the API didn't surface a division_count (older view payloads).
+  const divCount = (league && league.division_count) || 3;
+  for (let t = 1; t <= divCount; t++) {
     const el = document.createElement('div');
     el.className = 'tab tier-' + t + (t === activeTier ? ' active' : '');
     el.textContent = 'League ' + t;
-    el.onclick = () => { activeTier = t; refresh(true); };
+    el.onclick = () => {
+      activeTier = t;
+      try { localStorage.setItem(LIVE_LAST_TIER_KEY, String(t)); } catch {}
+      refresh(true);
+    };
     tabs.appendChild(el);
   }
 }
@@ -2701,25 +3527,112 @@ function renderSideCard(hostId, side) {
   const host = document.getElementById(hostId);
   if (!side) { host.innerHTML = '<div class="empty">No team yet</div>'; return; }
   const f = side.fighter;
+  const posLine = side.position
+    ? '<div class="team-pos" title="Current league position">#' + side.position +
+      ' · ' + side.points + ' pts · ' + side.fixtures_played + ' played</div>'
+    : '';
+  const teamHdr =
+    '<div class="team-name">' +
+      teamLabel(side.team_id, side.team_name) +
+      ' ' + starBtn('team', side.team_id, side.team_name) +
+    '</div>' +
+    '<div class="team-user">@' + esc(side.username) + '</div>' +
+    posLine;
   if (!f) {
-    host.innerHTML =
-      '<div class="team-name">' + esc(side.team_name) + '</div>' +
-      '<div class="team-user">@' + esc(side.username) + '</div>' +
-      '<div class="empty">Picking fighter…</div>';
+    host.innerHTML = teamHdr + '<div class="empty">Picking fighter…</div>';
     return;
   }
-  host.innerHTML =
-    '<div class="team-name"><a href="/team/' + side.team_id + '" style="color:inherit;text-decoration:none">' + esc(side.team_name) + '</a></div>' +
-    '<div class="team-user">@' + esc(side.username) + '</div>' +
+  const masterName = f.master_display_name || f.master_file_name;
+  const masterId = f.master_fighter_id;
+  const authorLine = f.master_author ? '<div class="fighter-author">by ' + esc(f.master_author) + '</div>' : '';
+  const stam = Number(f.stamina || 0).toFixed(2);
+  host.innerHTML = teamHdr +
     '<img class="portrait" src="/portrait/' + encodeURIComponent(f.master_file_name) + '.png" onerror="this.style.visibility=\\'hidden\\'">' +
-    '<div class="fighter-name">' + esc(f.display_name) + '</div>' +
-    '<div class="fighter-master">' + esc(f.master_display_name || f.master_file_name) + '</div>' +
+    '<div class="fighter-row">' +
+      '<div class="fighter-name" title="' + esc(f.display_name) + ' — this team\\'s nickname for the fighter">' + esc(f.display_name) + '</div>' +
+      starBtn('master', masterId, masterName) +
+    '</div>' +
+    '<div class="fighter-master" title="Underlying character. Click the star to follow.">' + esc(masterName) + '</div>' +
+    authorLine +
     '<div class="stat-grid">' +
-      '<div class="stat"><span class="v">' + f.matches_won + '</span><span class="l">W</span></div>' +
-      '<div class="stat"><span class="v">' + f.matches_lost + '</span><span class="l">L</span></div>' +
-      '<div class="stat"><span class="v">' + f.matches_drawn + '</span><span class="l">D</span></div>' +
-      '<div class="stat"><span class="v">' + Number(f.stamina || 0).toFixed(2) + '</span><span class="l">Stam</span></div>' +
+      '<div class="stat" title="Career matches won by this fighter"><span class="v">' + f.matches_won + '</span><span class="l">W</span></div>' +
+      '<div class="stat" title="Career matches lost"><span class="v">' + f.matches_lost + '</span><span class="l">L</span></div>' +
+      '<div class="stat" title="Career draws"><span class="v">' + f.matches_drawn + '</span><span class="l">D</span></div>' +
+      '<div class="stat" title="Stamina (1.0 = full HP for the next match, drops 0.20 per fight, recovers 0.25 while resting)"><span class="v">' + stam + '</span><span class="l">Stam</span></div>' +
     '</div>';
+}
+
+// Head-to-head panel under the stream — two blocks side by side:
+//   1. Team H2H: fixtures between the two TEAMS regardless of who they fielded
+//   2. Fighter H2H: prior matches between the two MASTER FIGHTERS in the ring,
+//      across all leagues and owners
+function renderHeadToHead(teamRows, fighterRows, home, away) {
+  const host = document.getElementById('h2h');
+  if (!host) return;
+  if (!home || !away) { host.innerHTML = ''; return; }
+  // Drop fixtures that never had real fighter info on slot 1.
+  const teamPlayed = (teamRows || []).filter((r) => r.home_fighter && r.away_fighter);
+  const fighterPlayed = (fighterRows || []);
+
+  const teamItems = teamPlayed.map((r) => {
+    const homeWasHome = r.home_team_id === home.team_id;
+    const ourScore = homeWasHome ? r.home_rounds : r.away_rounds;
+    const theirScore = homeWasHome ? r.away_rounds : r.home_rounds;
+    const ourFighter = homeWasHome ? r.home_fighter : r.away_fighter;
+    const theirFighter = homeWasHome ? r.away_fighter : r.home_fighter;
+    let cls;
+    if (r.winner_team_id == null) cls = 'd';
+    else if (r.winner_team_id === home.team_id) cls = 'w';
+    else cls = 'l';
+    const label = cls === 'w' ? 'W' : cls === 'l' ? 'L' : 'D';
+    return '<div class="h2h-row ' + cls + '">' +
+      '<span class="h2h-res">' + label + '</span>' +
+      '<span class="h2h-fighter">' + esc(ourFighter || '—') + '</span>' +
+      '<span class="h2h-score">' + ourScore + '–' + theirScore + '</span>' +
+      '<span class="h2h-fighter h2h-them">' + esc(theirFighter || '—') + '</span>' +
+      '<span class="h2h-loc">L' + r.tier + ' R' + r.round_num + '</span>' +
+    '</div>';
+  }).join('');
+
+  const homeMasterId = home.fighter && home.fighter.master_fighter_id;
+  const fighterItems = fighterPlayed.map((r) => {
+    const ourMasterIsHome = r.home_master_id === homeMasterId;
+    const ourScore = ourMasterIsHome ? r.home_rounds : r.away_rounds;
+    const theirScore = ourMasterIsHome ? r.away_rounds : r.home_rounds;
+    const ourFighter = ourMasterIsHome ? r.home_fighter : r.away_fighter;
+    const theirFighter = ourMasterIsHome ? r.away_fighter : r.home_fighter;
+    const ourTeamName = ourMasterIsHome ? r.home_team_name : r.away_team_name;
+    const theirTeamName = ourMasterIsHome ? r.away_team_name : r.home_team_name;
+    let cls;
+    if (ourScore > theirScore) cls = 'w';
+    else if (ourScore < theirScore) cls = 'l';
+    else cls = 'd';
+    const label = cls === 'w' ? 'W' : cls === 'l' ? 'L' : 'D';
+    return '<div class="h2h-row ' + cls + '">' +
+      '<span class="h2h-res">' + label + '</span>' +
+      '<span class="h2h-fighter" title="' + esc(ourFighter || '') + ' (' + esc(ourTeamName || '') + ')">' + esc(ourFighter || '—') + '</span>' +
+      '<span class="h2h-score">' + ourScore + '–' + theirScore + '</span>' +
+      '<span class="h2h-fighter h2h-them" title="' + esc(theirFighter || '') + ' (' + esc(theirTeamName || '') + ')">' + esc(theirFighter || '—') + '</span>' +
+      '<span class="h2h-loc">L' + r.tier + ' R' + r.round_num + '</span>' +
+    '</div>';
+  }).join('');
+
+  const teamBlock = '<div class="h2h-block">' +
+    '<div class="h2h-head">Team head-to-head' + (teamPlayed.length ? ' · ' + teamPlayed.length + ' prior' : '') + '</div>' +
+    (teamItems || '<div class="h2h-empty">These teams have never met.</div>') +
+    '</div>';
+
+  const fighterMasterHome = home.fighter && home.fighter.master_display_name;
+  const fighterMasterAway = away.fighter && away.fighter.master_display_name;
+  const fighterHeadLabel = (fighterMasterHome && fighterMasterAway)
+    ? esc(fighterMasterHome) + ' vs ' + esc(fighterMasterAway)
+    : 'Fighter head-to-head';
+  const fighterBlock = '<div class="h2h-block">' +
+    '<div class="h2h-head">' + fighterHeadLabel + (fighterPlayed.length ? ' · ' + fighterPlayed.length + ' prior' : '') + '</div>' +
+    (fighterItems || '<div class="h2h-empty">These fighters have never met.</div>') +
+    '</div>';
+
+  host.innerHTML = teamBlock + fighterBlock;
 }
 
 function renderStream(workerId) {
@@ -2737,18 +3650,28 @@ function renderStandings(rows, viewerTeamId) {
   const body = rows.map((s, i) => {
     const mine = s.team_id === viewerTeamId ? ' class="mine"' : '';
     return '<tr' + mine + '><td class="pos' + (i === 0 ? ' p1' : '') + '">' + (i + 1) + '</td>' +
-      '<td>' + esc(s.team_name) + '</td>' +
+      '<td>' + teamLabel(s.team_id, s.team_name) + '</td>' +
       '<td>' + s.fixtures_played + '</td>' +
+      '<td>' + s.fixtures_won + '</td>' +
+      '<td>' + s.fixtures_drawn + '</td>' +
+      '<td>' + s.fixtures_lost + '</td>' +
       '<td>' + s.points + '</td></tr>';
   }).join('');
-  host.innerHTML = '<table><thead><tr><th>#</th><th>Team</th><th>Pl</th><th>Pts</th></tr></thead><tbody>' + body + '</tbody></table>';
+  host.innerHTML = '<table><thead><tr>' +
+    '<th>#</th><th>Team</th><th title="Played">P</th>' +
+    '<th title="Won">W</th><th title="Drawn">D</th><th title="Lost">L</th>' +
+    '<th title="Points">Pts</th>' +
+    '</tr></thead><tbody>' + body + '</tbody></table>';
 }
 
 function renderUpcoming(rows) {
   const host = document.getElementById('upcoming');
   if (!rows.length) { host.innerHTML = '<div style="color:#6e7681">None.</div>'; return; }
   host.innerHTML = '<table><tbody>' + rows.map(r =>
-    '<tr><td>R' + r.round_num + '</td><td>' + esc(r.home_team_name) + '</td><td style="color:#6e7681">vs</td><td>' + esc(r.away_team_name) + '</td></tr>'
+    '<tr><td>R' + r.round_num + '</td>' +
+      '<td>' + teamLabel(r.home_team_id, r.home_team_name) + '</td>' +
+      '<td style="color:#6e7681">vs</td>' +
+      '<td>' + teamLabel(r.away_team_id, r.away_team_name) + '</td></tr>'
   ).join('') + '</tbody></table>';
 }
 
@@ -2756,15 +3679,14 @@ function renderRecent(rows) {
   const host = document.getElementById('recent');
   if (!rows.length) { host.innerHTML = '<div style="color:#6e7681">No results yet.</div>'; return; }
   host.innerHTML = '<table><tbody>' + rows.map(r => {
-    const homeWon = r.winner_team_id && r.home_team_name && r.winner_team_id !== null;
     const hCls = r.winner_team_id && r.winner_team_id === r.home_team_id ? 'w' : (r.winner_team_id ? 'l' : 'd');
     const aCls = r.winner_team_id && r.winner_team_id === r.away_team_id ? 'w' : (r.winner_team_id ? 'l' : 'd');
     const hFighter = r.home_fighter ? '<div class="fighter-cell">' + esc(r.home_fighter) + '</div>' : '';
     const aFighter = r.away_fighter ? '<div class="fighter-cell">' + esc(r.away_fighter) + '</div>' : '';
     return '<tr>' +
-      '<td class="' + hCls + '">' + esc(r.home_team_name) + hFighter + '</td>' +
+      '<td class="' + hCls + '">' + teamLabel(r.home_team_id, r.home_team_name) + hFighter + '</td>' +
       '<td style="text-align:center;font-variant-numeric:tabular-nums">' + r.home_rounds + '-' + r.away_rounds + '</td>' +
-      '<td class="' + aCls + '">' + esc(r.away_team_name) + aFighter + '</td>' +
+      '<td class="' + aCls + '">' + teamLabel(r.away_team_id, r.away_team_name) + aFighter + '</td>' +
     '</tr>';
   }).join('') + '</tbody></table>';
 }
@@ -2795,17 +3717,38 @@ async function refresh(fromTab = false) {
   }
   const cur = view.current;
   if (cur) {
-    renderSideCard('home-card', cur.home);
-    renderSideCard('away-card', cur.away);
-    document.getElementById('score').textContent = cur.home_rounds + ' – ' + cur.away_rounds;
+    // Annotate each side with its current standings position so the side
+    // card can render "#3 · 12 pts" under the @username.
+    const standings = view.standings || [];
+    const augment = (side) => {
+      if (!side) return side;
+      const idx = standings.findIndex((s) => s.team_id === side.team_id);
+      if (idx < 0) return side;
+      const s = standings[idx];
+      return { ...side, position: idx + 1, points: s.points, fixtures_played: s.fixtures_played };
+    };
+    renderSideCard('home-card', augment(cur.home));
+    renderSideCard('away-card', augment(cur.away));
+    renderHeadToHead(view.team_h2h || [], view.fighter_h2h || [], cur.home, cur.away);
+    // Ikemen doesn't write round-by-round results to the match log — the
+    // p1wins/p2wins values only land at the very end of the match. So we
+    // genuinely don't know the live score during play. Show a "live" pill
+    // instead of a misleading 0–0; the final score appears in the Recent
+    // panel the moment the match wraps.
+    const scoreEl = document.getElementById('score');
+    scoreEl.innerHTML = '<span class="live-pill" title="Round score isn\\'t available live — the final score appears under Recent the moment the match ends.">● LIVE</span>';
+    const stageBit = cur.stage
+      ? 'Stage: ' + esc(cur.stage) + (cur.stage_author ? ' <span style="color:#6e7681">by ' + esc(cur.stage_author) + '</span>' : '') + ' · '
+      : '';
     document.getElementById('score-meta').innerHTML =
-      (cur.stage ? 'Stage: ' + esc(cur.stage) + ' · ' : '') +
+      stageBit +
       'Round ' + cur.round + ' · ' + esc(view.league.name);
   } else {
     renderSideCard('home-card', null);
     renderSideCard('away-card', null);
     document.getElementById('score').textContent = '—';
     document.getElementById('score-meta').textContent = 'Between fixtures — ' + esc(view.league.name);
+    document.getElementById('h2h').innerHTML = '';
   }
   renderStream(view.stream_worker_id);
   const viewer = await viewerTeamId();
@@ -2814,7 +3757,7 @@ async function refresh(fromTab = false) {
   renderRecent(view.recent || []);
 }
 
-refresh();
+loadFollows().then(() => refresh());
 setInterval(refresh, 2000);
 </script>
 </body></html>`;
@@ -2915,11 +3858,13 @@ const server = createServer((req, res) => {
   }
   if (req.url === '/api/workers') {
     const db = getDb();
-    const data = Array.from(workers.values()).map((w) => {
-      const base = w.describe();
-      const ctx = w.leagueId ? getLiveLeagueContext(db, w.leagueId, w.divisionId) : null;
-      return { ...base, context: ctx };
-    });
+    const data = Array.from(workers.values())
+      .filter((w) => w.kind === 'league')
+      .map((w) => {
+        const base = w.describe();
+        const ctx = w.leagueId ? getLiveLeagueContext(db, w.leagueId, w.divisionId) : null;
+        return { ...base, context: ctx };
+      });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
     return;
@@ -2973,6 +3918,90 @@ const server = createServer((req, res) => {
   if (req.url === '/leaderboard' || req.url === '/leaderboard/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(LEADERBOARD_HTML);
+    return;
+  }
+  if (req.url === '/exhibition' || req.url === '/exhibition/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(EXHIBITION_HTML);
+    return;
+  }
+  if (req.url === '/trades' || req.url === '/trades/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(TRADES_HTML);
+    return;
+  }
+  if (req.url && req.url.startsWith('/api/trades')) {
+    const db = getDb();
+    const url = new URL(req.url, 'http://x');
+    const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit') || '50', 10)));
+    // Pull recent buys from wallet_ledger (the canonical record of money
+    // movement). Each buy_master entry produces one row; each listing-buy
+    // produces TWO ledger entries (debit on buyer, credit on seller) — we
+    // dedupe to one trade event per ref_id by collapsing on (kind, ref_id).
+    const rows = db.prepare(`
+      SELECT w.id, w.user_id, w.delta_cents, w.reason, w.ref_id, w.created_at,
+        u.username AS actor_username, u.is_bot AS actor_is_bot,
+        of.id AS owned_id, of.team_id AS owned_team_id, of.display_name AS owned_display,
+        f.id AS master_id, f.file_name AS master_file_name,
+        f.display_name AS master_display, f.author AS master_author
+      FROM wallet_ledger w
+      JOIN user_account u ON u.id = w.user_id
+      LEFT JOIN owned_fighter of ON of.id = w.ref_id
+      LEFT JOIN fighter f ON f.id = of.master_fighter_id
+      WHERE w.reason LIKE 'buy_master%' OR w.reason = 'buy_listing'
+         OR w.reason = 'sell_listing' OR w.reason = 'release'
+      ORDER BY w.id DESC
+      LIMIT ?
+    `).all(limit * 2);
+    // Group by (reason category, ref_id, created_at-bucket) so the buyer+seller
+    // halves of a listing-buy collapse into one trade event with both sides.
+    const trades = [];
+    const seen = new Set();
+    for (const r of rows) {
+      const cat = r.reason.startsWith('buy_master')
+        ? 'buy_master'
+        : (r.reason === 'buy_listing' || r.reason === 'sell_listing')
+        ? 'listing_trade'
+        : r.reason; // 'release' passes through
+      const key = cat + '|' + (r.ref_id || 0) + '|' + r.created_at;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let buyer = null, seller = null;
+      if (cat === 'buy_master') {
+        buyer = { user_id: r.user_id, username: r.actor_username, is_bot: r.actor_is_bot };
+      } else if (cat === 'release') {
+        // Release: the actor used to own the fighter; surface them as 'seller'
+        // so the UI can render "@user released X" similarly.
+        seller = { user_id: r.user_id, username: r.actor_username, is_bot: r.actor_is_bot };
+      } else {
+        // listing trade: find both halves in `rows`
+        const halves = rows.filter((x) => x.ref_id === r.ref_id && x.created_at === r.created_at);
+        const buyHalf = halves.find((h) => h.delta_cents < 0);
+        const sellHalf = halves.find((h) => h.delta_cents > 0);
+        buyer = buyHalf && { user_id: buyHalf.user_id, username: buyHalf.actor_username, is_bot: buyHalf.actor_is_bot };
+        seller = sellHalf && { user_id: sellHalf.user_id, username: sellHalf.actor_username, is_bot: sellHalf.actor_is_bot };
+      }
+      const kind = cat === 'buy_master' ? 'buy_unclaimed'
+                 : cat === 'release' ? 'release'
+                 : 'buy_listing';
+      trades.push({
+        id: r.id,
+        kind,
+        price_cents: Math.abs(r.delta_cents),
+        created_at: r.created_at,
+        buyer,
+        seller,
+        master: r.master_id ? {
+          id: r.master_id,
+          file_name: r.master_file_name,
+          display_name: r.master_display,
+          author: r.master_author,
+        } : null,
+      });
+      if (trades.length >= limit) break;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(trades));
     return;
   }
   if (req.url === '/api/leaderboard') {
@@ -3050,8 +4079,95 @@ const server = createServer((req, res) => {
     const u = currentUser(db, req);
     if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
     const team = getTeamForUser(db, u.id);
+    if (team) team.notices = listOpenNotices(db, team.id);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(team || { error: 'No team yet' }));
+    return;
+  }
+  const dismissNoticeMatch = req.url && req.url.match(/^\/api\/me\/team\/notices\/(\d+)\/dismiss$/);
+  if (dismissNoticeMatch && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const team = db.prepare('SELECT id FROM team WHERE user_id = ?').get(u.id);
+    if (!team) { res.writeHead(404); res.end('{"error":"No team"}'); return; }
+    const r = dismissNotice(db, team.id, Number(dismissNoticeMatch[1]));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(r));
+    return;
+  }
+
+  // ---------- Exhibition matches ----------
+  if (req.url === '/api/exhibition/fighters' && req.method === 'GET') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    const data = listExhibitionFighters(db, u?.id || null);
+    const recent = u ? listExhibitionsForUser(db, u.id, 10) : [];
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ...data, recent, signed_in: !!u }));
+    return;
+  }
+  if (req.url === '/api/exhibition' && req.method === 'POST') {
+    readJsonBody(req).then((body) => {
+      const db = getDb();
+      const u = currentUser(db, req);
+      if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+      const homeId = Number(body?.home_owned_fighter_id);
+      const awayId = Number(body?.away_owned_fighter_id);
+      const stageId = body?.stage_id != null ? Number(body.stage_id) : null;
+      if (!homeId || !awayId) { res.writeHead(400); res.end('{"error":"home and away required"}'); return; }
+      const r = enqueueExhibition(db, { requesterId: u.id, homeId, awayId, stageId });
+      if (r.error) { res.writeHead(400); res.end(JSON.stringify(r)); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: r.id }));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const exhibitionByIdMatch = req.url && req.url.match(/^\/api\/exhibition\/(\d+)$/);
+  if (exhibitionByIdMatch && req.method === 'GET') {
+    const db = getDb();
+    const id = Number(exhibitionByIdMatch[1]);
+    const ex = getExhibition(db, id);
+    if (!ex) { res.writeHead(404); res.end('{"error":"not_found"}'); return; }
+    // Surface the live worker's id so the page can embed /stream/<id> while
+    // running. After completion the worker has already moved on, so this
+    // becomes null and the UI can hide the stream.
+    let streamWorkerId = null;
+    if (ex.status === 'running') {
+      const w = Array.from(workers.values()).find((ww) => ww.exhibitionId === id);
+      streamWorkerId = w ? w.workerId : null;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ...ex, stream_worker_id: streamWorkerId }));
+    return;
+  }
+  if (req.url === '/api/follow' && req.method === 'GET') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(listFollows(db, u.id)));
+    return;
+  }
+  if (req.url === '/api/follow' && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    readJsonBody(req).then((body) => {
+      const r = follow(db, u.id, body.kind, Number(body.id));
+      res.writeHead(r.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(r));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const unfollowMatch = req.url && req.url.match(/^\/api\/follow\/(master|team)\/(\d+)$/);
+  if (unfollowMatch && req.method === 'DELETE') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const r = unfollow(db, u.id, unfollowMatch[1], Number(unfollowMatch[2]));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(r));
     return;
   }
   if (req.url === '/api/me/wait') {
@@ -3115,9 +4231,23 @@ const server = createServer((req, res) => {
   if (marketMatch && req.method === 'GET') {
     const db = getDb();
     const url = new URL(req.url, 'http://x');
-    const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10)));
+    // Pass `?limit=N` to cap; omit (or pass `all`) to return every unclaimed
+    // master. Without a cap the response can be 1k+ rows but the JSON is small
+    // and the market page already lazy-renders cards as the user scrolls.
+    const raw = url.searchParams.get('limit');
+    const limit = (!raw || raw === 'all') ? null : Math.max(1, parseInt(raw, 10));
+    let rows = marketListings(db, { limit });
+    // Surface followed masters at the top so a user's starred fighters are
+    // the first thing they see when one finally hits the market.
+    const u = currentUser(db, req);
+    if (u) {
+      const follows = listFollows(db, u.id);
+      const followedSet = new Set(follows.masters);
+      rows = rows.map((r) => ({ ...r, followed: followedSet.has(r.id) }));
+      rows.sort((a, b) => Number(b.followed) - Number(a.followed));
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(marketListings(db, { limit })));
+    res.end(JSON.stringify(rows));
     return;
   }
   if (req.url === '/api/market/buy' && req.method === 'POST') {
@@ -3141,8 +4271,15 @@ const server = createServer((req, res) => {
     const db = getDb();
     const url = new URL(req.url, 'http://x');
     const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10)));
+    let rows = userListings(db, { limit });
+    const u = currentUser(db, req);
+    if (u) {
+      const followedSet = new Set(listFollows(db, u.id).masters);
+      rows = rows.map((r) => ({ ...r, followed: followedSet.has(r.master_id) }));
+      rows.sort((a, b) => Number(b.followed) - Number(a.followed));
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(userListings(db, { limit })));
+    res.end(JSON.stringify(rows));
     return;
   }
   if (req.url === '/api/market/buy-listing' && req.method === 'POST') {
@@ -3490,9 +4627,15 @@ const server = createServer((req, res) => {
 (async () => {
   await bootWorkers();
   startSupervisor();
+  startExhibitionSupervisor();
+  startBotMarketSupervisor();
   server.listen(PORT, () => {
     console.log(`[server] http://localhost:${PORT}`);
-    console.log(`[pool] ${WORKER_COUNT} worker(s) on displays :${DISPLAY_BASE + 1}..:${DISPLAY_BASE + WORKER_COUNT}`);
+    console.log(`[pool] ${WORKER_COUNT} league worker(s) on displays :${DISPLAY_BASE + 1}..:${DISPLAY_BASE + WORKER_COUNT}`);
+    if (EXHIBITION_WORKER_COUNT > 0) {
+      const start = DISPLAY_BASE + WORKER_COUNT + 1;
+      console.log(`[pool] ${EXHIBITION_WORKER_COUNT} exhibition worker(s) on displays :${start}..:${start + EXHIBITION_WORKER_COUNT - 1}`);
+    }
     console.log(`[hint] create leagues with: node src/index.js league create`);
   });
 })();

@@ -80,7 +80,14 @@ if [ -f "$WORKER_SAVE/config.json" ] && \
     rm -f "$WORKER_SAVE/config.json"
   fi
 fi
-trap 'rm -rf "$WORKER_SAVE"' EXIT
+
+# Per-match Ikemen.log — Ikemen writes its own diagnostic log to
+# engine/Ikemen.log on certain startup errors (panic: missing file, etc).
+# The engine dir is mounted read-only, so without a writable shim Ikemen
+# panics with "open Ikemen.log: read-only file system" and the match
+# terminates before any rounds play. Bind a per-match scratch file over it.
+WORKER_IKE_LOG="$(mktemp /tmp/mb-ikelog.XXXXXX)"
+trap 'rm -rf "$WORKER_SAVE"; rm -f "$WORKER_IKE_LOG"' EXIT
 
 exec bwrap \
   --unshare-net --unshare-pid --die-with-parent --new-session \
@@ -90,6 +97,7 @@ exec bwrap \
   --symlink usr/lib /lib64 \
   --ro-bind "$ENGINE_DIR" "$ENGINE_DIR" \
   --bind "$WORKER_SAVE" "$ENGINE_DIR/save" \
+  --bind "$WORKER_IKE_LOG" "$ENGINE_DIR/Ikemen.log" \
   --tmpfs /tmp \
   --ro-bind /tmp/.X11-unix /tmp/.X11-unix \
   --bind "$LOG_FILE" "$LOG_FILE" \

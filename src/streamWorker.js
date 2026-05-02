@@ -15,9 +15,10 @@
  * currentFixtureId, clients.size, lastError.
  */
 
-import { spawn } from 'child_process';
-import { existsSync } from 'fs';
+import { spawn, spawnSync } from 'child_process';
+import { existsSync, unlinkSync } from 'fs';
 import { runLeagueWorker } from './leagueWorker.js';
+import { runExhibition } from './exhibition.js';
 
 const SOI = Buffer.from([0xff, 0xd8]); // JPEG start of image
 const EOI = Buffer.from([0xff, 0xd9]); // JPEG end of image
@@ -33,6 +34,7 @@ export class StreamWorker {
     size = DEFAULT_SIZE,
     fps = DEFAULT_FPS,
     logPath,
+    kind = 'league',
   }) {
     if (!workerId) throw new Error('StreamWorker: workerId required');
     if (!display) throw new Error('StreamWorker: display required');
@@ -41,6 +43,10 @@ export class StreamWorker {
     this.size = size;
     this.fps = fps;
     this.logPath = logPath;
+    // 'league' workers loop through fixture queues; 'exhibition' workers
+    // claim one ad-hoc match at a time. Different supervisors, different
+    // assign methods — kept on one Map so /stream/<id> works uniformly.
+    this.kind = kind;
 
     this.xvfb = null;
     this.ffmpeg = null;
@@ -51,6 +57,7 @@ export class StreamWorker {
     this.leagueId = null;
     this.divisionId = null;
     this.currentFixtureId = null;
+    this.exhibitionId = null;
     this.runPromise = null;
     this.lastError = null;
     this.startedAt = null;
@@ -72,6 +79,16 @@ export class StreamWorker {
   }
 
   _startXvfb() {
+    // Stale sockets from a previous run will fool a naive readiness check —
+    // existsSync(/tmp/.X11-unix/Xnn) returns true for the leftover even
+    // though no server is listening, and Ikemen later errors with
+    // "Failed to open display". Kill any orphan Xvfb on this display and
+    // remove the sockets before spawning a fresh one.
+    const num = this.display.replace(':', '');
+    try { spawnSync('pkill', ['-9', '-f', `Xvfb ${this.display} `], { stdio: 'ignore' }); } catch {}
+    for (const f of [`/tmp/.X11-unix/X${num}`, `/tmp/.X11-unix/X${num}_`]) {
+      try { if (existsSync(f)) unlinkSync(f); } catch {}
+    }
     this.xvfb = spawn('Xvfb', [this.display, '-screen', '0', `${this.size}x24`, '-nolisten', 'tcp'], {
       stdio: 'ignore',
     });
@@ -86,13 +103,17 @@ export class StreamWorker {
     });
   }
 
-  /** Wait for Xvfb to create its X socket. Poll /tmp/.X11-unix/Xnn. */
+  /**
+   * Wait for Xvfb to actually be serving — not just for the socket file to
+   * exist (a leftover socket from a dead Xvfb passes existsSync but no
+   * server is listening). We probe with `xprop` which connects to the X
+   * server and bails fast if nobody's there.
+   */
   async _waitForDisplay() {
-    const num = this.display.replace(':', '');
-    const sock = `/tmp/.X11-unix/X${num}`;
     const deadline = Date.now() + XVFB_READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      if (existsSync(sock)) return;
+      const r = spawnSync('xprop', ['-display', this.display, '-root'], { stdio: 'ignore', timeout: 1000 });
+      if (r.status === 0) return;
       await new Promise((r) => setTimeout(r, 50));
     }
     throw new Error(`Xvfb for ${this.display} did not come up in time`);
@@ -199,6 +220,42 @@ export class StreamWorker {
     return this.runPromise;
   }
 
+  /**
+   * Assign a single pre-claimed exhibition match. Caller is responsible for
+   * having atomically marked the exhibition_match row as 'running' first
+   * (claimNextPendingExhibition). The runner finalises the row when the
+   * match resolves; on failure the row is marked 'failed' inside runExhibition.
+   */
+  assignExhibition(db, exhibitionId, callbacks = {}) {
+    if (this.status !== 'idle') {
+      throw new Error(`StreamWorker ${this.workerId}: can't assign exhibition in status=${this.status}`);
+    }
+    this.status = 'running';
+    this.exhibitionId = exhibitionId;
+    this.lastError = null;
+    const ctx = { logPath: this.logPath, display: this.display };
+
+    this.runPromise = (async () => {
+      try {
+        callbacks.onStart?.(exhibitionId);
+        const r = await runExhibition(db, exhibitionId, ctx);
+        callbacks.onEnd?.(exhibitionId, r);
+        return r;
+      } catch (err) {
+        this.lastError = err.message;
+        console.error(`[worker ${this.workerId}] exhibition ${exhibitionId} failed: ${err.message}`);
+        callbacks.onError?.(exhibitionId, err);
+        return { ok: false };
+      }
+    })().finally(() => {
+      this.exhibitionId = null;
+      this.runPromise = null;
+      if (this.status === 'running') this.status = 'idle';
+    });
+
+    return this.runPromise;
+  }
+
   stop() {
     if (this.status === 'stopped') return;
     this.status = 'stopped';
@@ -216,11 +273,13 @@ export class StreamWorker {
   describe() {
     return {
       workerId: this.workerId,
+      kind: this.kind,
       display: this.display,
       status: this.status,
       leagueId: this.leagueId,
       divisionId: this.divisionId,
       currentFixtureId: this.currentFixtureId,
+      exhibitionId: this.exhibitionId,
       clients: this.clients.size,
       lastError: this.lastError,
       startedAt: this.startedAt,

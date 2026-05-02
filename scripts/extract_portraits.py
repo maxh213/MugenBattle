@@ -383,6 +383,8 @@ def find_sff_for_char(char_dir: Path):
             k, v = line.split('=', 1)
             if k.strip().lower() == 'sprite':
                 sff_rel = v.strip().strip('"')
+                # Many MUGEN .defs use Windows backslashes (e.g. files\Foo.sff).
+                sff_rel = sff_rel.replace('\\', '/')
                 sff_path = char_dir / sff_rel
                 if sff_path.exists():
                     return sff_path
@@ -398,6 +400,11 @@ def extract_one(char_dir: Path, force=False):
     out = char_dir / PORTRAIT_FILE
     if out.exists() and not force:
         return 'skipped'
+    # A `portrait.manual` sentinel file marks portraits that were placed by
+    # hand (e.g. KFM's headshot) and should never be overwritten by the
+    # SFF auto-extractor — even with --force.
+    if (char_dir / 'portrait.manual').exists():
+        return 'skipped_manual'
     sff = find_sff_for_char(char_dir)
     if sff is None:
         return 'no_sff'

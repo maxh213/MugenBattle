@@ -136,7 +136,13 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
     const ERROR_RX = /panic:|runtime error:|fatal error:|I\.K\.E\.M\.E\.N Error/;
 
     const child = execFile(cmd, args, {
-      timeout: 120_000,
+      // A best-of-3 match with stock 99s rounds + intro/load/result screens
+      // runs ~3-5 min on a fast machine; under bwrap + Xvfb + llvmpipe with
+      // three concurrent workers contending for CPU it can stretch to
+      // 7-9 min, especially on stages with heavy animated backgrounds.
+      // 600s gives the long tail of legitimate matches a chance to finish
+      // before SIGKILL — anything slower is genuinely stuck.
+      timeout: 600_000,
       killSignal: 'SIGKILL',
       env,
     }, (error, stdout, stderr) => {
@@ -146,7 +152,17 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
         // char's dir. Ikemen's Lua modal error gets logged but NOT written
         // to stderr, so err.message alone wouldn't identify the char.
         try { error.matchLog = readFileSync(logPath, 'utf-8'); } catch { error.matchLog = ''; }
-        if (error.matchLog) error.message = `${error.message}\n${error.matchLog.slice(-2000)}`;
+        // Stderr captures Go panics (`panic: open ... read-only` etc) that
+        // never reach matchData.log. Surface them in the error message so
+        // operators can see why a class of matches is failing without
+        // sifting through the bwrap output by hand.
+        const stderrTail = (stderr || stderrBuf || '').slice(-1500);
+        const stdoutTail = (stdout || '').slice(-1500);
+        const extras = [];
+        if (stderrTail.trim()) extras.push(`stderr:\n${stderrTail}`);
+        if (!error.matchLog && stdoutTail.trim()) extras.push(`stdout:\n${stdoutTail}`);
+        if (error.matchLog) extras.push(`log:\n${error.matchLog.slice(-2000)}`);
+        if (extras.length) error.message = `${error.message}\n${extras.join('\n')}`;
         reject(error);
       } else {
         resolve(stdout);
@@ -189,7 +205,8 @@ function launchEngine(fighter1, fighter2, stage, p1Life, p2Life, ctx) {
  * `winner` is the value returned by parsers: 'fighter1' | 'fighter2' | 'draw'.
  * Master counters are bumped too so market pricing reflects lifetime record.
  */
-export function applyMatchOutcome(db, homeOwnedFighterId, awayOwnedFighterId, winner) {
+export function applyMatchOutcome(db, homeOwnedFighterId, awayOwnedFighterId, winner, opts = {}) {
+  const { affectStamina = true } = opts;
   const home = db.prepare('SELECT team_id, master_fighter_id FROM owned_fighter WHERE id = ?').get(homeOwnedFighterId);
   const away = db.prepare('SELECT team_id, master_fighter_id FROM owned_fighter WHERE id = ?').get(awayOwnedFighterId);
   if (!home || !away) return;
@@ -212,10 +229,12 @@ export function applyMatchOutcome(db, homeOwnedFighterId, awayOwnedFighterId, wi
       bumpOwnedD.run(homeOwnedFighterId); bumpMasterD.run(home.master_fighter_id);
       bumpOwnedD.run(awayOwnedFighterId); bumpMasterD.run(away.master_fighter_id);
     }
-    applyMatchCost(db, homeOwnedFighterId);
-    applyMatchCost(db, awayOwnedFighterId);
-    applyTeamRest(db, home.team_id, homeOwnedFighterId);
-    applyTeamRest(db, away.team_id, awayOwnedFighterId);
+    if (affectStamina) {
+      applyMatchCost(db, homeOwnedFighterId);
+      applyMatchCost(db, awayOwnedFighterId);
+      applyTeamRest(db, home.team_id, homeOwnedFighterId);
+      applyTeamRest(db, away.team_id, awayOwnedFighterId);
+    }
   });
   tx();
 }
@@ -234,6 +253,10 @@ export async function runOwnedFighterMatch({
   awayOwnedFighterId,
   stageFileName,
   ctx,
+  // When false (exhibition mode): both fighters get full life regardless of
+  // current stamina, and W/L/D records bump WITHOUT applying stamina cost or
+  // teammate rest. Default true keeps league fixtures unchanged.
+  affectStamina = true,
 }) {
   const home = db.prepare('SELECT * FROM owned_fighter WHERE id = ?').get(homeOwnedFighterId);
   const away = db.prepare('SELECT * FROM owned_fighter WHERE id = ?').get(awayOwnedFighterId);
@@ -241,8 +264,8 @@ export async function runOwnedFighterMatch({
 
   const homeStam = readEffectiveStamina(db, homeOwnedFighterId);
   const awayStam = readEffectiveStamina(db, awayOwnedFighterId);
-  const homeLife = staminaToLife(homeStam);
-  const awayLife = staminaToLife(awayStam);
+  const homeLife = affectStamina ? staminaToLife(homeStam) : staminaToLife(1.0);
+  const awayLife = affectStamina ? staminaToLife(awayStam) : staminaToLife(1.0);
 
   let result;
   if (FAKE_MODE) {
@@ -268,7 +291,7 @@ export async function runOwnedFighterMatch({
     }
   }
 
-  applyMatchOutcome(db, homeOwnedFighterId, awayOwnedFighterId, result.winner);
+  applyMatchOutcome(db, homeOwnedFighterId, awayOwnedFighterId, result.winner, { affectStamina });
 
   return {
     ...result,

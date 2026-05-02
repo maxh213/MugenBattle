@@ -8,6 +8,7 @@
  */
 
 import { drawStarterMasters, getKfmId } from './market.js';
+import { topUpRoster } from './teams.js';
 
 const BOT_EMAIL_DOMAIN = 'system.local';
 const STARTER_UNCLAIMED_COUNT = 4;
@@ -69,19 +70,25 @@ export function seedBots(db, total) {
       idx++;
     }
 
-    // Refill any existing bot whose roster is short (fewer than 5 active
-    // non-retired fighters). Happens after retireAllBotRosters.
-    const shorts = db.prepare(`
-      SELECT t.id FROM team t
-      JOIN user_account u ON t.user_id = u.id
-      WHERE u.is_bot = 1
-        AND (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id AND is_retired = 0 AND slot = 'active') < 5
-    `).all();
-    for (const { id: teamId } of shorts) {
-      insertStarterRoster(db, teamId);
-    }
   });
   tx();
+
+  // Refill any existing bot whose roster is short (fewer than 5 active
+  // non-retired fighters). Use topUpRoster — it only adds enough fighters
+  // to reach 5, instead of always inserting 5 more like insertStarterRoster
+  // did. The previous version compounded badly under repeated seedBots
+  // calls during a season-transition storm: a team briefly down to 4 active
+  // gained 5 fresh fighters → 9 active → next call still saw it short or
+  // the next-next call did, ballooning bots to 17 active.
+  const shorts = db.prepare(`
+    SELECT t.id FROM team t
+    JOIN user_account u ON t.user_id = u.id
+    WHERE u.is_bot = 1
+      AND (SELECT COUNT(*) FROM owned_fighter WHERE team_id = t.id AND is_retired = 0 AND slot = 'active') < 5
+  `).all();
+  for (const { id: teamId } of shorts) {
+    topUpRoster(db, teamId);
+  }
 
   return db.prepare(`
     SELECT u.id AS user_id, u.username, t.id AS team_id

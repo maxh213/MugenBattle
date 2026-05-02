@@ -43,9 +43,9 @@ const PROJECT_ROOT = resolve(__dirname, '..');
 const CHARS_DIR = join(PROJECT_ROOT, 'engine', 'chars');
 const TMP_ROOT = '/tmp';
 
-const MAX_ZIP_BYTES = 100 * 1024 * 1024;      // upload size cap (compressed)
-const MAX_EXTRACTED_BYTES = 200 * 1024 * 1024; // zip-bomb cap (uncompressed, total)
-const MAX_FILE_BYTES = 50 * 1024 * 1024;       // per-file cap
+const MAX_ZIP_BYTES = 250 * 1024 * 1024;      // upload size cap (compressed) — HD char packs (e.g. HDBZ Z2 chars) clear 100MB easily
+const MAX_EXTRACTED_BYTES = 500 * 1024 * 1024; // zip-bomb cap (uncompressed, total)
+const MAX_FILE_BYTES = 128 * 1024 * 1024;      // per-file cap (HDBZ Z2 .snd files can hit 100MB+)
 const SANDBOX_DISPLAY_BASE = 300;
 const SANDBOX_LOG_MAX_CHARS = 8_000;
 

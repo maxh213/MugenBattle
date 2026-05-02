@@ -15,7 +15,9 @@ import {
   readEffectiveStamina,
   LOW_STAMINA_ROTATION_THRESHOLD,
 } from './stamina.js';
-import { drawStarterMasters, getKfmId } from './market.js';
+import { drawStarterMasters, listUnclaimedOldest, getKfmId } from './market.js';
+
+const FULL_ACTIVE_ROSTER = 5;
 
 const STARTER_UNCLAIMED_COUNT = 4;
 const STARTER_TOTAL = 5;
@@ -87,9 +89,15 @@ export function setLineup(db, teamId, body) {
   const active = Array.isArray(body.active) ? body.active.map(Number) : [];
   const bench = Array.isArray(body.bench) ? body.bench.map(Number) : [];
   const priority = body.priority && typeof body.priority === 'object' ? body.priority : {};
-  const autoRotate = body.auto_rotate ? 1 : 0;
-  const rotateOnStamina = body.rotate_on_stamina ? 1 : 0;
-  const rotateOnLosses = body.rotate_on_losses ? 1 : 0;
+  // All rotation fields are conditional: `undefined` means the caller isn't
+  // touching that field, so we leave the existing column value alone. The
+  // /lineup PUT is shared between the rotation-rules form (sends everything)
+  // and lineup edits like drag-reorder (sends only what changed). Earlier we
+  // had `body.rotate_on_stamina ? 1 : 0`, which silently wiped the flag any
+  // time a lineup edit didn't include it.
+  const autoRotate     = body.auto_rotate        === undefined ? null : (body.auto_rotate ? 1 : 0);
+  const rotateOnStamina = body.rotate_on_stamina === undefined ? null : (body.rotate_on_stamina ? 1 : 0);
+  const rotateOnLosses  = body.rotate_on_losses  === undefined ? null : (body.rotate_on_losses ? 1 : 0);
   let rotationThreshold = body.rotation_threshold;
   if (rotationThreshold != null) {
     rotationThreshold = Number(rotationThreshold);
@@ -130,12 +138,17 @@ export function setLineup(db, teamId, body) {
   }
 
   const tx = db.transaction(() => {
-    const cols = ['auto_rotate = ?', 'rotate_on_stamina = ?', 'rotate_on_losses = ?'];
-    const args = [autoRotate, rotateOnStamina, rotateOnLosses];
-    if (rotationThreshold != null) { cols.push('rotation_threshold = ?'); args.push(rotationThreshold); }
-    if (rotationLossStreak != null) { cols.push('rotation_loss_streak = ?'); args.push(rotationLossStreak); }
-    args.push(teamId);
-    db.prepare(`UPDATE team SET ${cols.join(', ')} WHERE id = ?`).run(...args);
+    const cols = [];
+    const args = [];
+    if (autoRotate != null)        { cols.push('auto_rotate = ?');         args.push(autoRotate); }
+    if (rotateOnStamina != null)   { cols.push('rotate_on_stamina = ?');   args.push(rotateOnStamina); }
+    if (rotateOnLosses != null)    { cols.push('rotate_on_losses = ?');    args.push(rotateOnLosses); }
+    if (rotationThreshold != null) { cols.push('rotation_threshold = ?');  args.push(rotationThreshold); }
+    if (rotationLossStreak != null){ cols.push('rotation_loss_streak = ?');args.push(rotationLossStreak); }
+    if (cols.length) {
+      args.push(teamId);
+      db.prepare(`UPDATE team SET ${cols.join(', ')} WHERE id = ?`).run(...args);
+    }
     const setActive = db.prepare(
       "UPDATE owned_fighter SET slot = 'active', priority = ? WHERE id = ? AND team_id = ?"
     );
@@ -172,13 +185,27 @@ export function setLineup(db, teamId, body) {
  */
 export function pickActiveFighter(db, teamId) {
   const team = db.prepare(
-    'SELECT auto_rotate, rotate_on_stamina, rotate_on_losses, rotation_threshold, rotation_loss_streak FROM team WHERE id = ?'
+    `SELECT t.auto_rotate, t.rotate_on_stamina, t.rotate_on_losses,
+            t.rotation_threshold, t.rotation_loss_streak, u.is_bot
+       FROM team t JOIN user_account u ON u.id = t.user_id
+      WHERE t.id = ?`
   ).get(teamId);
   if (!team) return null;
   const actives = db
     .prepare("SELECT * FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'active' ORDER BY priority, id")
     .all(teamId);
   if (actives.length === 0) return null;
+
+  // Bots: strict sequential rotation through the active roster. Every fighter
+  // gets equal screen time regardless of stamina or loss streak. Index is the
+  // total count of completed fixtures this team has played, mod roster size,
+  // so the cycle is deterministic and resumes correctly across restarts.
+  if (team.is_bot) {
+    const played = db.prepare(
+      "SELECT COUNT(*) AS n FROM fixture WHERE (home_team_id = ? OR away_team_id = ?) AND status = 'complete'"
+    ).get(teamId, teamId).n;
+    return actives[played % actives.length];
+  }
 
   const autoOn = !!team.auto_rotate;
   const stamOn = autoOn && !!team.rotate_on_stamina;
@@ -206,6 +233,86 @@ export function teamCanPlay(db, teamId) {
     "SELECT COUNT(*) AS n FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'active'"
   ).get(teamId);
   return n >= 1;
+}
+
+/**
+ * If the team's active roster has fallen below FULL_ACTIVE_ROSTER (5), top
+ * it up from the oldest unclaimed masters in the pool. Falls back to KFM
+ * if the pool is empty so the team always reaches 5 active.
+ *
+ * Why oldest first: the user wants predictable draining of the unclaimed
+ * pool, not random. Old masters have been sitting unclaimed longest so
+ * they're the right candidates to bring back into rotation.
+ *
+ * Logs every replenish as a `team_notice` row (kind='auto_replenish') so
+ * the next time the user visits /team they're told their team got new
+ * fighters. Returns the count added.
+ */
+export function topUpRoster(db, teamId, target = FULL_ACTIVE_ROSTER) {
+  const have = db.prepare(
+    "SELECT COUNT(*) AS n FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'active'"
+  ).get(teamId).n;
+  const need = target - have;
+  if (need <= 0) return { added: 0, fighters: [] };
+
+  const masters = listUnclaimedOldest(db, { limit: need });
+  const kfmId = getKfmId(db);
+  const kfmRow = db.prepare('SELECT id, file_name, display_name FROM fighter WHERE id = ?').get(kfmId);
+  while (masters.length < need) masters.push(kfmRow);
+
+  const insertFighter = db.prepare(
+    "INSERT INTO owned_fighter (team_id, master_fighter_id, display_name, slot, priority) VALUES (?, ?, ?, 'active', ?)"
+  );
+  const insertHistory = db.prepare(
+    "INSERT INTO owned_fighter_team_history (owned_fighter_id, team_id, reason) VALUES (?, ?, ?)"
+  );
+  const insertNotice = db.prepare(
+    "INSERT INTO team_notice (team_id, kind, body) VALUES (?, 'auto_replenish', ?)"
+  );
+
+  const tx = db.transaction(() => {
+    const maxPrio = db.prepare(
+      "SELECT COALESCE(MAX(priority), -1) AS p FROM owned_fighter WHERE team_id = ? AND slot = 'active'"
+    ).get(teamId).p;
+    const added = [];
+    let prio = maxPrio + 1;
+    for (const m of masters) {
+      const isKfm = m.id === kfmId;
+      const name = isKfm ? 'Training Dummy' : (m.display_name || m.file_name);
+      const fId = insertFighter.run(teamId, m.id, name, prio++).lastInsertRowid;
+      insertHistory.run(fId, teamId, 'auto_replenish');
+      added.push({
+        owned_fighter_id: fId,
+        display_name: name,
+        master_file_name: m.file_name,
+        master_display_name: m.display_name,
+      });
+    }
+    insertNotice.run(teamId, JSON.stringify({ added }));
+    return added;
+  });
+  const added = tx();
+  return { added: added.length, fighters: added };
+}
+
+/**
+ * Pending team_notice rows for the user's team. Returned by /api/me/team
+ * so the frontend can show a banner explaining auto-replenish events.
+ */
+export function listOpenNotices(db, teamId) {
+  return db.prepare(
+    "SELECT id, kind, body, created_at FROM team_notice WHERE team_id = ? AND dismissed_at IS NULL ORDER BY id DESC"
+  ).all(teamId).map((n) => ({
+    ...n,
+    body: n.body ? JSON.parse(n.body) : null,
+  }));
+}
+
+export function dismissNotice(db, teamId, noticeId) {
+  const r = db.prepare(
+    "UPDATE team_notice SET dismissed_at = datetime('now') WHERE id = ? AND team_id = ? AND dismissed_at IS NULL"
+  ).run(noticeId, teamId);
+  return { ok: r.changes > 0 };
 }
 
 export function getTeamById(db, teamId) {

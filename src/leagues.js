@@ -16,7 +16,7 @@
  * touching standings.
  */
 
-import { pickActiveFighter, teamCanPlay } from './teams.js';
+import { pickActiveFighter, teamCanPlay, topUpRoster } from './teams.js';
 import { runOwnedFighterMatch, applyMatchOutcome, parseIkemenResult } from './match.js';
 import { credit } from './wallet.js';
 import { seedBots } from './bots.js';
@@ -269,6 +269,13 @@ export async function runFixture(db, fixtureId, ctx) {
     throw new Error(`Fixture ${fixtureId} is ${fixture.status}, not pending`);
   }
 
+  // Auto-replenish before the can-play check: a team that lost all its
+  // unique masters (deactivation cascade, retirements, etc.) gets fresh
+  // fighters from the oldest unclaimed pool so it stops auto-forfeiting
+  // every fixture. Falls back to KFM if the pool is dry.
+  topUpRoster(db, fixture.home_team_id);
+  topUpRoster(db, fixture.away_team_id);
+
   // Either team without a playable active roster forfeits the fixture.
   const homeCanPlay = teamCanPlay(db, fixture.home_team_id);
   const awayCanPlay = teamCanPlay(db, fixture.away_team_id);
@@ -315,7 +322,15 @@ export async function runFixture(db, fixtureId, ctx) {
       ctx: { ...(ctx || {}), rounds: BEST_OF_ROUNDS },
     });
   } catch (err) {
-    console.error(`[fixture ${fixture.id}] match error: ${err.message.split('\n')[0]}`);
+    // Log the first line + the most interesting follow-up lines (panic /
+    // read-only / missing-file etc) so a class of failures is diagnosable
+    // from the server log without grepping the full match output.
+    const lines = (err.message || '').split('\n');
+    const interesting = lines.slice(1).filter((l) =>
+      /panic|fatal|error|read-only|cannot|no such file/i.test(l)
+    ).slice(0, 3).map((l) => l.trim()).filter(Boolean);
+    const detail = interesting.length ? ' :: ' + interesting.join(' | ') : '';
+    console.error(`[fixture ${fixture.id}] match error: ${lines[0]}${detail}`);
     // Ikemen frequently exits with a non-zero status even after a clean AI
     // vs AI match (post-match teardown panics, bwrap kills at shutdown, etc).
     // The match log still holds [p1wins]/[p2wins], so parse it first — only
@@ -329,9 +344,22 @@ export async function runFixture(db, fixtureId, ctx) {
       r = parsed;
     } else {
       r = { winner: 'draw', fighter1Rounds: 0, fighter2Rounds: 0 };
-      const identified = deactivateIfIdentifiable(db, err.message || '');
-      if (!identified) {
-        chargeCrashSuspects(db, home.master_fighter_id, away.master_fighter_id);
+      // Environmental failures (Xvfb died, GLFW couldn't init, OOM, no disk
+      // space, bwrap setup error) should NOT be blamed on the chars in the
+      // ring. Without this guard a single broken Xvfb cascades: every match
+      // synth-draws → both masters get +1 crash suspect → after 3 rounds of
+      // failed matches every popular master in the league is deactivated
+      // and replaced with KFM. We hit that exact storm once already.
+      const errMsg = err.message || '';
+      const looksEnvironmental =
+        /Failed to open display|GLFW|X11:|panic: NotInitialized|read-only file system|Ikemen\.log|no space left|Cannot allocate/i.test(errMsg);
+      if (looksEnvironmental) {
+        console.error(`[fixture ${fixture.id}] environmental error — not charging char crash suspects: ${errMsg.split('\\n')[0].slice(0, 200)}`);
+      } else {
+        const identified = deactivateIfIdentifiable(db, errMsg);
+        if (!identified) {
+          chargeCrashSuspects(db, home.master_fighter_id, away.master_fighter_id);
+        }
       }
     }
     // runOwnedFighterMatch threw before it could persist stats + stamina;
@@ -768,17 +796,40 @@ export function autoCreateSeason(db, {
   const waitingReal = newRealTeams.length;
 
   const gaps = divisions.reduce((sum, d) => sum + (perDiv - d.teamIds.length), 0);
-  // Seed enough bots that AFTER excluding prev-season-dropped bots we still
-  // have `gaps` available. currentBotCount + gaps guarantees `gaps` fresh
-  // additions; existing-eligible bots make it spare.
+  // Seed enough bots that we have `gaps` ELIGIBLE bots available — i.e. orphan
+  // bots not already excluded. Earlier code added gaps to currentBotCount
+  // unconditionally, which doubled the bot population every fresh season.
+  // Now we top-up only when there aren't enough eligible bots already.
   const currentBotCount = db.prepare('SELECT COUNT(*) AS n FROM user_account WHERE is_bot = 1').get().n;
-  const allBots = seedBots(db, currentBotCount + Math.max(1, gaps));
-  const botIdsReady = allBots
-    .filter((b) => {
-      const t = db.prepare('SELECT current_league_id FROM team WHERE id = ?').get(b.team_id);
-      return t.current_league_id == null && !excluded.has(b.team_id);
-    })
-    .map((b) => b.team_id);
+  const eligibleBotCount = db.prepare(`
+    SELECT COUNT(*) AS n FROM team t
+    JOIN user_account u ON u.id = t.user_id
+    WHERE u.is_bot = 1 AND t.current_league_id IS NULL
+      AND (SELECT COUNT(*) FROM owned_fighter o
+           WHERE o.team_id = t.id AND o.is_retired = 0 AND o.slot = 'active') >= 5
+  `).get().n;
+  const needToCreate = Math.max(0, gaps - eligibleBotCount + 1); // +1 for buffer
+  if (needToCreate > 0) seedBots(db, currentBotCount + needToCreate);
+
+  // Pick orphan bots in this priority order:
+  //   1. never-played bots first (so freshly-introduced bots like a hand-curated
+  //      sailor_bot don't sit in the queue forever behind cycling old-timers)
+  //   2. newest user_id first within each group (recently added beats stale)
+  // Also requires a full 5-active roster so we don't seat a half-empty team.
+  const botIdsReady = db.prepare(`
+    SELECT t.id AS team_id
+    FROM team t
+    JOIN user_account u ON u.id = t.user_id
+    WHERE u.is_bot = 1
+      AND t.current_league_id IS NULL
+      AND (SELECT COUNT(*) FROM owned_fighter o
+           WHERE o.team_id = t.id AND o.is_retired = 0 AND o.slot = 'active') >= 5
+    ORDER BY
+      CASE WHEN EXISTS (
+        SELECT 1 FROM fixture f WHERE f.home_team_id = t.id OR f.away_team_id = t.id
+      ) THEN 1 ELSE 0 END,
+      u.id DESC
+  `).all().map((r) => r.team_id).filter((id) => !excluded.has(id));
 
   let botIdx = 0;
   for (const d of divisions) {
@@ -895,6 +946,14 @@ export function getLiveTierView(db, tier) {
   ).get();
   if (!leagueRow) return null;
 
+  // How many tiers this league has — the live page uses it to render the
+  // right number of "League N" tabs. Without this the front-end falls back
+  // to a hard-coded 3, which hid divisions 4..7 when we scaled up.
+  const divCount = db.prepare(
+    'SELECT COUNT(*) AS n FROM division WHERE league_id = ?'
+  ).get(leagueRow.id).n;
+  leagueRow.division_count = divCount;
+
   const division = db.prepare(
     'SELECT * FROM division WHERE league_id = ? AND tier = ? LIMIT 1'
   ).get(leagueRow.id, tier);
@@ -905,7 +964,9 @@ export function getLiveTierView(db, tier) {
     return db.prepare(`
       SELECT of.id, of.display_name, of.matches_won, of.matches_lost, of.matches_drawn,
         of.stamina, of.stamina_updated_at,
-        f.file_name AS master_file_name, f.display_name AS master_display_name
+        f.id AS master_fighter_id,
+        f.file_name AS master_file_name, f.display_name AS master_display_name,
+        f.author AS master_author
       FROM owned_fighter of
       JOIN fighter f ON of.master_fighter_id = f.id
       WHERE of.id = ?
@@ -919,7 +980,7 @@ export function getLiveTierView(db, tier) {
       f.home_score AS home_rounds, f.away_score AS away_rounds,
       h.name AS home_team_name, a.name AS away_team_name,
       hu.username AS home_username, au.username AS away_username,
-      s.display_name AS stage_display, s.file_name AS stage_file,
+      s.display_name AS stage_display, s.file_name AS stage_file, s.author AS stage_author,
       fm.home_owned_fighter_id, fm.away_owned_fighter_id,
       fm.home_rounds AS round_home, fm.away_rounds AS round_away
     FROM fixture f
@@ -937,6 +998,7 @@ export function getLiveTierView(db, tier) {
     fixture_id: running.id,
     round: running.round_num,
     stage: running.stage_display || running.stage_file || null,
+    stage_author: running.stage_author || null,
     home_rounds: running.round_home ?? 0,
     away_rounds: running.round_away ?? 0,
     home: {
@@ -955,7 +1017,8 @@ export function getLiveTierView(db, tier) {
 
   // Next 5 pending fixtures.
   const upcoming = db.prepare(`
-    SELECT f.id, f.round_num, h.name AS home_team_name, a.name AS away_team_name
+    SELECT f.id, f.round_num, f.home_team_id, f.away_team_id,
+      h.name AS home_team_name, a.name AS away_team_name
     FROM fixture f
     JOIN team h ON f.home_team_id = h.id
     JOIN team a ON f.away_team_id = a.id
@@ -968,6 +1031,7 @@ export function getLiveTierView(db, tier) {
   const recent = db.prepare(`
     SELECT f.id, f.round_num, f.home_score AS home_rounds, f.away_score AS away_rounds,
       f.winner_team_id, f.finished_at,
+      f.home_team_id, f.away_team_id,
       h.name AS home_team_name, a.name AS away_team_name,
       oh.display_name AS home_fighter, oa.display_name AS away_fighter
     FROM fixture f
@@ -995,6 +1059,75 @@ export function getLiveTierView(db, tier) {
              t.name ASC
   `).all(division.id);
 
+  // Head-to-head, two flavours:
+  //   - team_h2h: prior completed fixtures between the two TEAMS in the ring
+  //     (regardless of which fighters they fielded). Same answer regardless of
+  //     who's currently on the bench.
+  //   - fighter_h2h: prior matches between the two MASTER FIGHTERS currently
+  //     on the screen (regardless of the team that owned them). Across all
+  //     leagues, all owners. "Has my Ryu ever beaten this Sagat before?"
+  let teamH2H = [];
+  let fighterH2H = [];
+  if (running) {
+    teamH2H = db.prepare(`
+      SELECT f.id, f.round_num, f.home_team_id, f.away_team_id,
+        f.home_score AS home_rounds, f.away_score AS away_rounds,
+        f.winner_team_id, f.finished_at,
+        d.tier, d.league_id,
+        oh.display_name AS home_fighter, oa.display_name AS away_fighter,
+        fmh.file_name AS home_master_file, fma.file_name AS away_master_file
+      FROM fixture f
+      JOIN division d ON d.id = f.division_id
+      LEFT JOIN fixture_match fm ON fm.fixture_id = f.id AND fm.slot = 1
+      LEFT JOIN owned_fighter oh ON oh.id = fm.home_owned_fighter_id
+      LEFT JOIN owned_fighter oa ON oa.id = fm.away_owned_fighter_id
+      LEFT JOIN fighter fmh ON fmh.id = oh.master_fighter_id
+      LEFT JOIN fighter fma ON fma.id = oa.master_fighter_id
+      WHERE f.status = 'complete'
+        AND f.id != ?
+        AND ((f.home_team_id = ? AND f.away_team_id = ?)
+          OR (f.home_team_id = ? AND f.away_team_id = ?))
+      ORDER BY f.finished_at DESC, f.id DESC
+      LIMIT 5
+    `).all(
+      running.id,
+      running.home_team_id, running.away_team_id,
+      running.away_team_id, running.home_team_id,
+    );
+
+    const homeMasterId = current?.home?.fighter?.master_fighter_id ?? null;
+    const awayMasterId = current?.away?.fighter?.master_fighter_id ?? null;
+    if (homeMasterId && awayMasterId && homeMasterId !== awayMasterId) {
+      fighterH2H = db.prepare(`
+        SELECT f.id AS fixture_id, f.round_num, f.finished_at,
+          d.tier, d.league_id,
+          fm.home_rounds, fm.away_rounds,
+          oh.master_fighter_id AS home_master_id,
+          oa.master_fighter_id AS away_master_id,
+          oh.display_name AS home_fighter, oa.display_name AS away_fighter,
+          th.name AS home_team_name, ta.name AS away_team_name,
+          th.id AS home_team_id, ta.id AS away_team_id
+        FROM fixture_match fm
+        JOIN owned_fighter oh ON oh.id = fm.home_owned_fighter_id
+        JOIN owned_fighter oa ON oa.id = fm.away_owned_fighter_id
+        JOIN fixture f ON f.id = fm.fixture_id
+        JOIN division d ON d.id = f.division_id
+        JOIN team th ON th.id = f.home_team_id
+        JOIN team ta ON ta.id = f.away_team_id
+        WHERE f.status = 'complete'
+          AND f.id != ?
+          AND ((oh.master_fighter_id = ? AND oa.master_fighter_id = ?)
+            OR (oh.master_fighter_id = ? AND oa.master_fighter_id = ?))
+        ORDER BY f.finished_at DESC, f.id DESC
+        LIMIT 5
+      `).all(
+        running.id,
+        homeMasterId, awayMasterId,
+        awayMasterId, homeMasterId,
+      );
+    }
+  }
+
   return {
     league: leagueRow,
     division: { tier: division.tier, name: division.name, id: division.id },
@@ -1002,6 +1135,8 @@ export function getLiveTierView(db, tier) {
     upcoming,
     recent,
     standings,
+    team_h2h: teamH2H,
+    fighter_h2h: fighterH2H,
   };
 }
 

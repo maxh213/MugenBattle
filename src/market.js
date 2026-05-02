@@ -54,6 +54,26 @@ export function listUnclaimed(db, { winsMax = null, limit = null } = {}) {
 }
 
 /**
+ * Like listUnclaimed but ordered deterministically by age (oldest fighter
+ * row first). Used for auto-replenish: when a team falls below its full
+ * roster, we hand them the oldest unclaimed masters so the pool drains
+ * predictably instead of randomly.
+ */
+export function listUnclaimedOldest(db, { limit = null } = {}) {
+  let sql = `
+    SELECT f.* FROM fighter f
+    WHERE f.is_master = 1 AND f.active = 1 AND f.is_unique = 1
+      AND NOT EXISTS (
+        SELECT 1 FROM owned_fighter of
+        WHERE of.master_fighter_id = f.id AND of.is_retired = 0
+      )
+    ORDER BY f.created_at ASC, f.id ASC
+  `;
+  if (limit != null) sql += ` LIMIT ${Number(limit)}`;
+  return db.prepare(sql).all();
+}
+
+/**
  * Pick `count` masters for a starter team. Tries 0-win unclaimed first; if
  * fewer than `count` exist, pads the remainder with KFM (which is always
  * returned as the plain master row — caller decides how to duplicate it).
@@ -72,9 +92,10 @@ export function drawStarterMasters(db, count) {
 /**
  * Market listing view: unclaimed unique masters with their current price.
  */
-export function marketListings(db, { limit = 100 } = {}) {
+export function marketListings(db, { limit = null } = {}) {
   const rows = listUnclaimed(db);
-  return rows.slice(0, limit).map((f) => ({
+  const sliced = limit == null ? rows : rows.slice(0, limit);
+  return sliced.map((f) => ({
     id: f.id,
     file_name: f.file_name,
     display_name: f.display_name,
@@ -82,6 +103,7 @@ export function marketListings(db, { limit = 100 } = {}) {
     matches_won: f.matches_won,
     matches_lost: f.matches_lost,
     matches_drawn: f.matches_drawn,
+    created_at: f.created_at,
     price_cents: priceFor(f),
   }));
 }
@@ -462,6 +484,10 @@ export function releaseOwnedFighter(db, userId, ownedFighterId) {
     db.prepare(
       'UPDATE owned_fighter SET is_retired = 1, slot = \'bench\', listing_price_cents = NULL WHERE id = ?'
     ).run(ownedFighterId);
+    // Surface the release in the trades feed. delta=0 because no money moved;
+    // the trades query keys off the 'release' reason and the ref_id points
+    // back to the owned_fighter row whose master is now unclaimed.
+    credit(db, userId, 0, 'release', ownedFighterId);
     return { ok: true };
   });
   return tx();

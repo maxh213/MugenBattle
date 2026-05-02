@@ -10,7 +10,7 @@
  * crashes we've seen.
  */
 
-import { readFileSync, existsSync, statSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, statSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -44,14 +44,21 @@ function parseDefFiles(defText) {
 
 function fileExistsInCharDir(charDir, relPath) {
   if (!relPath) return true;
-  const full = join(charDir, relPath);
+  // MUGEN .def files use Windows-style backslashes (e.g. `cmd = files\Foo.mfg`).
+  // Normalize to forward slashes so path.join resolves into subdirs on Linux.
+  const norm = relPath.replace(/\\/g, '/');
+  const full = join(charDir, norm);
   if (existsSync(full)) return true;
-  // MUGEN chars often reference files case-insensitively; try a case-insensitive lookup
+  // Case-insensitive walk: each path segment matched against the actual dir entries.
   try {
-    const dir = dirname(full);
-    const base = relPath.split('/').pop().toLowerCase();
-    const { readdirSync } = require('fs');
-    return readdirSync(dir).some((f) => f.toLowerCase() === base);
+    let cur = charDir;
+    for (const seg of norm.split('/').filter(Boolean)) {
+      const want = seg.toLowerCase();
+      const hit = readdirSync(cur).find((f) => f.toLowerCase() === want);
+      if (!hit) return false;
+      cur = join(cur, hit);
+    }
+    return existsSync(cur);
   } catch {
     return false;
   }
@@ -110,7 +117,7 @@ export function validateFighter(fileName) {
   // Check the CMD file for the malformed-VarSet pattern
   const cmdRef = files.cmd;
   try {
-    const cmdText = readFileSync(join(charDir, cmdRef), 'utf-8');
+    const cmdText = readFileSync(join(charDir, cmdRef.replace(/\\/g, '/')), 'utf-8');
     if (hasMalformedVarSet(cmdText)) return { ok: false, reason: 'malformed_varset' };
     if (cmdText.length < 100) return { ok: false, reason: 'cmd_too_small' };
   } catch {

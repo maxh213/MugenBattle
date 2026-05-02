@@ -2,6 +2,7 @@
 
 import { program } from 'commander';
 import { resolve } from 'path';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import {
   addFighter,
   addStage,
@@ -709,6 +710,55 @@ market
       console.log(`${String(r.id).padStart(5)} ${fname.padEnd(26)} ${display.padEnd(24)} ${author.padEnd(16)} ${String(r.matches_won).padStart(5)} ${String(r.price_cents).padStart(7)}`);
     }
     console.log(`\nShowing ${rows.length} of unlimited.  (Total unclaimed available in DB shows above.)`);
+  });
+
+// --- Rename a master (admin) ---
+
+program
+  .command('rename-master <file_name> <new_name>')
+  .description('Rename a master fighter: updates DB display_name, propagates to default-named owned clones, and rewrites name="..." / displayname="..." in the master .def file (so the in-game banner above the lifebar updates too).')
+  .action((file_name, new_name) => {
+    const db = getDb();
+    const master = db.prepare(
+      'SELECT id, file_name, display_name FROM fighter WHERE file_name = ? AND is_master = 1'
+    ).get(file_name);
+    if (!master) { console.error(`No master with file_name "${file_name}".`); process.exit(1); }
+
+    const oldDisplay = master.display_name;
+    console.log(`Master #${master.id} ${master.file_name}`);
+    console.log(`  display_name: ${oldDisplay} → ${new_name}`);
+
+    // 1. Update master row
+    db.prepare('UPDATE fighter SET display_name = ? WHERE id = ?').run(new_name, master.id);
+
+    // 2. Update clones whose display_name still matches the old master name —
+    // i.e. ones the user hasn't custom-renamed. Hand-renamed clones are
+    // left alone since their owner picked that name on purpose.
+    const cloneUpdate = db.prepare(
+      'UPDATE owned_fighter SET display_name = ? WHERE master_fighter_id = ? AND display_name = ?'
+    ).run(new_name, master.id, oldDisplay);
+    console.log(`  clones renamed (default-named only): ${cloneUpdate.changes}`);
+
+    // 3. Patch the .def file so Ikemen's in-game banner shows the new name.
+    const defPath = resolve(process.cwd(), 'engine', 'chars', file_name, `${file_name}.def`);
+    if (!existsSync(defPath)) {
+      console.warn(`  .def not found at ${defPath} — DB updated but in-game name may be stale.`);
+      return;
+    }
+    const original = readFileSync(defPath, 'utf-8');
+    const escaped = new_name.replace(/"/g, '\\"');
+    const patched = original.replace(
+      /^(\s*(?:name|displayname)\s*=\s*)"[^"]*"(\s*(?:;.*)?)$/gim,
+      (_m, lhs, trail) => `${lhs}"${escaped}"${trail}`,
+    );
+    if (patched !== original) {
+      writeFileSync(defPath, patched);
+      console.log(`  patched ${defPath}`);
+    } else {
+      console.warn(`  .def has no name=/displayname= lines to patch.`);
+    }
+
+    console.log('Done.');
   });
 
 // --- Character import (admin/testing) ---
