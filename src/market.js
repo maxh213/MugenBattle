@@ -17,6 +17,14 @@ const KFM_FILE_NAME = 'kfm';
 const PRICE_FREE_THRESHOLD = 2;
 const PRICE_PER_WIN_CENTS = 100;
 const MAX_BENCH_SIZE = 5;
+// Per-user override hook for the bench cap. Looked up by username (not by
+// user_id) so the override survives DB rebuilds and the env-var-style
+// hardcoded list is the source of truth.
+const UNLIMITED_BENCH_USERS = new Set(['maxh94']);
+export function maxBenchSizeForUser(db, userId) {
+  const u = db.prepare('SELECT username FROM user_account WHERE id = ?').get(userId);
+  return u && UNLIMITED_BENCH_USERS.has(u.username) ? Infinity : MAX_BENCH_SIZE;
+}
 const MIN_LIST_PRICE_CENTS = 0;
 const MAX_LIST_PRICE_CENTS = 1_000_000; // $10k sanity cap
 
@@ -128,7 +136,7 @@ export function buyUnclaimedMaster(db, userId, masterId) {
     if (!team) return { error: 'no_team' };
 
     const master = db.prepare(
-      'SELECT id, file_name, display_name, matches_won FROM fighter WHERE id = ? AND is_master = 1 AND is_unique = 1 AND active = 1'
+      'SELECT id, file_name, display_name, matches_won, is_unique FROM fighter WHERE id = ? AND is_master = 1 AND is_unique = 1 AND active = 1'
     ).get(masterId);
     if (!master) return { error: 'master_not_available' };
 
@@ -140,7 +148,7 @@ export function buyUnclaimedMaster(db, userId, masterId) {
     const { n: benchCount } = db.prepare(
       "SELECT COUNT(*) AS n FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'bench'"
     ).get(team.id);
-    if (benchCount >= MAX_BENCH_SIZE) return { error: 'bench_full' };
+    if (benchCount >= maxBenchSizeForUser(db, userId)) return { error: 'bench_full' };
 
     const price = priceFor(master);
     const { balance_cents } = db.prepare('SELECT balance_cents FROM user_account WHERE id = ?').get(userId);
@@ -148,16 +156,39 @@ export function buyUnclaimedMaster(db, userId, masterId) {
       return { error: 'insufficient_balance', need: price, have: balance_cents };
     }
 
-    const ins = db.prepare(
-      "INSERT INTO owned_fighter (team_id, master_fighter_id, display_name, slot, priority) VALUES (?, ?, ?, 'bench', ?)"
-    ).run(team.id, master.id, master.display_name || master.file_name, benchCount);
-    const ownedId = ins.lastInsertRowid;
+    // For UNIQUE masters: if a previous (retired) clone exists, RESURRECT it
+    // on the new team instead of inserting a fresh row. That preserves W/L/D
+    // so a fighter's career travels with them across release-and-rebuy.
+    // For non-unique masters (currently KFM, but could be more — duplicate
+    // training dummies, generic types, etc.), always INSERT a fresh row so
+    // the same master can have many independent clones with their own stats.
+    // The `master` query above already filters is_unique = 1, so this branch
+    // only runs for uniques — the check is defensive in case that changes.
+    const retiredClone = master.is_unique === 0 ? null : db.prepare(
+      'SELECT id, matches_won, matches_lost, matches_drawn FROM owned_fighter WHERE master_fighter_id = ? AND is_retired = 1 ORDER BY id DESC LIMIT 1'
+    ).get(masterId);
+
+    let ownedId;
+    if (retiredClone) {
+      db.prepare(
+        "UPDATE owned_fighter SET team_id = ?, slot = 'bench', priority = ?, is_retired = 0, listing_price_cents = NULL, display_name = ? WHERE id = ?"
+      ).run(team.id, benchCount, master.display_name || master.file_name, retiredClone.id);
+      ownedId = retiredClone.id;
+    } else {
+      const ins = db.prepare(
+        "INSERT INTO owned_fighter (team_id, master_fighter_id, display_name, slot, priority) VALUES (?, ?, ?, 'bench', ?)"
+      ).run(team.id, master.id, master.display_name || master.file_name, benchCount);
+      ownedId = ins.lastInsertRowid;
+    }
 
     db.prepare(
       'INSERT INTO owned_fighter_team_history (owned_fighter_id, team_id, reason) VALUES (?, ?, ?)'
     ).run(ownedId, team.id, 'bought_from_market');
 
-    if (price > 0) credit(db, userId, -price, `buy_master:${master.id}`, ownedId);
+    // Always log to wallet_ledger so the trade shows up in /trades, even
+    // when the master is free (most are, under 3 wins). Earlier the credit
+    // was gated on `price > 0`, which silently hid every $0 buy.
+    credit(db, userId, -price, `buy_master:${master.id}`, ownedId);
 
     return { ok: true, owned_fighter_id: ownedId, price_cents: price };
   });
@@ -200,6 +231,11 @@ export function listForSale(db, userId, ownedFighterId, priceCents) {
     db.prepare(
       "UPDATE owned_fighter SET slot = 'for_sale', listing_price_cents = ? WHERE id = ?"
     ).run(n, ownedFighterId);
+    // Log the list as a wallet_ledger event so it shows up in /trades.
+    // delta_cents = 0 because no money has moved yet — the asking price
+    // lives on owned_fighter.listing_price_cents and the trades API looks
+    // it up via ref_id when rendering the event.
+    credit(db, userId, 0, 'list', ownedFighterId);
     return { ok: true, price_cents: n };
   });
   return tx();
@@ -223,7 +259,7 @@ export function unlistFromSale(db, userId, ownedFighterId) {
     const { n: benchCount } = db.prepare(
       "SELECT COUNT(*) AS n FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'bench'"
     ).get(row.team_id);
-    if (benchCount >= MAX_BENCH_SIZE) return { error: 'bench_full' };
+    if (benchCount >= maxBenchSizeForUser(db, userId)) return { error: 'bench_full' };
     db.prepare(
       "UPDATE owned_fighter SET slot = 'bench', listing_price_cents = NULL WHERE id = ?"
     ).run(ownedFighterId);
@@ -261,7 +297,7 @@ export function buyListedFighter(db, buyerUserId, ownedFighterId) {
     const { n: benchCount } = db.prepare(
       "SELECT COUNT(*) AS n FROM owned_fighter WHERE team_id = ? AND is_retired = 0 AND slot = 'bench'"
     ).get(buyerTeam.id);
-    if (benchCount >= MAX_BENCH_SIZE) return { error: 'bench_full' };
+    if (benchCount >= maxBenchSizeForUser(db, buyerUserId)) return { error: 'bench_full' };
 
     const price = listing.listing_price_cents;
     const { balance_cents } = db.prepare(

@@ -18,7 +18,7 @@
 import { spawn, spawnSync } from 'child_process';
 import { existsSync, unlinkSync } from 'fs';
 import { runLeagueWorker } from './leagueWorker.js';
-import { runExhibition } from './exhibition.js';
+import { runExhibition, runTournamentMatch } from './exhibition.js';
 
 const SOI = Buffer.from([0xff, 0xd8]); // JPEG start of image
 const EOI = Buffer.from([0xff, 0xd9]); // JPEG end of image
@@ -58,6 +58,7 @@ export class StreamWorker {
     this.divisionId = null;
     this.currentFixtureId = null;
     this.exhibitionId = null;
+    this.tournamentMatchId = null;
     this.runPromise = null;
     this.lastError = null;
     this.startedAt = null;
@@ -256,6 +257,43 @@ export class StreamWorker {
     return this.runPromise;
   }
 
+  /**
+   * Assign a single pre-claimed exhibition_tournament_match. Caller has
+   * already marked the row 'running' via claimNextPendingTournamentMatch.
+   * On match completion runTournamentMatch records the winner and advances
+   * the bracket; the supervisor will pick up follow-up matches on its next
+   * tick.
+   */
+  assignTournamentMatch(db, matchId, callbacks = {}) {
+    if (this.status !== 'idle') {
+      throw new Error(`StreamWorker ${this.workerId}: can't assign tournament match in status=${this.status}`);
+    }
+    this.status = 'running';
+    this.tournamentMatchId = matchId;
+    this.lastError = null;
+    const ctx = { logPath: this.logPath, display: this.display };
+
+    this.runPromise = (async () => {
+      try {
+        callbacks.onStart?.(matchId);
+        const r = await runTournamentMatch(db, matchId, ctx);
+        callbacks.onEnd?.(matchId, r);
+        return r;
+      } catch (err) {
+        this.lastError = err.message;
+        console.error(`[worker ${this.workerId}] tournament match ${matchId} failed: ${err.message}`);
+        callbacks.onError?.(matchId, err);
+        return { ok: false };
+      }
+    })().finally(() => {
+      this.tournamentMatchId = null;
+      this.runPromise = null;
+      if (this.status === 'running') this.status = 'idle';
+    });
+
+    return this.runPromise;
+  }
+
   stop() {
     if (this.status === 'stopped') return;
     this.status = 'stopped';
@@ -280,6 +318,7 @@ export class StreamWorker {
       divisionId: this.divisionId,
       currentFixtureId: this.currentFixtureId,
       exhibitionId: this.exhibitionId,
+      tournamentMatchId: this.tournamentMatchId,
       clients: this.clients.size,
       lastError: this.lastError,
       startedAt: this.startedAt,

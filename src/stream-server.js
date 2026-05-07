@@ -47,6 +47,15 @@ import {
   claimNextPendingExhibition,
   listExhibitionsForUser,
   resetStuckExhibitions,
+  createExhibitionTournament,
+  getExhibitionTournament,
+  getActiveTournamentForUser,
+  cancelExhibitionTournament,
+  claimNextPendingTournamentMatch,
+  resetStuckTournamentMatches,
+  listLiveTournaments,
+  listRecentTournaments,
+  listTournamentWinsForMaster,
 } from './exhibition.js';
 import { getEffectiveCmd, saveCmdOverride } from './matchStaging.js';
 import { StreamWorker } from './streamWorker.js';
@@ -106,6 +115,12 @@ const SUPERVISOR_POLL_MS = 10_000;
 // Faster cadence for exhibition supervisor — feels snappier when you click
 // "Spar" and a worker is sitting idle waiting.
 const EXHIBITION_SUPERVISOR_POLL_MS = 1500;
+// Hard cap on simultaneously-running tournaments. Beyond this the rest sit
+// 'pending' until a slot frees up. Defaults to the worker count so each
+// running tournament gets at least one worker on average — set higher to
+// allow more concurrent tournaments at the cost of slower per-tournament
+// pacing, or lower to keep brackets snappy.
+const MAX_CONCURRENT_TOURNAMENTS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_TOURNAMENTS || String(Math.max(EXHIBITION_WORKER_COUNT, 1)), 10));
 // Bot transfer-market tick: each tick a small fraction of bot teams scout
 // the market and may sell/buy. Default 5min so activity is visible but
 // not chaotic. Set BOT_MARKET_DISABLED=1 to turn it off entirely.
@@ -219,6 +234,8 @@ async function bootWorkers() {
   // reserved for exhibitions (we'd never spin up 100+ league workers).
   const stuckEx = resetStuckExhibitions(db);
   if (stuckEx > 0) console.log(`[boot] reset ${stuckEx} stuck 'running' exhibition(s) to 'failed'`);
+  const stuckTm = resetStuckTournamentMatches(db);
+  if (stuckTm > 0) console.log(`[boot] reset ${stuckTm} stuck 'running' tournament match(es) to 'pending'`);
   for (let i = 1; i <= EXHIBITION_WORKER_COUNT; i++) {
     const id = 100 + i;
     const w = new StreamWorker({
@@ -340,12 +357,23 @@ function startExhibitionSupervisor() {
   setInterval(() => {
     const db = getDb();
     const exWorkers = Array.from(workers.values()).filter((w) => w.kind === 'exhibition');
+    // Single matches first so individual user spars feel snappier than a
+    // 32-fighter bracket sucking up the whole pool.
     for (const w of exWorkers) {
       if (w.status !== 'idle') continue;
       const claimed = claimNextPendingExhibition(db, w.workerId);
-      if (!claimed) break; // queue empty, no point checking other workers
+      if (!claimed) break;
       console.log(`[ex-supervisor] exhibition ${claimed.id} → worker ${w.workerId}`);
       w.assignExhibition(db, claimed.id);
+    }
+    // Then tournaments — multiple matches in the same round can run
+    // concurrently across workers because they're independent.
+    for (const w of exWorkers) {
+      if (w.status !== 'idle') continue;
+      const claimed = claimNextPendingTournamentMatch(db, w.workerId, MAX_CONCURRENT_TOURNAMENTS);
+      if (!claimed) break;
+      console.log(`[ex-supervisor] tournament match ${claimed.id} (t#${claimed.tournament_id}) → worker ${w.workerId}`);
+      w.assignTournamentMatch(db, claimed.id);
     }
   }, EXHIBITION_SUPERVISOR_POLL_MS);
 }
@@ -456,8 +484,14 @@ function getFighterProfile(fileName) {
   const db = getDb();
   const fighter = db.prepare('SELECT * FROM fighter WHERE file_name = ?').get(fileName);
   if (!fighter) return null;
-  const recent = db.prepare(`
-    SELECT f1.display_name AS f1, f2.display_name AS f2, s.display_name AS stage,
+  // Pull from both the legacy `fight_history` (random/tournament matches) and
+  // the live `fixture_match` (league matches). Merge in JS, sort by date,
+  // take the top 15. Without the second branch, league-only fighters showed
+  // no recent fights because everything they did landed in fixture_match.
+  const fromHistory = db.prepare(`
+    SELECT f1.display_name AS f1, f1.file_name AS f1_file,
+      f2.display_name AS f2, f2.file_name AS f2_file,
+      s.display_name AS stage,
       v.file_name AS victor_file, v.display_name AS victor, fh.fought_at
     FROM fight_history fh
     JOIN fighter f1 ON fh.fighter_one_id = f1.id
@@ -467,12 +501,90 @@ function getFighterProfile(fileName) {
     WHERE fh.fighter_one_id = ? OR fh.fighter_two_id = ?
     ORDER BY fh.fought_at DESC LIMIT 15
   `).all(fighter.id, fighter.id);
+  // fixture_match rows are pre-inserted with winner='draw' the moment a
+  // fixture goes 'running' (so the live overlay can show who's on screen).
+  // The row is UPDATEd with the real winner only at completion. We MUST
+  // filter to status='complete' or every active match shows up as a 'D'
+  // in the recent-fights table.
+  const fromFixtures = db.prepare(`
+    SELECT mf1.display_name AS f1, mf1.file_name AS f1_file,
+      mf2.display_name AS f2, mf2.file_name AS f2_file,
+      s.display_name AS stage,
+      CASE
+        WHEN fm.winner = 'home' THEN mf1.file_name
+        WHEN fm.winner = 'away' THEN mf2.file_name
+        ELSE NULL
+      END AS victor_file,
+      CASE
+        WHEN fm.winner = 'home' THEN mf1.display_name
+        WHEN fm.winner = 'away' THEN mf2.display_name
+        ELSE NULL
+      END AS victor,
+      fm.played_at AS fought_at
+    FROM fixture_match fm
+    JOIN fixture fx ON fx.id = fm.fixture_id
+    JOIN owned_fighter oh ON oh.id = fm.home_owned_fighter_id
+    JOIN owned_fighter oa ON oa.id = fm.away_owned_fighter_id
+    JOIN fighter mf1 ON mf1.id = oh.master_fighter_id
+    JOIN fighter mf2 ON mf2.id = oa.master_fighter_id
+    JOIN stage s ON s.id = fm.stage_id
+    WHERE (oh.master_fighter_id = ? OR oa.master_fighter_id = ?)
+      AND fx.status = 'complete'
+    ORDER BY fm.played_at DESC LIMIT 15
+  `).all(fighter.id, fighter.id);
+  const recent = [...fromHistory, ...fromFixtures]
+    .sort((a, b) => (b.fought_at || '').localeCompare(a.fought_at || ''))
+    .slice(0, 15);
+  // Owner history — every team that's ever held a clone of this master.
+  // State per row: 'current' (still owns and clone is active), 'released'
+  // (latest entry for this clone AND clone is retired → master returned to
+  // pool), 'sold' (a later entry exists for the same clone — newer team
+  // bought/inherited it via market or staff reassignment).
+  const ownerRows = db.prepare(`
+    SELECT t.id AS team_id, t.name AS team_name,
+      u.username AS owner_username, u.is_bot AS owner_is_bot,
+      h.id AS hist_id, h.owned_fighter_id, h.joined_at, h.reason,
+      of.is_retired AS clone_retired,
+      of.team_id AS clone_current_team_id
+    FROM owned_fighter_team_history h
+    JOIN team t ON t.id = h.team_id
+    JOIN user_account u ON u.id = t.user_id
+    JOIN owned_fighter of ON of.id = h.owned_fighter_id
+    WHERE of.master_fighter_id = ?
+    ORDER BY h.id DESC
+    LIMIT 20
+  `).all(fighter.id);
+  const latestPerClone = new Map();
+  for (const r of ownerRows) {
+    const prev = latestPerClone.get(r.owned_fighter_id);
+    if (prev == null || r.hist_id > prev) latestPerClone.set(r.owned_fighter_id, r.hist_id);
+  }
+  const owners = ownerRows.map((r) => {
+    const isLatest = r.hist_id === latestPerClone.get(r.owned_fighter_id);
+    let state;
+    if (!isLatest) state = 'sold';
+    else if (r.clone_retired) state = 'released';
+    else if (r.clone_current_team_id === r.team_id) state = 'current';
+    else state = 'sold';
+    return {
+      team_id: r.team_id,
+      team_name: r.team_name,
+      owner_username: r.owner_username,
+      owner_is_bot: r.owner_is_bot,
+      joined_at: r.joined_at,
+      reason: r.reason,
+      state,
+    };
+  });
   const total = fighter.matches_won + fighter.matches_lost + fighter.matches_drawn;
+  const tournamentWinsList = listTournamentWinsForMaster(db, fighter.id, 10);
   return {
     ...fighter,
     total_matches: total,
     win_rate: total > 0 ? Math.round(1000 * fighter.matches_won / total) / 10 : 0,
     recent,
+    owners,
+    tournament_wins_list: tournamentWinsList,
   };
 }
 
@@ -536,20 +648,67 @@ const MODAL_HTML = `
   </div></div>
 </div>
 <script>
+// Cached follow set + helpers shared across modal-open paths.
+let followedMastersCache = null;
+async function loadFollowedMasters() {
+  if (followedMastersCache) return followedMastersCache;
+  try {
+    const r = await fetch('/api/follow');
+    if (!r.ok) { followedMastersCache = new Set(); return followedMastersCache; }
+    const j = await r.json();
+    followedMastersCache = new Set(j.masters || []);
+  } catch { followedMastersCache = new Set(); }
+  return followedMastersCache;
+}
+async function toggleFollowMaster(masterId, btn) {
+  const set = await loadFollowedMasters();
+  const isOn = set.has(masterId);
+  if (isOn) {
+    await fetch('/api/follow/master/' + masterId, { method: 'DELETE' });
+    set.delete(masterId);
+    btn.classList.remove('on'); btn.textContent = '☆';
+    btn.title = 'Follow'; btn.style.color = '#8b949e';
+  } else {
+    const r = await fetch('/api/follow', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ kind: 'master', id: masterId }) });
+    if (r.status === 401) { alert('Sign in to follow fighters.'); return; }
+    set.add(masterId);
+    btn.classList.add('on'); btn.textContent = '★';
+    btn.title = 'Unfollow'; btn.style.color = '#f0ae3c';
+  }
+}
 async function openProfile(fileName) {
   const r = await fetch('/api/fighter/' + encodeURIComponent(fileName));
   if (!r.ok) return;
   const f = await r.json();
+  const followed = await loadFollowedMasters();
+  const isFollowed = followed.has(f.id);
   const recent = (f.recent || []).map(m => {
     const winLose = m.victor === f.display_name || m.victor_file === f.file_name ? 'W' : (m.victor ? 'L' : 'D');
-    const opp = (m.f1 === (f.display_name || f.file_name)) ? m.f2 : m.f1;
-    return \`<tr><td>\${winLose}</td><td>vs \${esc(opp)}</td><td style="color:#8b949e">\${esc(m.stage || '')}</td></tr>\`;
+    const isF1 = (m.f1 === (f.display_name || f.file_name)) || (m.f1_file === f.file_name);
+    const opp = isF1 ? m.f2 : m.f1;
+    const oppFile = isF1 ? m.f2_file : m.f1_file;
+    const oppCell = oppFile
+      ? 'vs <span style="cursor:pointer;color:#58a6ff;text-decoration:underline" onclick=\\'openProfile(' + JSON.stringify(oppFile) + ')\\'>' + esc(opp || '?') + '</span>' 
+      : 'vs ' + esc(opp || '?');
+    return \`<tr><td>\${winLose}</td><td>\${oppCell}</td><td style="color:#8b949e">\${esc(m.stage || '')}</td></tr>\`;
   }).join('');
+  const starGlyph = isFollowed ? '★' : '☆';
+  const starColor = isFollowed ? '#f0ae3c' : '#8b949e';
+  const starTip = isFollowed ? 'Unfollow' : 'Follow';
+  const tourneyWinsHtml = (f.tournament_wins_list && f.tournament_wins_list.length) ? \`<h2 style="margin-top:16px;font-size:12px;text-transform:uppercase;color:#8b949e">🏆 Tournament wins</h2><table>\${f.tournament_wins_list.map(t => \`<tr><td style="white-space:nowrap"><a href="/tournaments">#\${t.id}</a></td><td>\${t.size}-fighter bracket · best of \${t.rounds_per_fight}</td><td style="color:#8b949e">@\${esc(t.requester_username)}</td><td style="color:#6e7681;font-size:11px">\${esc(t.finished_at || '')}</td></tr>\`).join('')}</table>\` : '';
+  const ownersHtml = (f.owners && f.owners.length) ? \`<h2 style="margin-top:16px;font-size:12px;text-transform:uppercase;color:#8b949e">Owner history</h2><table>\${f.owners.map(o => {
+    const bot = o.owner_is_bot ? \` <span style="color:#8b949e;font-size:10px;background:#21262d;border-radius:3px;padding:1px 4px">BOT</span>\` : '';
+    const status = o.is_retired ? '<span style="color:#6e7681">retired</span>' : '<span style="color:#3fb950">current</span>';
+    return \`<tr><td style="white-space:nowrap"><a href="/team/\${o.team_id}">\${esc(o.team_name)}</a> <span style="color:#8b949e">@\${esc(o.owner_username)}</span>\${bot}</td><td style="color:#8b949e;font-size:11px">\${esc(o.joined_at || '')}</td><td>\${status}</td><td style="color:#6e7681;font-size:11px">\${esc(o.reason || '')}</td></tr>\`;
+  }).join('')}</table>\` : '';
   document.getElementById('modal-body').innerHTML = \`
     <div class="head">
       <img class="portrait" src="/portrait/\${encodeURIComponent(f.file_name)}.png" onerror="this.style.visibility='hidden'">
-      <div>
-        <h3>\${esc(f.display_name || f.file_name)}</h3>
+      <div style="flex:1">
+        <h3 style="display:flex;align-items:center;gap:10px;margin:0">
+          <span>\${esc(f.display_name || f.file_name)}</span>
+          <button id="modal-star" title="\${starTip}" style="background:none;border:0;font-size:22px;cursor:pointer;color:\${starColor};padding:0;line-height:1">\${starGlyph}</button>
+        </h3>
         <div class="sub">\${esc(f.author || 'unknown author')}</div>
       </div>
     </div>
@@ -558,13 +717,18 @@ async function openProfile(fileName) {
       <div class="stat"><div class="v">\${f.matches_lost}</div><div class="l">Losses</div></div>
       <div class="stat"><div class="v">\${f.matches_drawn}</div><div class="l">Draws</div></div>
       <div class="stat"><div class="v">\${f.win_rate}%</div><div class="l">Win rate</div></div>
+      <div class="stat"><div class="v">\${f.tournament_wins || 0}</div><div class="l">🏆 Tourneys</div></div>
     </div>
     <div class="field"><b>File name:</b> \${esc(f.file_name)}</div>
     <div class="field"><b>Added:</b> \${esc(f.created_at || '-')}</div>
     \${f.source_url ? \`<div class="field"><b>Source:</b> <a href="\${esc(f.source_url)}" target="_blank">\${esc(f.source_url)}</a></div>\` : ''}
     \${f.validation_reason ? \`<div class="field"><b>Issue:</b> <span style="color:#f85149">\${esc(f.validation_reason)}</span></div>\` : ''}
     \${recent ? \`<h2 style="margin-top:16px;font-size:12px;text-transform:uppercase;color:#8b949e">Recent fights</h2><table>\${recent}</table>\` : ''}
+    \${tourneyWinsHtml}
+    \${ownersHtml}
   \`;
+  const starBtn = document.getElementById('modal-star');
+  if (starBtn) starBtn.onclick = () => toggleFollowMaster(f.id, starBtn);
   document.getElementById('modal-bg').classList.add('open');
 }
 function closeModal() { document.getElementById('modal-bg').classList.remove('open'); }
@@ -800,6 +964,7 @@ ${AUTH_BAR_HTML}
   <a href="/market">Market</a>
   <a href="/exhibition">Exhibition</a>
   <a href="/trades">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -887,12 +1052,18 @@ const TRADES_HTML = `<!doctype html>
   .tr-row .kind.buy_unclaimed { color: #d29922; }
   .tr-row .kind.buy_listing { color: #58a6ff; }
   .tr-row .kind.release { color: #db6d28; }
+  .tr-row .kind.list { color: #a371f7; }
   .tr-row.release .price { color: #6e7681; }
   @media (max-width: 700px) {
     .tr-row { grid-template-columns: 32px 1fr 80px; gap: 8px; }
     .tr-row .when, .tr-row .kind { display: none; }
   }
   .tr-empty { color: #6e7681; padding: 30px; text-align: center; font-size: 13px; }
+  .tr-row .actor { color: #58a6ff; text-decoration: none; }
+  .tr-row .actor:hover { text-decoration: underline; }
+  .tr-row .master.clickable, .tr-row .pic.clickable { cursor: pointer; }
+  .tr-row .master.clickable:hover { color: #58a6ff; }
+  .tr-row .pic.clickable:hover { outline: 1px solid #58a6ff; }
 </style></head>
 <body>
 <h1>📈 Trades</h1>
@@ -904,6 +1075,7 @@ const TRADES_HTML = `<!doctype html>
   <a href="/market">Market</a>
   <a href="/exhibition">Exhibition</a>
   <a href="/trades" class="active">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div class="tr-controls">
@@ -913,9 +1085,109 @@ const TRADES_HTML = `<!doctype html>
 </div>
 <div class="tr-feed" id="tr-feed"></div>
 
+<div class="modal-bg" id="modal-bg" onclick="if(event.target.id==='modal-bg')closeModal()">
+  <div class="modal modal-shell">
+    <div class="close" onclick="closeModal()">×</div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
 <script>
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 let lastSeenId = 0;
+
+let followedMastersCache = null;
+async function loadFollowedMasters() {
+  if (followedMastersCache) return followedMastersCache;
+  try {
+    const r = await fetch('/api/follow');
+    if (!r.ok) { followedMastersCache = new Set(); return followedMastersCache; }
+    const j = await r.json();
+    followedMastersCache = new Set(j.masters || []);
+  } catch { followedMastersCache = new Set(); }
+  return followedMastersCache;
+}
+async function toggleFollowMaster(masterId, btn) {
+  const set = await loadFollowedMasters();
+  const isOn = set.has(masterId);
+  if (isOn) {
+    await fetch('/api/follow/master/' + masterId, { method: 'DELETE' });
+    set.delete(masterId);
+    btn.textContent = '☆'; btn.title = 'Follow'; btn.style.color = '#8b949e';
+  } else {
+    const r = await fetch('/api/follow', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ kind: 'master', id: masterId }) });
+    if (r.status === 401) { alert('Sign in to follow fighters.'); return; }
+    set.add(masterId);
+    btn.textContent = '★'; btn.title = 'Unfollow'; btn.style.color = '#f0ae3c';
+  }
+}
+async function openProfile(fileName) {
+  const r = await fetch('/api/fighter/' + encodeURIComponent(fileName));
+  if (!r.ok) return;
+  const f = await r.json();
+  const followed = await loadFollowedMasters();
+  const isFollowed = followed.has(f.id);
+  const starGlyph = isFollowed ? '★' : '☆';
+  const starColor = isFollowed ? '#f0ae3c' : '#8b949e';
+  const starTip = isFollowed ? 'Unfollow' : 'Follow';
+  const recent = (f.recent || []).map((m) => {
+    const winLose = m.victor === f.display_name || m.victor_file === f.file_name ? 'W' : (m.victor ? 'L' : 'D');
+    const isF1 = (m.f1 === (f.display_name || f.file_name)) || (m.f1_file === f.file_name);
+    const opp = isF1 ? m.f2 : m.f1;
+    const oppFile = isF1 ? m.f2_file : m.f1_file;
+    const oppCell = oppFile
+      ? 'vs <span style="cursor:pointer;color:#58a6ff;text-decoration:underline" onclick=\\'openProfile(' + JSON.stringify(oppFile) + ')\\'>' + esc(opp || '?') + '</span>' 
+      : 'vs ' + esc(opp || '?');
+    return '<tr><td>' + winLose + '</td><td>' + oppCell + '</td><td style="color:#8b949e">' + esc(m.stage || '') + '</td></tr>';
+  }).join('');
+  const reasonLabel = (r) => {
+    if (!r) return '';
+    if (r === 'created') return 'starter roster';
+    if (r === 'bought_from_market') return 'bought from pool';
+    if (r === 'bought_from_user') return 'bought from owner';
+    if (r === 'auto_replenish') return 'auto-replenished';
+    if (r === 'replaced_extra_kfm') return 'replaced training dummy';
+    if (r === 'boot_sweep') return 'boot recovery';
+    if (r.startsWith('kfm_replacement:repeated_crash')) return 'system-replaced (crash)';
+    if (r.startsWith('kfm_replacement:')) return 'system-replaced';
+    return r;
+  };
+  const stateLabel = (s) => {
+    if (s === 'current') return '<span style="color:#3fb950">current</span>';
+    if (s === 'released') return '<span style="color:#d29922">released</span>';
+    if (s === 'sold') return '<span style="color:#58a6ff">sold</span>';
+    return '<span style="color:#6e7681">' + s + '</span>';
+  };
+  const ownersHtml = (f.owners && f.owners.length)
+    ? '<h2 style="margin-top:16px;font-size:12px;text-transform:uppercase;color:#8b949e">Owner history</h2><table>' +
+      f.owners.map(o => {
+        const bot = o.owner_is_bot ? ' <span style="color:#8b949e;font-size:10px;background:#21262d;border-radius:3px;padding:1px 4px">BOT</span>' : '';
+        return '<tr><td style="white-space:nowrap"><a href="/team/' + o.team_id + '">' + esc(o.team_name) + '</a> <span style="color:#8b949e">@' + esc(o.owner_username) + '</span>' + bot + '</td><td style="color:#8b949e;font-size:11px">' + esc(o.joined_at || '') + '</td><td>' + stateLabel(o.state) + '</td><td style="color:#6e7681;font-size:11px">' + esc(reasonLabel(o.reason)) + '</td></tr>';
+      }).join('') + '</table>'
+    : '';
+  document.getElementById('modal-body').innerHTML =
+    '<div class="head">' +
+      '<img class="portrait" src="/portrait/' + encodeURIComponent(f.file_name) + '.png" onerror="this.style.visibility=\\'hidden\\'">' +
+      '<div style="flex:1"><h3 style="display:flex;align-items:center;gap:10px;margin:0">' +
+      '<span>' + esc(f.display_name || f.file_name) + '</span>' +
+      '<button id="modal-star" title="' + starTip + '" style="background:none;border:0;font-size:22px;cursor:pointer;color:' + starColor + ';padding:0;line-height:1">' + starGlyph + '</button>' +
+      '</h3>' +
+      '<div class="sub">' + esc(f.author || 'unknown author') + '</div></div></div>' +
+    '<div class="stats">' +
+      '<div class="stat"><div class="v">' + f.matches_won + '</div><div class="l">Wins</div></div>' +
+      '<div class="stat"><div class="v">' + f.matches_lost + '</div><div class="l">Losses</div></div>' +
+      '<div class="stat"><div class="v">' + f.matches_drawn + '</div><div class="l">Draws</div></div>' +
+      '<div class="stat"><div class="v">' + f.win_rate + '%</div><div class="l">Win rate</div></div></div>' +
+    '<div class="field"><b>File name:</b> ' + esc(f.file_name) + '</div>' +
+    '<div class="field"><b>Added:</b> ' + esc(f.created_at || '-') + '</div>' +
+    (f.source_url ? '<div class="field"><b>Source:</b> <a href="' + esc(f.source_url) + '" target="_blank">' + esc(f.source_url) + '</a></div>' : '') +
+    (recent ? '<h2 style="margin-top:16px;font-size:12px;text-transform:uppercase;color:#8b949e">Recent fights</h2><table>' + recent + '</table>' : '') + tourneyWinsHtml + ownersHtml;
+  const sb = document.getElementById('modal-star');
+  if (sb) sb.onclick = () => toggleFollowMaster(f.id, sb);
+  document.getElementById('modal-bg').classList.add('open');
+}
+function closeModal() { document.getElementById('modal-bg').classList.remove('open'); }
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 
 function relTime(iso) {
   const t = new Date(iso.replace(' ', 'T') + 'Z').getTime();
@@ -930,15 +1202,23 @@ function relTime(iso) {
 function userTag(u) {
   if (!u) return '<span style="color:#6e7681">(unknown)</span>';
   const bot = u.is_bot ? '<span class="bot">BOT</span>' : '';
-  return '<span class="actor">@' + esc(u.username) + '</span>' + bot;
+  const name = '@' + esc(u.username);
+  const link = u.team_id
+    ? '<a class="actor" href="/team/' + u.team_id + '">' + name + '</a>'
+    : '<span class="actor">' + name + '</span>';
+  return link + bot;
 }
 
 function rowHtml(t, isFresh) {
+  // Both the portrait and the name open the fighter profile modal — same
+  // pattern the leaderboard uses. The escape-quotes-in-onclick gymnastics
+  // are because file_name can contain spaces/parens/quotes.
+  const fnAttr = t.master ? esc(t.master.file_name).replace(/'/g, "\\'") : '';
   const pic = t.master
-    ? '<img class="pic" src="/portrait/' + encodeURIComponent(t.master.file_name) + '.png" onerror="this.classList.add(\\'empty\\');this.removeAttribute(\\'src\\')">'
+    ? '<img class="pic clickable" onclick="openProfile(\\'' + fnAttr + '\\')" src="/portrait/' + encodeURIComponent(t.master.file_name) + '.png" onerror="this.classList.add(\\'empty\\');this.removeAttribute(\\'src\\')">'
     : '<div class="pic empty"></div>';
   const masterLabel = t.master
-    ? '<span class="master">' + esc(t.master.display_name || t.master.file_name) + '</span>'
+    ? '<span class="master clickable" onclick="openProfile(\\'' + fnAttr + '\\')">' + esc(t.master.display_name || t.master.file_name) + '</span>'
       + (t.master.author ? ' <span class="author">· ' + esc(t.master.author) + '</span>' : '')
     : '<span style="color:#6e7681">(unknown fighter)</span>';
 
@@ -949,6 +1229,9 @@ function rowHtml(t, isFresh) {
   } else if (t.kind === 'release') {
     descHtml = userTag(t.seller) + ' released ' + masterLabel + ' back to the unclaimed pool';
     kindLabel = 'released';
+  } else if (t.kind === 'list') {
+    descHtml = userTag(t.seller) + ' listed ' + masterLabel + ' for sale';
+    kindLabel = 'listed';
   } else {
     descHtml = userTag(t.buyer) + ' bought ' + masterLabel
       + '<span class="arrow">←</span>' + userTag(t.seller);
@@ -1012,6 +1295,7 @@ const EXHIBITION_HTML = `<!doctype html>
   .ex-item.selected { background: #1f6feb33; border-color: #1f6feb; }
   .ex-item.mine { background: #2da44e1a; }
   .ex-item.mine.selected { background: #2da44e44; }
+  .ex-item.followed { border-left: 2px solid #f0ae3c; }
   .ex-item .name { color: #c9d1d9; font-weight: 600; }
   .ex-item .meta { color: #8b949e; font-size: 11px; }
   .ex-item .stats { color: #6e7681; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -1043,6 +1327,67 @@ const EXHIBITION_HTML = `<!doctype html>
   .ex-history-row .when { color: #6e7681; font-size: 11px; }
   .live-pill-ex { display: inline-block; padding: 2px 8px; background: #da3633; color: #fff; border-radius: 999px; font-size: 11px; font-weight: 600; animation: live-pulse 1.6s infinite; }
   @keyframes live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+  .mode-tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid #30363d; }
+  .mode-tab { padding: 10px 20px; font-size: 14px; font-weight: 600; color: #8b949e; cursor: pointer; border-bottom: 2px solid transparent; user-select: none; }
+  .mode-tab.active { color: #c9d1d9; border-bottom-color: #f0ae3c; }
+  .mode-tab:hover:not(.active) { color: #c9d1d9; }
+  .tn-toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; margin-bottom: 14px; }
+  .tn-toolbar .lbl { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.4px; }
+  .tn-size { display: flex; gap: 4px; }
+  .tn-size button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 5px 12px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+  .tn-size button.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .tn-toolbar .tn-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 5px 12px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+  .tn-toolbar .tn-btn:hover { background: #30363d; }
+  .tn-toolbar .tn-btn.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  .tn-toolbar .tn-btn.primary:hover:not(:disabled) { background: #2ea043; }
+  .tn-toolbar .tn-btn:disabled { background: #21262d; color: #6e7681; cursor: not-allowed; border-color: #30363d; }
+  .tn-toolbar .tn-status { color: #8b949e; font-size: 12px; margin-left: auto; }
+  .tn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: stretch; }
+  @media (max-width: 800px) { .tn-row { grid-template-columns: 1fr; } }
+  .tn-side { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; }
+  .tn-side h2 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #8b949e; }
+  .tn-slots { display: grid; grid-template-columns: 1fr; gap: 6px; max-height: 480px; overflow-y: auto; }
+  .tn-slot { display: grid; grid-template-columns: 28px 1fr auto; gap: 8px; align-items: center; padding: 8px 10px; background: #0d1117; border: 1px solid #21262d; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .tn-slot:hover { border-color: #58a6ff; }
+  .tn-slot.active { border-color: #f0ae3c; background: #1d232b; }
+  .tn-slot.empty .tn-slot-name { color: #6e7681; font-style: italic; }
+  .tn-slot .tn-slot-num { color: #8b949e; font-variant-numeric: tabular-nums; text-align: right; }
+  .tn-slot .tn-slot-name { color: #c9d1d9; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tn-slot .tn-slot-meta { color: #8b949e; font-size: 11px; margin-left: 4px; font-weight: 400; }
+  .tn-slot .tn-slot-clear { color: #6e7681; font-size: 14px; padding: 0 4px; cursor: pointer; }
+  .tn-slot .tn-slot-clear:hover { color: #f85149; }
+  .tn-bracket-wrap { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; margin-top: 16px; }
+  .tn-bracket-wrap.hidden { display: none; }
+  .tn-bracket-wrap h2 { margin: 0 0 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #8b949e; }
+  .tn-bracket-scroll { overflow-x: auto; padding-bottom: 8px; }
+  .tn-bracket-titles { display: flex; }
+  .tn-bracket-titles > div { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.4px; text-align: center; margin-bottom: 8px; }
+  .tn-bracket { position: relative; }
+  .tn-bracket .tn-match { position: absolute; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; font-size: 12px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; }
+  .tn-bracket .tn-match.tn-champion { border-color: #f0ae3c; background: #1d232b; }
+  .tn-bracket .tn-match.tn-running { border-color: #da3633; box-shadow: 0 0 0 2px rgba(218,54,51,0.25); animation: tn-running-pulse 1.6s infinite; }
+  .tn-bracket .tn-match.tn-done { border-color: #21262d; }
+  .tn-bracket .tn-match .tn-fighter.winner { color: #3fb950; font-weight: 600; }
+  .tn-bracket .tn-match .tn-fighter.loser { color: #6e7681; text-decoration: line-through; }
+  @keyframes tn-running-pulse { 0%,100% { box-shadow: 0 0 0 2px rgba(218,54,51,0.25); } 50% { box-shadow: 0 0 0 3px rgba(218,54,51,0.5); } }
+  .tn-bracket .tn-coinflip { cursor: help; font-size: 11px; opacity: 0.85; }
+  .tn-bracket .tn-match .tn-fighter { padding: 3px 0; color: #c9d1d9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; }
+  .tn-bracket .tn-match .tn-fighter.tbd { color: #6e7681; font-style: italic; }
+  .tn-bracket .tn-match .tn-fighter .seed { color: #6e7681; font-size: 10px; margin-right: 6px; font-variant-numeric: tabular-nums; display: inline-block; min-width: 18px; }
+  .tn-bracket-svg { position: absolute; top: 0; left: 0; pointer-events: none; }
+  .tn-bracket-svg path { stroke: #30363d; stroke-width: 1.5; fill: none; }
+  .tn-rpf { display: flex; align-items: center; gap: 6px; }
+  .tn-rpf select { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 5px; padding: 4px 8px; font-size: 12px; cursor: pointer; }
+  #tournament-mode.locked .tn-toolbar,
+  #tournament-mode.locked .tn-row,
+  #tournament-mode.locked > .panel { display: none; }
+  .tn-confirm-bar { display: flex; gap: 14px; align-items: center; justify-content: center; margin-top: 14px; padding-top: 14px; border-top: 1px solid #21262d; }
+  .tn-confirm-bar.queued { padding-top: 12px; }
+  .tn-confirm-bar .ex-btn.danger { background: #da3633; }
+  .tn-confirm-bar .ex-btn.danger:hover:not(:disabled) { background: #f85149; }
+  .tn-confirm-bar .tn-status { color: #8b949e; font-size: 12px; }
+  .tn-queued-banner { background: #1f6feb22; border: 1px solid #1f6feb; border-radius: 6px; padding: 10px 14px; font-size: 13px; color: #c9d1d9; margin-top: 14px; }
+  .tn-queued-banner b { color: #58a6ff; }
 </style></head>
 <body>
 <h1>🥋 Exhibition</h1>
@@ -1054,9 +1399,16 @@ const EXHIBITION_HTML = `<!doctype html>
   <a href="/market">Market</a>
   <a href="/exhibition" class="active">Exhibition</a>
   <a href="/trades">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
+<div class="mode-tabs" id="mode-tabs">
+  <div class="mode-tab active" data-mode="match">Match</div>
+  <div class="mode-tab" data-mode="tournament">Tournament</div>
+</div>
+
+<div id="match-mode">
 <div class="panel" style="margin-bottom: 16px;">
   <p style="margin: 0; font-size: 13px; color: #8b949e;">
     Pick any two fighters and run a one-off match. Both sides fight at full life — W/L/D records and master stats update, but stamina is untouched so testing your team won't burn their rest. League standings aren't affected.
@@ -1105,6 +1457,78 @@ const EXHIBITION_HTML = `<!doctype html>
 </div>
 
 <div class="ex-history" id="history-host"></div>
+</div>
+
+<div id="tournament-mode" hidden>
+<div class="panel" style="margin-bottom: 16px;">
+  <p style="margin: 0; font-size: 13px; color: #8b949e;">
+    Build a single-elimination bracket. Pick a size, then click slots and assign fighters from the picker. Use Auto-fill to seed quickly. Drawn matches are tiebroken by coin flip (🪙) so the bracket can advance.
+  </p>
+</div>
+
+<div class="tn-toolbar">
+  <span class="lbl">Size</span>
+  <div class="tn-size" id="tn-size">
+    <button data-size="4">4</button>
+    <button data-size="8" class="active">8</button>
+    <button data-size="16">16</button>
+    <button data-size="32">32</button>
+    <button data-size="64">64</button>
+  </div>
+  <span class="tn-rpf"><span class="lbl">Best of</span>
+    <select id="tn-rpf">
+      <option value="1" selected>1 round</option>
+      <option value="3">3 rounds</option>
+      <option value="5">5 rounds</option>
+    </select>
+  </span>
+  <span class="tn-rpf"><span class="lbl">Stage</span>
+    <select id="tn-stage">
+      <option value="" selected>Random per match</option>
+    </select>
+  </span>
+  <button class="tn-btn" id="tn-fill-mine">Auto-fill: my team</button>
+  <button class="tn-btn" id="tn-fill-random">Auto-fill: random</button>
+  <button class="tn-btn" id="tn-fill-wins">Auto-fill: top wins</button>
+  <button class="tn-btn" id="tn-shuffle">Shuffle order</button>
+  <button class="tn-btn" id="tn-clear">Clear</button>
+  <button class="tn-btn primary" id="tn-generate" disabled>Generate bracket</button>
+  <span class="tn-status" id="tn-status">0 / 8 slots filled</span>
+</div>
+
+<div class="tn-row">
+  <div class="tn-side">
+    <h2>Slots</h2>
+    <div class="tn-slots" id="tn-slots"></div>
+  </div>
+  <div class="tn-side">
+    <h2>Pick a fighter</h2>
+    <div class="ex-tabs" data-side="tn">
+      <div class="ex-tab active" data-bucket="mine">My team <span class="count" id="tn-count-mine">0</span></div>
+      <div class="ex-tab" data-bucket="others">Other teams <span class="count" id="tn-count-others">0</span></div>
+      <div class="ex-tab" data-bucket="market">Market <span class="count" id="tn-count-market">0</span></div>
+    </div>
+    <input type="search" class="ex-search" id="tn-search" placeholder="Search fighter or character...">
+    <div class="ex-list" id="tn-list"></div>
+  </div>
+</div>
+
+<div class="tn-bracket-wrap hidden" id="tn-bracket-wrap">
+  <h2>Bracket <span id="tn-bracket-meta" style="font-weight:400;color:#8b949e;text-transform:none;letter-spacing:0;"></span></h2>
+  <div class="tn-bracket-scroll"><div class="tn-bracket" id="tn-bracket"></div></div>
+  <div class="ex-stream-wrap hidden" id="tn-stream-wrap" style="margin-top:14px">
+    <div class="ex-stream-hdr">
+      <h2 id="tn-stream-title">Live match</h2>
+      <span class="live-pill-ex">● LIVE</span>
+    </div>
+    <div class="ex-stream" id="tn-stream-host"><div class="placeholder">Waiting for stream…</div></div>
+  </div>
+  <div class="tn-confirm-bar" id="tn-confirm-bar">
+    <button class="ex-btn" id="tn-start-btn">Confirm and start tournament</button>
+    <span class="tn-status" id="tn-confirm-status"></span>
+  </div>
+</div>
+</div>
 
 <script>
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
@@ -1140,6 +1564,35 @@ async function loadFighters() {
     renderList(side);
   }
   renderHistory();
+  // Populate the stage dropdown for the tournament builder.
+  const stageSel = document.getElementById('tn-stage');
+  if (stageSel && d.stages) {
+    const opts = ['<option value="">Random per match</option>']
+      .concat(d.stages.map((s) => '<option value="' + s.id + '">' + esc(s.display_name || s.file_name) + '</option>'));
+    stageSel.innerHTML = opts.join('');
+  }
+  // Hydrate tournament mode from any existing active tournament so reloading
+  // the page shows the queued banner instead of a blank picker.
+  if (d.active_tournament) {
+    tn.queuedId = d.active_tournament.id;
+    tn.size = d.active_tournament.size;
+    tn.roundsPerFight = d.active_tournament.rounds_per_fight;
+    tn.generated = true;
+    document.querySelectorAll('#tn-size button').forEach((b) =>
+      b.classList.toggle('active', Number(b.dataset.size) === tn.size));
+    const rpfSel = document.getElementById('tn-rpf');
+    if (rpfSel) rpfSel.value = String(tn.roundsPerFight);
+    // Reconstruct the slot fighters from round-0 home/away pairs in order.
+    const r0 = d.active_tournament.matches.filter((m) => m.round === 0).sort((a, b) => a.match_index - b.match_index);
+    tn.slots = new Array(tn.size).fill(null);
+    for (const m of r0) {
+      tn.slots[m.match_index * 2] = m.home_owned_fighter_id ? { owned_fighter_id: m.home_owned_fighter_id, display_name: m.home_name, team_name: m.home_team_name } : null;
+      tn.slots[m.match_index * 2 + 1] = m.away_owned_fighter_id ? { owned_fighter_id: m.away_owned_fighter_id, display_name: m.away_name, team_name: m.away_team_name } : null;
+    }
+    tnRenderBracket();
+    tnRenderConfirmBar();
+    tnStartPolling();
+  }
 }
 
 function rosterFor(bucket) {
@@ -1163,13 +1616,17 @@ function filterRoster(rows, q) {
 function rowHtml(r, side) {
   const sel = state.selection[side]?.owned_fighter_id === r.owned_fighter_id ? ' selected' : '';
   const mineCls = state.mine.find((m) => m.owned_fighter_id === r.owned_fighter_id) ? ' mine' : '';
+  const followCls = r.followed ? ' followed' : '';
+  const star = r.followed ? '<span style="color:#f0ae3c;margin-right:6px" title="Followed">★</span>' : '';
   const stam = Math.round((r.stamina || 0) * 100);
-  return '<div class="ex-item' + mineCls + sel + '" data-id="' + r.owned_fighter_id + '">' +
+  // Show master lifetime wins inline so the sort order (wins-desc) is visible.
+  const masterRec = (r.master_won != null) ? ' · ' + r.master_won + 'w lifetime' : '';
+  return '<div class="ex-item' + mineCls + followCls + sel + '" data-id="' + r.owned_fighter_id + '">' +
     '<div>' +
-      '<div class="name">' + esc(r.display_name) + '</div>' +
+      '<div class="name">' + star + esc(r.display_name) + '</div>' +
       '<div class="meta">' + esc(r.master_display_name || '') + (r.master_author ? ' · ' + esc(r.master_author) : '') + ' · <span style="color:#8b949e">' + esc(r.team_name) + '</span></div>' +
     '</div>' +
-    '<div class="stats">' + r.matches_won + 'W ' + r.matches_lost + 'L ' + r.matches_drawn + 'D · ' + stam + '%</div>' +
+    '<div class="stats">' + r.matches_won + 'W ' + r.matches_lost + 'L ' + r.matches_drawn + 'D · ' + stam + '%' + masterRec + '</div>' +
   '</div>';
 }
 
@@ -1346,7 +1803,894 @@ function renderHistory() {
   host.innerHTML = '<h2>Recent exhibitions</h2>' + items;
 }
 
+// === Tournament mode ===
+const tn = {
+  size: 8,
+  slots: new Array(8).fill(null),
+  activeSlot: 0,
+  bucket: 'mine',
+  search: '',
+  generated: false,
+  roundsPerFight: 1,
+  stageId: '',  // empty string = random per match
+  queuedId: null,
+  // Server-side bracket state once queued: per-(round,match_index) entry with
+  // home/away/winner/status. Used by the renderer to show live progress.
+  liveMatches: null,
+  liveStatus: null,        // tournament status: pending/running/complete/...
+  liveWinnerName: null,    // champion name when status=complete
+  pollTimer: null,
+};
+
+function tnPool() {
+  if (tn.bucket === 'mine') return state.mine;
+  if (tn.bucket === 'others') return state.others;
+  return state.market;
+}
+
+function tnFilteredPool() {
+  const ql = tn.search.trim().toLowerCase();
+  const rows = tnPool();
+  if (!ql) return rows;
+  return rows.filter((r) =>
+    (r.display_name || '').toLowerCase().includes(ql) ||
+    (r.master_display_name || '').toLowerCase().includes(ql) ||
+    (r.team_name || '').toLowerCase().includes(ql) ||
+    (r.master_author || '').toLowerCase().includes(ql)
+  );
+}
+
+function tnRenderCounts() {
+  document.getElementById('tn-count-mine').textContent = state.mine.length;
+  document.getElementById('tn-count-others').textContent = state.others.length;
+  document.getElementById('tn-count-market').textContent = state.market.length;
+}
+
+function tnRenderSlots() {
+  const host = document.getElementById('tn-slots');
+  host.innerHTML = tn.slots.map((s, i) => {
+    const active = i === tn.activeSlot ? ' active' : '';
+    const empty = s ? '' : ' empty';
+    const name = s
+      ? esc(s.display_name) + '<span class="tn-slot-meta">· ' + esc(s.master_display_name || '') + ' · ' + esc(s.team_name) + '</span>'
+      : 'click to assign';
+    const clear = s ? '<span class="tn-slot-clear" data-clear="' + i + '" title="Clear">×</span>' : '<span class="tn-slot-clear" style="visibility:hidden">×</span>';
+    return '<div class="tn-slot' + active + empty + '" data-slot="' + i + '">' +
+      '<span class="tn-slot-num">' + (i + 1) + '.</span>' +
+      '<span class="tn-slot-name">' + name + '</span>' +
+      clear +
+    '</div>';
+  }).join('');
+  host.querySelectorAll('.tn-slot').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      if (e.target.dataset.clear != null) {
+        const idx = Number(e.target.dataset.clear);
+        tn.slots[idx] = null;
+        tnUpdate();
+        return;
+      }
+      tn.activeSlot = Number(el.dataset.slot);
+      tnUpdate();
+    });
+  });
+  const filled = tn.slots.filter(Boolean).length;
+  document.getElementById('tn-status').textContent = filled + ' / ' + tn.size + ' slots filled';
+  document.getElementById('tn-generate').disabled = filled !== tn.size;
+}
+
+function tnRenderList() {
+  const list = document.getElementById('tn-list');
+  const rows = tnFilteredPool();
+  const usedIds = new Set(tn.slots.filter(Boolean).map((s) => s.owned_fighter_id));
+  list.innerHTML = rows.length
+    ? rows.map((r) => {
+        const used = usedIds.has(r.owned_fighter_id);
+        const star = r.followed ? '<span style="color:#f0ae3c;margin-right:6px">★</span>' : '';
+        const stam = Math.round((r.stamina || 0) * 100);
+        const masterRec = (r.master_won != null) ? ' · ' + r.master_won + 'w lifetime' : '';
+        const cls = 'ex-item' + (used ? ' selected' : '');
+        const usedLabel = used ? ' <span style="color:#6e7681;font-size:10px">(in bracket)</span>' : '';
+        return '<div class="' + cls + '" data-id="' + r.owned_fighter_id + '">' +
+          '<div>' +
+            '<div class="name">' + star + esc(r.display_name) + usedLabel + '</div>' +
+            '<div class="meta">' + esc(r.master_display_name || '') + ' · <span style="color:#8b949e">' + esc(r.team_name) + '</span></div>' +
+          '</div>' +
+          '<div class="stats">' + r.matches_won + 'W ' + r.matches_lost + 'L · ' + stam + '%' + masterRec + '</div>' +
+        '</div>';
+      }).join('')
+    : '<div style="padding:12px;color:#6e7681;text-align:center;font-size:12px">No fighters match.</div>';
+  list.querySelectorAll('.ex-item').forEach((el) => {
+    el.addEventListener('click', () => {
+      const id = Number(el.dataset.id);
+      const all = [...state.mine, ...state.others, ...state.market];
+      const f = all.find((x) => x.owned_fighter_id === id);
+      if (!f) return;
+      if (tn.slots.some((s, i) => s && s.owned_fighter_id === id && i !== tn.activeSlot)) return;
+      tn.slots[tn.activeSlot] = f;
+      const next = tn.slots.findIndex((s, i) => !s && i > tn.activeSlot);
+      const wrap = next === -1 ? tn.slots.findIndex((s) => !s) : next;
+      if (wrap !== -1) tn.activeSlot = wrap;
+      tnUpdate();
+    });
+  });
+}
+
+function tnRenderBracket() {
+  const wrap = document.getElementById('tn-bracket-wrap');
+  if (!tn.generated) { wrap.classList.add('hidden'); return; }
+  wrap.classList.remove('hidden');
+  const host = document.getElementById('tn-bracket');
+  const rounds = Math.log2(tn.size);
+  const roundNames = { 1: 'Final', 2: 'Semifinal', 3: 'Quarterfinal', 4: 'Round of 16', 5: 'Round of 32', 6: 'Round of 64' };
+  // Match height has to clear the two fighter rows + padding (≈56px) or the
+  // boxes visually overlap. Compact mode for big brackets keeps the page sane.
+  const matchH = tn.size >= 32 ? 46 : 60;
+  const matchW = tn.size >= 32 ? 170 : 200;
+  const matchGap = tn.size >= 32 ? 10 : 16;
+  const colGap = 48;
+  const firstRoundCount = tn.size / 2;
+  const totalH = firstRoundCount * matchH + (firstRoundCount - 1) * matchGap;
+  const totalW = (rounds + 1) * matchW + rounds * colGap;
+  // Pre-compute every match's pixel position so the SVG and DOM stay aligned.
+  const matches = [];
+  for (let r = 0; r < rounds; r++) {
+    const count = firstRoundCount / Math.pow(2, r);
+    const slotH = totalH / count;
+    for (let m = 0; m < count; m++) {
+      const x = r * (matchW + colGap);
+      const y = m * slotH + (slotH - matchH) / 2;
+      const f1 = r === 0 ? tn.slots[m * 2] : null;
+      const f2 = r === 0 ? tn.slots[m * 2 + 1] : null;
+      matches.push({ r, m, x, y, w: matchW, h: matchH, f1, f2 });
+    }
+  }
+  const champX = rounds * (matchW + colGap);
+  const champY = (totalH - matchH) / 2;
+  matches.push({ r: rounds, m: 0, x: champX, y: champY, w: matchW, h: matchH, champion: true });
+
+  // Round titles row
+  let titlesHtml = '<div class="tn-bracket-titles" style="width:' + totalW + 'px">';
+  for (let r = 0; r < rounds; r++) {
+    const remaining = rounds - r;
+    const title = roundNames[remaining] || ('Round ' + (r + 1));
+    const left = r === 0 ? 0 : colGap;
+    titlesHtml += '<div style="width:' + matchW + 'px;margin-left:' + left + 'px">' + esc(title) + '</div>';
+  }
+  titlesHtml += '<div style="width:' + matchW + 'px;margin-left:' + colGap + 'px;color:#f0ae3c">Champion</div>';
+  titlesHtml += '</div>';
+
+  // SVG connectors: for each pair of matches in a round, draw the C-bracket
+  // (right of upper → mid x, mid x down to lower's y, lower's right → mid x)
+  // and a horizontal stub from mid y into the next round's match.
+  let svg = '<svg class="tn-bracket-svg" width="' + totalW + '" height="' + totalH + '">';
+  for (let r = 0; r < rounds; r++) {
+    const ms = matches.filter((mm) => mm.r === r);
+    for (let i = 0; i < ms.length; i += 2) {
+      const upper = ms[i];
+      const lower = ms[i + 1];
+      const next = matches.find((mm) => mm.r === r + 1 && mm.m === Math.floor(i / 2));
+      if (!next) continue;
+      if (!lower) {
+        // Final round → champion: a single straight line.
+        const xRight = upper.x + upper.w;
+        const yU = upper.y + upper.h / 2;
+        const yNext = next.y + next.h / 2;
+        svg += '<path d="M ' + xRight + ' ' + yU + ' L ' + next.x + ' ' + yNext + '"/>';
+        continue;
+      }
+      const xRight = upper.x + upper.w;
+      const yU = upper.y + upper.h / 2;
+      const yL = lower.y + lower.h / 2;
+      const xMid = xRight + colGap / 2;
+      const yMid = (yU + yL) / 2;
+      const xNext = next.x;
+      const yNext = next.y + next.h / 2;
+      svg += '<path d="M ' + xRight + ' ' + yU + ' L ' + xMid + ' ' + yU + ' L ' + xMid + ' ' + yL + ' L ' + xRight + ' ' + yL + '"/>';
+      svg += '<path d="M ' + xMid + ' ' + yMid + ' L ' + xNext + ' ' + yNext + '"/>';
+    }
+  }
+  svg += '</svg>';
+
+  // Match boxes — when queued, the live data overlays the static slot info
+  // so the bracket reflects in-flight winners and current match.
+  const liveByKey = new Map();
+  if (tn.liveMatches) for (const lm of tn.liveMatches) liveByKey.set(lm.round + ':' + lm.match_index, lm);
+
+  let boxes = '';
+  for (const mm of matches) {
+    const style = 'left:' + mm.x + 'px;top:' + mm.y + 'px;width:' + mm.w + 'px;height:' + mm.h + 'px';
+    if (mm.champion) {
+      const champLabel = tn.liveWinnerName ? '🏆 ' + esc(tn.liveWinnerName) : '🏆 Champion: TBD';
+      const champCls = tn.liveWinnerName ? 'tn-fighter' : 'tn-fighter tbd';
+      boxes += '<div class="tn-match tn-champion" style="' + style + '"><div class="' + champCls + '" style="text-align:center">' + champLabel + '</div></div>';
+      continue;
+    }
+    const live = liveByKey.get(mm.r + ':' + mm.m);
+    let f1Name, f2Name, f1Id, f2Id, mStatus;
+    if (live) {
+      f1Name = live.home_name;
+      f2Name = live.away_name;
+      f1Id = live.home_owned_fighter_id;
+      f2Id = live.away_owned_fighter_id;
+      mStatus = live.status;
+    } else {
+      f1Name = mm.f1?.display_name;
+      f2Name = mm.f2?.display_name;
+      f1Id = mm.f1?.owned_fighter_id;
+      f2Id = mm.f2?.owned_fighter_id;
+      mStatus = 'pending';
+    }
+    const winnerId = live?.winner_owned_fighter_id;
+    const f1Won = winnerId && f1Id === winnerId;
+    const f2Won = winnerId && f2Id === winnerId;
+    const f1Lost = winnerId && f1Id && f1Id !== winnerId;
+    const f2Lost = winnerId && f2Id && f2Id !== winnerId;
+    const coinflip = !!live?.was_coinflip;
+    const crashFlip = !!live?.was_crash;
+    const coinIcon = coinflip
+      ? ' <span class="tn-coinflip" title="' + (crashFlip ? 'Match crashed' : 'Match ended in a draw') + ' — winner picked by coin flip">🪙</span>'
+      : '';
+    const cell = (name, seed, won, lost) => {
+      if (!name) return '<div class="tn-fighter tbd"><span class="seed"></span>TBD</div>';
+      const cls = 'tn-fighter' + (won ? ' winner' : '') + (lost ? ' loser' : '');
+      const flag = won && coinflip ? coinIcon : '';
+      return '<div class="' + cls + '"><span class="seed">' + (seed ? '#' + seed : '') + '</span>' + esc(name) + flag + '</div>';
+    };
+    const s1 = mm.r === 0 ? mm.m * 2 + 1 : '';
+    const s2 = mm.r === 0 ? mm.m * 2 + 2 : '';
+    const matchCls = 'tn-match' + (mStatus === 'running' ? ' tn-running' : '') + (mStatus === 'complete' ? ' tn-done' : '');
+    boxes += '<div class="' + matchCls + '" style="' + style + '">' + cell(f1Name, s1, f1Won, f1Lost) + cell(f2Name, s2, f2Won, f2Lost) + '</div>';
+  }
+
+  host.style.width = totalW + 'px';
+  host.style.height = totalH + 'px';
+  host.innerHTML = svg + boxes;
+  // Render titles outside the bracket box.
+  let titleHost = document.getElementById('tn-bracket-titles-host');
+  if (!titleHost) {
+    titleHost = document.createElement('div');
+    titleHost.id = 'tn-bracket-titles-host';
+    host.parentNode.insertBefore(titleHost, host);
+  }
+  titleHost.innerHTML = titlesHtml;
+  // Bracket meta line
+  document.getElementById('tn-bracket-meta').textContent =
+    ' · ' + tn.size + ' fighters · best of ' + tn.roundsPerFight + ' round' + (tn.roundsPerFight > 1 ? 's' : '') + ' per match';
+}
+
+function tnUpdate() {
+  tnRenderSlots();
+  tnRenderList();
+  tnRenderCounts();
+  if (tn.generated) tnRenderBracket();
+}
+
+function tnSetSize(n) {
+  tn.size = n;
+  tn.slots = new Array(n).fill(null);
+  tn.activeSlot = 0;
+  tn.generated = false;
+  document.querySelectorAll('#tn-size button').forEach((b) => b.classList.toggle('active', Number(b.dataset.size) === n));
+  document.getElementById('tn-bracket-wrap').classList.add('hidden');
+  tnUpdate();
+}
+
+function tnFillFrom(rows, sortFn) {
+  const pool = sortFn ? [...rows].sort(sortFn) : [...rows];
+  const usedIds = new Set();
+  for (let i = 0; i < tn.slots.length; i++) {
+    if (tn.slots[i]) usedIds.add(tn.slots[i].owned_fighter_id);
+  }
+  for (let i = 0; i < tn.slots.length; i++) {
+    if (tn.slots[i]) continue;
+    const next = pool.find((r) => !usedIds.has(r.owned_fighter_id));
+    if (!next) break;
+    tn.slots[i] = next;
+    usedIds.add(next.owned_fighter_id);
+  }
+  tn.generated = false;
+  document.getElementById('tn-bracket-wrap').classList.add('hidden');
+  tnUpdate();
+}
+
+function tnInit() {
+  document.querySelectorAll('#mode-tabs .mode-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('#mode-tabs .mode-tab').forEach((t) => t.classList.toggle('active', t === tab));
+      const mode = tab.dataset.mode;
+      document.getElementById('match-mode').hidden = mode !== 'match';
+      document.getElementById('tournament-mode').hidden = mode !== 'tournament';
+      if (mode === 'tournament') tnUpdate();
+    });
+  });
+  document.querySelectorAll('#tn-size button').forEach((b) => {
+    b.addEventListener('click', () => tnSetSize(Number(b.dataset.size)));
+  });
+  document.getElementById('tn-rpf').addEventListener('change', (e) => {
+    tn.roundsPerFight = Number(e.target.value);
+    if (tn.generated) tnRenderBracket();
+  });
+  document.getElementById('tn-stage').addEventListener('change', (e) => {
+    tn.stageId = e.target.value;
+    if (tn.generated) tnRenderBracket();
+  });
+  document.querySelectorAll('.ex-tabs[data-side="tn"] .ex-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      tn.bucket = tab.dataset.bucket;
+      document.querySelectorAll('.ex-tabs[data-side="tn"] .ex-tab').forEach((t) => t.classList.toggle('active', t === tab));
+      tnRenderList();
+    });
+  });
+  document.getElementById('tn-search').addEventListener('input', (e) => {
+    tn.search = e.target.value;
+    tnRenderList();
+  });
+  document.getElementById('tn-fill-mine').addEventListener('click', () => tnFillFrom(state.mine));
+  document.getElementById('tn-fill-random').addEventListener('click', () => {
+    const all = [...state.mine, ...state.others];
+    tnFillFrom(all, () => Math.random() - 0.5);
+  });
+  document.getElementById('tn-fill-wins').addEventListener('click', () => {
+    const all = [...state.mine, ...state.others];
+    tnFillFrom(all, (a, b) => (b.master_won || 0) - (a.master_won || 0));
+  });
+  document.getElementById('tn-shuffle').addEventListener('click', () => {
+    // Fisher-Yates on the filled slots only; preserves null gaps so a
+    // partially-filled bracket can still be re-shuffled.
+    const filled = tn.slots.filter(Boolean);
+    for (let i = filled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [filled[i], filled[j]] = [filled[j], filled[i]];
+    }
+    let k = 0;
+    tn.slots = tn.slots.map((s) => s ? filled[k++] : null);
+    tn.generated = false;
+    document.getElementById('tn-bracket-wrap').classList.add('hidden');
+    tnUpdate();
+  });
+  document.getElementById('tn-clear').addEventListener('click', () => {
+    tn.slots = new Array(tn.size).fill(null);
+    tn.activeSlot = 0;
+    tn.generated = false;
+    document.getElementById('tn-bracket-wrap').classList.add('hidden');
+    tnUpdate();
+  });
+  document.getElementById('tn-generate').addEventListener('click', () => {
+    if (tn.slots.filter(Boolean).length !== tn.size) return;
+    tn.generated = true;
+    tn.queuedId = null;
+    tnRenderBracket();
+    tnRenderConfirmBar();
+  });
+  document.getElementById('tn-start-btn').addEventListener('click', tnStartHandler);
+}
+
+let tnConfirmArmed = false;
+function tnRenderConfirmBar() {
+  const bar = document.getElementById('tn-confirm-bar');
+  // Lock the upper builder controls + picker while a tournament is queued so
+  // editing slots can't drift out of sync with the persisted bracket.
+  document.getElementById('tournament-mode').classList.toggle('locked', !!tn.queuedId);
+  if (!tn.generated) { bar.innerHTML = ''; return; }
+  if (tn.queuedId) {
+    bar.classList.add('queued');
+    let bannerHtml;
+    let actionHtml;
+    if (tn.liveStatus === 'complete') {
+      bannerHtml = '<div class="tn-queued-banner" style="border-color:#3fb950;background:#3fb95022">Tournament <b>#' + tn.queuedId + '</b> complete — champion: ' + esc(tn.liveWinnerName || '?') + '</div>';
+      actionHtml = '<button class="ex-btn" id="tn-new-btn">New tournament</button>';
+    } else if (tn.liveStatus === 'cancelled') {
+      bannerHtml = '<div class="tn-queued-banner" style="border-color:#6e7681">Tournament <b>#' + tn.queuedId + '</b> cancelled.</div>';
+      actionHtml = '<button class="ex-btn" id="tn-new-btn">New tournament</button>';
+    } else if (tn.liveStatus === 'running') {
+      bannerHtml = '<div class="tn-queued-banner" style="border-color:#da3633">Tournament <b>#' + tn.queuedId + '</b> running. Watch the bracket fill in below.</div>';
+      actionHtml = '';
+    } else {
+      bannerHtml = '<div class="tn-queued-banner">Tournament <b>#' + tn.queuedId + '</b> queued. Waiting for an exhibition worker to pick up the first match…</div>';
+      actionHtml = '<button class="ex-btn danger" id="tn-cancel-tourn-btn">Cancel tournament</button>';
+    }
+    bar.innerHTML = bannerHtml + actionHtml;
+    const cancelBtn = document.getElementById('tn-cancel-tourn-btn');
+    if (cancelBtn) cancelBtn.addEventListener('click', tnCancelHandler);
+    const newBtn = document.getElementById('tn-new-btn');
+    if (newBtn) newBtn.addEventListener('click', tnResetForNew);
+    return;
+  }
+  bar.classList.remove('queued');
+  if (!tnConfirmArmed) {
+    bar.innerHTML = '<button class="ex-btn" id="tn-start-btn">Confirm and start tournament</button>' +
+      '<span class="tn-status" id="tn-confirm-status"></span>';
+  } else {
+    bar.innerHTML = '<span style="color:#c9d1d9;font-size:13px">Start ' + tn.size + '-fighter bracket, best of ' + tn.roundsPerFight + ' round' + (tn.roundsPerFight > 1 ? 's' : '') + '?</span>' +
+      '<button class="ex-btn" id="tn-start-btn">Yes, start</button>' +
+      '<button class="ex-btn danger" id="tn-cancel-btn">Cancel</button>';
+    document.getElementById('tn-cancel-btn').addEventListener('click', () => {
+      tnConfirmArmed = false;
+      tnRenderConfirmBar();
+    });
+  }
+  document.getElementById('tn-start-btn').addEventListener('click', tnStartHandler);
+}
+
+async function tnStartHandler() {
+  if (!tnConfirmArmed) {
+    tnConfirmArmed = true;
+    tnRenderConfirmBar();
+    return;
+  }
+  const btn = document.getElementById('tn-start-btn');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  try {
+    const r = await fetch('/api/exhibition/tournament', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        size: tn.size,
+        rounds_per_fight: tn.roundsPerFight,
+        slot_ids: tn.slots.map((s) => s.owned_fighter_id),
+        stage_id: tn.stageId || null,
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      // Server says they already have one running — hydrate to that view
+      // instead of showing an error so the UI stays in sync with the DB.
+      if (err.error === 'tournament_in_progress' && err.existing_id) {
+        tn.queuedId = err.existing_id;
+        tnConfirmArmed = false;
+        tnRenderConfirmBar();
+        return;
+      }
+      btn.disabled = false;
+      btn.textContent = 'Yes, start';
+      const status = document.getElementById('tn-confirm-status');
+      if (status) status.textContent = 'Failed: ' + (err.error || r.status);
+      else alert('Failed: ' + (err.error || r.status));
+      return;
+    }
+    const { id } = await r.json();
+    tn.queuedId = id;
+    tnConfirmArmed = false;
+    tnRenderConfirmBar();
+    tnStartPolling();
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = 'Yes, start';
+    alert('Network error: ' + err.message);
+  }
+}
+
+function tnResetForNew() {
+  tnStopPolling();
+  tn.queuedId = null;
+  tn.generated = false;
+  tn.slots = new Array(tn.size).fill(null);
+  tn.activeSlot = 0;
+  tn.liveMatches = null;
+  tn.liveStatus = null;
+  tn.liveWinnerName = null;
+  document.getElementById('tn-bracket-wrap').classList.add('hidden');
+  tnUpdate();
+  tnRenderConfirmBar();
+}
+
+function tnStopPolling() {
+  if (tn.pollTimer) { clearInterval(tn.pollTimer); tn.pollTimer = null; }
+}
+
+let tnAttachedWorkerId = null;
+async function tnPollOnce() {
+  if (!tn.queuedId) return;
+  try {
+    const r = await fetch('/api/exhibition/tournament/' + tn.queuedId);
+    if (!r.ok) return;
+    const t = await r.json();
+    tn.liveMatches = t.matches || [];
+    tn.liveStatus = t.status;
+    if (t.status === 'complete' && t.winner_owned_fighter_id) {
+      const win = tn.liveMatches.find((m) => m.winner_owned_fighter_id === t.winner_owned_fighter_id);
+      tn.liveWinnerName = win?.winner_name || null;
+    } else {
+      tn.liveWinnerName = null;
+    }
+    tnRenderBracket();
+    tnRenderConfirmBar();
+    // Manage the live stream embed. Re-attach only when worker changes so
+    // we don't tear down the MJPEG <img> on every poll tick.
+    const wrap = document.getElementById('tn-stream-wrap');
+    const host = document.getElementById('tn-stream-host');
+    const title = document.getElementById('tn-stream-title');
+    if (t.stream_worker_id) {
+      const running = tn.liveMatches.find((m) => m.id === t.running_match_id);
+      const label = running && running.home_name && running.away_name
+        ? running.home_name + ' vs ' + running.away_name
+        : 'Live match';
+      title.textContent = label;
+      wrap.classList.remove('hidden');
+      if (t.stream_worker_id !== tnAttachedWorkerId) {
+        tnAttachedWorkerId = t.stream_worker_id;
+        host.innerHTML = '<img src="/stream/' + t.stream_worker_id + '" alt="">';
+      }
+    } else {
+      tnAttachedWorkerId = null;
+      wrap.classList.add('hidden');
+      host.innerHTML = '<div class="placeholder">Waiting for stream…</div>';
+    }
+    if (t.status === 'complete' || t.status === 'cancelled' || t.status === 'failed') {
+      tnStopPolling();
+    }
+  } catch {}
+}
+
+function tnStartPolling() {
+  tnStopPolling();
+  tnPollOnce();
+  tn.pollTimer = setInterval(tnPollOnce, 2500);
+}
+
+async function tnCancelHandler() {
+  if (!tn.queuedId) return;
+  if (!confirm('Cancel tournament #' + tn.queuedId + '? This can only be done while it is still pending.')) return;
+  const btn = document.getElementById('tn-cancel-tourn-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+  try {
+    const r = await fetch('/api/exhibition/tournament/' + tn.queuedId + '/cancel', { method: 'POST' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      alert('Cancel failed: ' + (err.error || r.status));
+      if (btn) { btn.disabled = false; btn.textContent = 'Cancel tournament'; }
+      return;
+    }
+    tnStopPolling();
+    tn.queuedId = null;
+    tn.generated = false;
+    tn.slots = new Array(tn.size).fill(null);
+    tn.activeSlot = 0;
+    tn.liveMatches = null;
+    tn.liveStatus = null;
+    tn.liveWinnerName = null;
+    document.getElementById('tn-bracket-wrap').classList.add('hidden');
+    tnUpdate();
+    tnRenderConfirmBar();
+  } catch (err) {
+    alert('Network error: ' + err.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'Cancel tournament'; }
+  }
+}
+
+tnInit();
 loadFighters();
+</script>
+</body></html>`;
+
+const TOURNAMENTS_HTML = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>Tournaments · MugenBattle</title>
+<style>${COMMON_CSS}
+  .tt-card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .tt-hdr { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tt-hdr .tt-id { font-size: 14px; font-weight: 600; color: #c9d1d9; }
+  .tt-hdr .tt-meta { color: #8b949e; font-size: 12px; }
+  .tt-hdr .tt-pill { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; padding: 2px 7px; border-radius: 999px; font-weight: 600; }
+  .tt-hdr .tt-pill.running { background: #da363322; color: #f85149; border: 1px solid #f85149; }
+  .tt-hdr .tt-pill.queued { background: #30363d; color: #8b949e; }
+  .tt-hdr .tt-progress { margin-left: auto; font-size: 12px; color: #8b949e; font-variant-numeric: tabular-nums; }
+  .tt-stream { background: #161b22; border-radius: 8px; margin-bottom: 12px; }
+  .tt-stream .ex-stream { aspect-ratio: 4 / 3; max-width: 600px; margin: 0 auto; }
+  .tt-stream .ex-stream img { width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; display: block; }
+  .tt-stream .placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: #6e7681; font-size: 14px; }
+  .tt-stream-hdr { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; }
+  .tt-stream-hdr h3 { margin: 0; font-size: 12px; color: #c9d1d9; font-weight: 600; }
+  .tt-empty { padding: 16px; color: #6e7681; text-align: center; font-size: 13px; }
+  .tt-queue-row { display: grid; grid-template-columns: 40px 80px 1fr auto; gap: 12px; align-items: center; padding: 10px 14px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
+  .tt-queue-row .pos { color: #8b949e; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .tt-queue-row .id { color: #c9d1d9; font-weight: 600; }
+  .tt-queue-row .meta { color: #8b949e; font-size: 12px; }
+  .tt-queue-row .when { color: #6e7681; font-size: 11px; text-align: right; }
+  .live-pill-ex { display: inline-block; padding: 2px 8px; background: #da3633; color: #fff; border-radius: 999px; font-size: 11px; font-weight: 600; animation: live-pulse 1.6s infinite; }
+  @keyframes live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+  /* Bracket — same renderer as the /exhibition tournament tab */
+  .tn-bracket-scroll { overflow-x: auto; padding-bottom: 8px; }
+  .tn-bracket-titles { display: flex; }
+  .tn-bracket-titles > div { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.4px; text-align: center; margin-bottom: 8px; }
+  .tn-bracket { position: relative; }
+  .tn-bracket .tn-match { position: absolute; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; font-size: 12px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; }
+  .tn-bracket .tn-match.tn-champion { border-color: #f0ae3c; background: #1d232b; }
+  .tn-bracket .tn-match.tn-running { border-color: #da3633; box-shadow: 0 0 0 2px rgba(218,54,51,0.25); animation: tn-running-pulse 1.6s infinite; }
+  .tn-bracket .tn-match.tn-done { border-color: #21262d; }
+  .tn-bracket .tn-match .tn-fighter { padding: 3px 0; color: #c9d1d9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; }
+  .tn-bracket .tn-match .tn-fighter.tbd { color: #6e7681; font-style: italic; }
+  .tn-bracket .tn-match .tn-fighter.winner { color: #3fb950; font-weight: 600; }
+  .tn-bracket .tn-match .tn-fighter.loser { color: #6e7681; text-decoration: line-through; }
+  .tn-bracket .tn-match .tn-fighter .seed { color: #6e7681; font-size: 10px; margin-right: 6px; font-variant-numeric: tabular-nums; display: inline-block; min-width: 18px; }
+  .tn-bracket-svg { position: absolute; top: 0; left: 0; pointer-events: none; }
+  .tn-bracket-svg path { stroke: #30363d; stroke-width: 1.5; fill: none; }
+  @keyframes tn-running-pulse { 0%,100% { box-shadow: 0 0 0 2px rgba(218,54,51,0.25); } 50% { box-shadow: 0 0 0 3px rgba(218,54,51,0.5); } }
+  .tn-bracket .tn-coinflip { cursor: help; font-size: 11px; opacity: 0.85; }
+</style></head>
+<body>
+<h1>🏆 Tournaments</h1>
+<nav>
+  <a href="/">Live</a>
+  <a href="/leagues">Leagues</a>
+  <a href="/pyramid">Pyramid</a>
+  <a href="/team">My Team</a>
+  <a href="/market">Market</a>
+  <a href="/exhibition">Exhibition</a>
+  <a href="/trades">Trades</a>
+  <a href="/tournaments" class="active">Tournaments</a>
+  <a href="/leaderboard">Leaderboard</a>
+</nav>
+
+<div class="panel" style="margin-bottom: 16px">
+  <p style="margin:0;font-size:13px;color:#8b949e">Live brackets and the queue. <span id="cap-line"></span> Each user can have one active tournament — others wait in queue. Drawn matches are tiebroken by coin flip (🪙).</p>
+</div>
+
+<h2 style="font-size:11px;text-transform:uppercase;letter-spacing:0.4px;color:#8b949e;margin:0 0 8px">Active</h2>
+<div id="active-host"></div>
+<h2 id="queue-hdr" style="font-size:11px;text-transform:uppercase;letter-spacing:0.4px;color:#8b949e;margin:18px 0 8px;display:none">Queue</h2>
+<div id="queue-host"></div>
+<h2 id="recent-hdr" style="font-size:11px;text-transform:uppercase;letter-spacing:0.4px;color:#8b949e;margin:18px 0 8px;display:none">Recent champions</h2>
+<div id="recent-host"></div>
+
+<script>
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+
+// Track which worker each card's MJPEG is attached to so we don't tear
+// down the <img> on every refresh tick (browser would reset the stream).
+const attachedStreams = {};
+
+function renderBracketInto(t, hostId) {
+  const host = document.getElementById(hostId);
+  if (!host) return;
+  const rounds = Math.log2(t.size);
+  // Match height has to clear two fighter rows + padding — same dims as
+  // /exhibition's renderer or the boxes start visually overlapping.
+  const matchH = t.size >= 32 ? 46 : 60;
+  const matchW = t.size >= 32 ? 170 : 200;
+  const matchGap = t.size >= 32 ? 10 : 16;
+  const colGap = 48;
+  const firstRoundCount = t.size / 2;
+  const totalH = firstRoundCount * matchH + (firstRoundCount - 1) * matchGap;
+  const totalW = (rounds + 1) * matchW + rounds * colGap;
+  const matchByKey = new Map();
+  for (const m of t.matches) matchByKey.set(m.round + ':' + m.match_index, m);
+  const slots = [];
+  for (let r = 0; r < rounds; r++) {
+    const count = firstRoundCount / Math.pow(2, r);
+    const slotH = totalH / count;
+    for (let m = 0; m < count; m++) {
+      const x = r * (matchW + colGap);
+      const y = m * slotH + (slotH - matchH) / 2;
+      slots.push({ r, m, x, y, w: matchW, h: matchH, live: matchByKey.get(r + ':' + m) });
+    }
+  }
+  const champX = rounds * (matchW + colGap);
+  const champY = (totalH - matchH) / 2;
+  // Round titles
+  const roundNames = { 1: 'Final', 2: 'Semifinal', 3: 'Quarterfinal', 4: 'Round of 16', 5: 'Round of 32', 6: 'Round of 64' };
+  let titlesHtml = '<div class="tn-bracket-titles" style="width:' + totalW + 'px">';
+  for (let r = 0; r < rounds; r++) {
+    const remaining = rounds - r;
+    const title = roundNames[remaining] || ('Round ' + (r + 1));
+    const left = r === 0 ? 0 : colGap;
+    titlesHtml += '<div style="width:' + matchW + 'px;margin-left:' + left + 'px">' + esc(title) + '</div>';
+  }
+  titlesHtml += '<div style="width:' + matchW + 'px;margin-left:' + colGap + 'px;color:#f0ae3c">Champion</div>';
+  titlesHtml += '</div>';
+  // SVG connectors
+  let svg = '<svg class="tn-bracket-svg" width="' + totalW + '" height="' + totalH + '">';
+  for (let r = 0; r < rounds; r++) {
+    const ms = slots.filter((s) => s.r === r);
+    for (let i = 0; i < ms.length; i += 2) {
+      const upper = ms[i]; const lower = ms[i + 1];
+      const next = slots.find((s) => s.r === r + 1 && s.m === Math.floor(i / 2));
+      const xRight = upper.x + upper.w;
+      const yU = upper.y + upper.h / 2;
+      if (!lower) {
+        if (!next) {
+          // Final → champion stub
+          svg += '<path d="M ' + xRight + ' ' + yU + ' L ' + champX + ' ' + (champY + matchH / 2) + '"/>';
+        } else {
+          svg += '<path d="M ' + xRight + ' ' + yU + ' L ' + next.x + ' ' + (next.y + next.h / 2) + '"/>';
+        }
+        continue;
+      }
+      if (!next) continue;
+      const yL = lower.y + lower.h / 2;
+      const xMid = xRight + colGap / 2;
+      const yMid = (yU + yL) / 2;
+      const xNext = next.x;
+      const yNext = next.y + next.h / 2;
+      svg += '<path d="M ' + xRight + ' ' + yU + ' L ' + xMid + ' ' + yU + ' L ' + xMid + ' ' + yL + ' L ' + xRight + ' ' + yL + '"/>';
+      svg += '<path d="M ' + xMid + ' ' + yMid + ' L ' + xNext + ' ' + yNext + '"/>';
+    }
+  }
+  // Connector from final to champion (for sizes >= 4 where there's a round before champ)
+  const finalSlot = slots.find((s) => s.r === rounds - 1);
+  if (finalSlot) {
+    svg += '<path d="M ' + (finalSlot.x + finalSlot.w) + ' ' + (finalSlot.y + finalSlot.h / 2) + ' L ' + champX + ' ' + (champY + matchH / 2) + '"/>';
+  }
+  svg += '</svg>';
+  // Match boxes
+  let boxes = '';
+  for (const s of slots) {
+    const style = 'left:' + s.x + 'px;top:' + s.y + 'px;width:' + s.w + 'px;height:' + s.h + 'px';
+    const live = s.live;
+    const f1Name = live?.home_name;
+    const f2Name = live?.away_name;
+    const f1Id = live?.home_owned_fighter_id;
+    const f2Id = live?.away_owned_fighter_id;
+    const winnerId = live?.winner_owned_fighter_id;
+    const status = live?.status || 'pending';
+    const f1Won = winnerId && f1Id === winnerId;
+    const f2Won = winnerId && f2Id === winnerId;
+    const f1Lost = winnerId && f1Id && f1Id !== winnerId;
+    const f2Lost = winnerId && f2Id && f2Id !== winnerId;
+    const coinflip = !!live?.was_coinflip;
+    const crashFlip = !!live?.was_crash;
+    const coinIcon = coinflip
+      ? ' <span class="tn-coinflip" title="' + (crashFlip ? 'Match crashed' : 'Match ended in a draw') + ' — winner picked by coin flip">🪙</span>'
+      : '';
+    const cell = (name, seed, won, lost) => {
+      if (!name) return '<div class="tn-fighter tbd"><span class="seed"></span>TBD</div>';
+      const cls = 'tn-fighter' + (won ? ' winner' : '') + (lost ? ' loser' : '');
+      const flag = won && coinflip ? coinIcon : '';
+      return '<div class="' + cls + '"><span class="seed">' + (seed ? '#' + seed : '') + '</span>' + esc(name) + flag + '</div>';
+    };
+    const s1 = s.r === 0 ? s.m * 2 + 1 : '';
+    const s2 = s.r === 0 ? s.m * 2 + 2 : '';
+    const matchCls = 'tn-match' + (status === 'running' ? ' tn-running' : '') + (status === 'complete' ? ' tn-done' : '');
+    boxes += '<div class="' + matchCls + '" style="' + style + '">' + cell(f1Name, s1, f1Won, f1Lost) + cell(f2Name, s2, f2Won, f2Lost) + '</div>';
+  }
+  // Champion box
+  const champStyle = 'left:' + champX + 'px;top:' + champY + 'px;width:' + matchW + 'px;height:' + matchH + 'px';
+  let champHtml;
+  if (t.status === 'complete' && t.winner_owned_fighter_id) {
+    const win = t.matches.find((m) => m.winner_owned_fighter_id === t.winner_owned_fighter_id);
+    champHtml = '<div class="tn-match tn-champion" style="' + champStyle + '"><div class="tn-fighter" style="text-align:center">🏆 ' + esc(win?.winner_name || '?') + '</div></div>';
+  } else {
+    champHtml = '<div class="tn-match tn-champion" style="' + champStyle + '"><div class="tn-fighter tbd" style="text-align:center">🏆 Champion: TBD</div></div>';
+  }
+  host.style.width = totalW + 'px';
+  host.style.height = totalH + 'px';
+  host.innerHTML = svg + boxes + champHtml;
+  // Inject titles row above the bracket (host's parent .tn-bracket-scroll)
+  const scrollEl = host.parentNode;
+  let titleRow = scrollEl.previousElementSibling;
+  if (!titleRow || !titleRow.classList.contains('tn-bracket-titles-host')) {
+    titleRow = document.createElement('div');
+    titleRow.className = 'tn-bracket-titles-host';
+    scrollEl.parentNode.insertBefore(titleRow, scrollEl);
+  }
+  titleRow.innerHTML = titlesHtml;
+}
+
+function renderTournamentCard(t) {
+  const totalRounds = Math.log2(t.size);
+  const matchesDone = t.matches.filter((m) => m.status === 'complete').length;
+  const total = t.matches.length;
+  const stream = t.stream_worker_id
+    ? '<div class="tt-stream"><div class="tt-stream-hdr"><h3>Live match</h3><span class="live-pill-ex">● LIVE</span></div><div class="ex-stream" id="stream-' + t.id + '"><div class="placeholder">Connecting…</div></div></div>'
+    : '';
+  const userTag = t.requester_is_bot
+    ? '<span style="color:#8b949e">' + esc(t.requester_username || '?') + ' <span style="font-size:9px;background:#21262d;padding:1px 4px;border-radius:3px">BOT</span></span>'
+    : '<span style="color:#58a6ff">@' + esc(t.requester_username || '?') + '</span>';
+  return '<div class="tt-card">' +
+    '<div class="tt-hdr">' +
+      '<span class="tt-id">#' + t.id + '</span>' +
+      '<span class="tt-pill running">running</span>' +
+      '<span class="tt-meta">by ' + userTag + ' · ' + t.size + ' fighters · best of ' + t.rounds_per_fight + '</span>' +
+      '<span class="tt-progress" id="progress-' + t.id + '">' + matchesDone + ' / ' + total + ' matches done</span>' +
+    '</div>' +
+    stream +
+    '<div class="tn-bracket-scroll"><div class="tn-bracket" id="bracket-' + t.id + '"></div></div>' +
+  '</div>';
+}
+
+async function refresh() {
+  let r;
+  try { r = await fetch('/api/tournaments'); }
+  catch { return; }
+  if (!r.ok) return;
+  const { tournaments, recent, max_concurrent } = await r.json();
+  document.getElementById('cap-line').textContent = 'Up to ' + max_concurrent + ' tournament' + (max_concurrent === 1 ? '' : 's') + ' run concurrently;';
+  const running = tournaments.filter((t) => t.status === 'running');
+  const queued = tournaments.filter((t) => t.status === 'pending');
+
+  const activeHost = document.getElementById('active-host');
+  if (running.length === 0) {
+    activeHost.innerHTML = '<div class="tt-empty">No tournaments running.</div>';
+    Object.keys(attachedStreams).forEach((k) => delete attachedStreams[k]);
+  } else {
+    // Detect added/removed cards. If the set of IDs changed, re-render the
+    // cards and clear stream attachments so the renderer rebuilds. Otherwise
+    // render brackets in-place (and only re-attach streams when worker changes).
+    const existing = new Set(Array.from(activeHost.querySelectorAll('.tt-card .tt-id')).map((el) => Number(el.textContent.replace('#', ''))));
+    const wanted = new Set(running.map((t) => t.id));
+    const sameSet = existing.size === wanted.size && [...existing].every((id) => wanted.has(id));
+    if (!sameSet) {
+      activeHost.innerHTML = running.map(renderTournamentCard).join('');
+      Object.keys(attachedStreams).forEach((k) => delete attachedStreams[k]);
+    }
+    for (const t of running) {
+      renderBracketInto(t, 'bracket-' + t.id);
+      // Update the in-card progress text in place so it stays fresh across
+      // refreshes even when the card itself isn't rebuilt.
+      const progEl = document.getElementById('progress-' + t.id);
+      if (progEl) {
+        const done = t.matches.filter((m) => m.status === 'complete').length;
+        progEl.textContent = done + ' / ' + t.matches.length + ' matches done';
+      }
+      if (t.stream_worker_id) {
+        const host = document.getElementById('stream-' + t.id);
+        if (host && attachedStreams[t.id] !== t.stream_worker_id) {
+          attachedStreams[t.id] = t.stream_worker_id;
+          host.innerHTML = '<img src="/stream/' + t.stream_worker_id + '" alt="">';
+        }
+      } else if (attachedStreams[t.id]) {
+        delete attachedStreams[t.id];
+        const host = document.getElementById('stream-' + t.id);
+        if (host) host.innerHTML = '<div class="placeholder">Match transitioning…</div>';
+      }
+    }
+  }
+
+  // Recent champions — clickable cards that expand into the full bracket.
+  const recentList = recent || [];
+  document.getElementById('recent-hdr').style.display = recentList.length ? '' : 'none';
+  const recentHost = document.getElementById('recent-host');
+  // Preserve which recent cards were expanded across refreshes.
+  const expanded = new Set(Array.from(recentHost.querySelectorAll('.tt-card[data-expanded="1"]')).map((el) => Number(el.dataset.id)));
+  recentHost.innerHTML = recentList.map((t) => {
+    const userTag = t.requester_is_bot
+      ? '<span style="color:#8b949e">' + esc(t.requester_username || '?') + '</span>'
+      : '<span style="color:#58a6ff">@' + esc(t.requester_username || '?') + '</span>';
+    const champMatch = t.matches.find((m) => m.winner_owned_fighter_id === t.winner_owned_fighter_id);
+    const champ = champMatch?.winner_name || '?';
+    const isExpanded = expanded.has(t.id);
+    return '<div class="tt-card" data-id="' + t.id + '" data-expanded="' + (isExpanded ? '1' : '0') + '">' +
+      '<div class="tt-hdr" style="cursor:pointer" data-toggle="' + t.id + '">' +
+        '<span class="tt-id">#' + t.id + '</span>' +
+        '<span class="tt-pill" style="background:#3fb95022;color:#3fb950;border:1px solid #3fb950">complete</span>' +
+        '<span class="tt-meta">by ' + userTag + ' · ' + t.size + ' fighters · best of ' + t.rounds_per_fight + '</span>' +
+        '<span class="tt-progress">🏆 ' + esc(champ) + '</span>' +
+        '<span style="color:#6e7681;font-size:10px;margin-left:8px">' + (isExpanded ? '▾' : '▸') + '</span>' +
+      '</div>' +
+      (isExpanded ? '<div class="tn-bracket-scroll"><div class="tn-bracket" id="recent-bracket-' + t.id + '"></div></div>' : '') +
+    '</div>';
+  }).join('');
+  recentHost.querySelectorAll('[data-toggle]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const id = Number(el.dataset.toggle);
+      const card = el.closest('.tt-card');
+      const willExpand = card.dataset.expanded !== '1';
+      card.dataset.expanded = willExpand ? '1' : '0';
+      // Re-trigger refresh to render bracket into the now-expanded card
+      refresh();
+    });
+  });
+  for (const t of recentList) {
+    if (expanded.has(t.id)) renderBracketInto(t, 'recent-bracket-' + t.id);
+  }
+
+  document.getElementById('queue-hdr').style.display = queued.length ? '' : 'none';
+  document.getElementById('queue-host').innerHTML = queued.map((t, i) => {
+    const userTag = t.requester_is_bot
+      ? esc(t.requester_username) + ' <span style="font-size:9px;background:#21262d;padding:1px 4px;border-radius:3px;color:#8b949e">BOT</span>'
+      : '<span style="color:#58a6ff">@' + esc(t.requester_username) + '</span>';
+    return '<div class="tt-queue-row">' +
+      '<span class="pos">' + (i + 1) + '</span>' +
+      '<span class="id">#' + t.id + '</span>' +
+      '<span class="meta">by ' + userTag + ' · ' + t.size + ' fighters · best of ' + t.rounds_per_fight + '</span>' +
+      '<span class="when">' + esc(t.created_at) + '</span>' +
+    '</div>';
+  }).join('');
+}
+
+refresh();
+setInterval(refresh, 3000);
 </script>
 </body></html>`;
 
@@ -1397,6 +2741,18 @@ const PYRAMID_HTML = `<!doctype html>
   .league-hdr .pending { color: #8b949e; font-size: 12px; margin-left: auto; }
   .empty-state { text-align: center; padding: 60px 20px; color: #8b949e; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
   .legend { padding: 8px 14px; background: #0d1117; border-radius: 6px; color: #6e7681; font-size: 11px; margin-top: 12px; display: flex; gap: 16px; }
+  .queue-row { display: grid; grid-template-columns: 30px 1fr auto; gap: 10px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; align-items: center; font-size: 13px; }
+  .queue-row.next-up { border-left: 3px solid #3fb950; background: linear-gradient(90deg, rgba(63,185,80,0.10) 0%, #161b22 40%); }
+  .queue-row.mine { border-color: #58a6ff; background: #1d2a3e; }
+  .queue-row .pos { color: #6e7681; font-variant-numeric: tabular-nums; }
+  .queue-row .tname { color: #c9d1d9; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .queue-row .tname .user { color: #8b949e; font-weight: 400; font-size: 12px; margin-left: 6px; }
+  .queue-row .tname .badge { display: inline-block; font-size: 9px; padding: 1px 5px; border-radius: 4px; background: #30363d; color: #8b949e; margin-left: 6px; vertical-align: middle; text-transform: uppercase; letter-spacing: 0.3px; }
+  .queue-row .tname .badge.me { background: #58a6ff; color: #0d1117; font-weight: 600; }
+  .queue-row .tname .badge.bot { background: #21262d; color: #6e7681; }
+  .queue-row .zone-tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; padding: 3px 8px; border-radius: 4px; }
+  .queue-row .zone-tag.in { background: rgba(63,185,80,0.18); color: #3fb950; }
+  .queue-row .zone-tag.wait { color: #6e7681; }
 </style></head>
 <body style="position:relative">
 ${AUTH_BAR_HTML}
@@ -1409,6 +2765,7 @@ ${AUTH_BAR_HTML}
   <a href="/market">Market</a>
   <a href="/exhibition">Exhibition</a>
   <a href="/trades">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -1490,7 +2847,40 @@ async function load() {
     '</div>';
   }).join('');
 
-  root.innerHTML = header + tiers +
+  // Queue to get in: orphan teams in pick order. Top "slots_opening" are
+  // highlighted as "in" for next season.
+  let queueHtml = '';
+  if (data.queue && data.queue.length) {
+    const slots = data.slots_opening || 3;
+    const queueRows = data.queue.map((q, i) => {
+      const inNext = q.will_seat_next_season;
+      const cls = ['queue-row'];
+      if (inNext) cls.push('next-up');
+      if (data.viewer_team_id === q.team_id) cls.push('mine');
+      const badge = data.viewer_team_id === q.team_id
+        ? '<span class="badge me">you</span>'
+        : q.is_bot ? '<span class="badge bot">bot</span>' : '';
+      const slotTag = inNext
+        ? '<span class="zone-tag in">★ next season</span>'
+        : '<span class="zone-tag wait">' + (i - slots + 1) + ' in line</span>';
+      return '<div class="' + cls.join(' ') + '">' +
+        '<div class="pos">' + (i + 1) + '</div>' +
+        '<div class="tname"><a href="/team/' + q.team_id + '" style="color:inherit;text-decoration:none">' + esc(q.team_name) + '</a>' + badge +
+          '<span class="user">@' + esc(q.username) + '</span>' +
+        '</div>' +
+        slotTag +
+      '</div>';
+    }).join('');
+    queueHtml =
+      '<div class="tier" style="margin-top:30px">' +
+        '<div class="hdr">' +
+          '<span class="tier-n" style="color:#8b949e">Queue to get in</span>' +
+          '<span class="tname">Bottom-tier seats opening at next season transition: ' + slots + '</span>' +
+        '</div>' +
+        '<div class="rows queue">' + queueRows + '</div>' +
+      '</div>';
+  }
+  root.innerHTML = header + tiers + queueHtml +
     '<div class="legend">' +
       '<span>Columns: pos · team · played · W-D-L · match W-L · diff · pts</span>' +
     '</div>';
@@ -1551,6 +2941,7 @@ ${AUTH_BAR_HTML}
   <a href="/market" class="active">Market</a>
   <a href="/exhibition">Exhibition</a>
   <a href="/trades">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -1934,13 +3325,16 @@ const TEAM_HTML = `<!doctype html>
   .imports-list .status-approved { color: #3fb950; font-weight: 600; }
   .imports-list .status-rejected { color: #f85149; font-weight: 600; }
   .imports-list .status-other { color: #f0ae3c; }
-  .schedule-row { display: grid; grid-template-columns: 60px 1.5fr 50px 1.5fr 70px 70px; gap: 10px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; font-size: 12px; margin-bottom: 4px; align-items: center; font-variant-numeric: tabular-nums; }
+  .schedule-row { display: grid; grid-template-columns: 60px 1.5fr 50px 1.5fr 70px 70px; gap: 2px 10px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; font-size: 12px; margin-bottom: 4px; align-items: center; font-variant-numeric: tabular-nums; }
   .schedule-row .sched-round { color: #8b949e; }
   .schedule-row .sched-team { text-align: left; }
   .schedule-row .sched-team.away { text-align: right; }
   .schedule-row .sched-team .us { color: #58a6ff; font-weight: 600; }
   .schedule-row .sched-team .sched-team-link { color: #c9d1d9; text-decoration: none; }
   .schedule-row .sched-team .sched-team-link:hover { color: #58a6ff; text-decoration: underline; }
+  .schedule-row .sched-fighter { color: #6e7681; font-size: 11px; font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .schedule-row .sched-fighter.home { grid-column: 2; }
+  .schedule-row .sched-fighter.away { grid-column: 4; text-align: right; }
   .schedule-row .sched-vs { color: #6e7681; text-align: center; }
   .schedule-row .sched-score { color: #f0ae3c; font-weight: 600; text-align: center; }
   .schedule-row .sched-score.loss { color: #f85149; }
@@ -1998,6 +3392,7 @@ ${AUTH_BAR_HTML}
   <a href="/market">Market</a>
   <a href="/exhibition">Exhibition</a>
   <a href="/trades">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -2031,7 +3426,13 @@ ${AUTH_BAR_HTML}
       <span class="msg" id="rotate-msg"></span>
     </div>
     <div class="rotate-config" id="rotate-config">
-      <div class="rule-row">
+      <div class="rule-row" style="gap:18px;flex-wrap:wrap">
+        <span class="rule-suffix">Mode:</span>
+        <label class="rule-check"><input type="radio" name="rotation-mode" id="mode-conditional" value="stamina" onchange="saveRotation()"><span>Conditional</span></label>
+        <label class="rule-check"><input type="radio" name="rotation-mode" id="mode-seq-active" value="sequential_active" onchange="saveRotation()"><span>Sequential — active</span></label>
+        <label class="rule-check"><input type="radio" name="rotation-mode" id="mode-seq-full" value="sequential_full" onchange="saveRotation()"><span>Sequential — active + bench</span></label>
+      </div>
+      <div class="rule-row" id="cond-row-stamina">
         <label class="rule-check">
           <input type="checkbox" id="rotate-on-stamina" onchange="saveRotation()">
           <span>Swap when stamina drops below</span>
@@ -2039,7 +3440,7 @@ ${AUTH_BAR_HTML}
         <input type="range" id="rotate-threshold" min="0" max="1" step="0.05" value="0.85" oninput="updateThresholdLabel()" onchange="saveRotation()">
         <span class="rotate-threshold-val" id="rotate-threshold-val">0.85</span>
       </div>
-      <div class="rule-row">
+      <div class="rule-row" id="cond-row-losses">
         <label class="rule-check">
           <input type="checkbox" id="rotate-on-losses" onchange="saveRotation()">
           <span>Swap after</span>
@@ -2047,7 +3448,7 @@ ${AUTH_BAR_HTML}
         <input type="number" id="rotate-loss-streak" min="1" max="20" step="1" value="3" onchange="saveRotation()" style="max-width:70px">
         <span class="rule-suffix">consecutive losses</span>
       </div>
-      <div class="rotate-hint">
+      <div class="rotate-hint" id="rotate-hint">
         Rotation is between fixtures only. The fielded fighter loses <b>0.20</b>
         stamina after their match; every other roster fighter on your team
         gains <b>0.25</b> while resting (capped at 1.00).
@@ -2285,6 +3686,9 @@ async function loadSchedule() {
       else if (f.winner_team_id == null) { scoreCls = 'draw'; statusLabel = 'drew'; statusCls = 'draw'; }
       else { scoreCls = 'loss'; statusLabel = 'lost'; statusCls = 'loss'; }
     }
+    const fighterCell = (cls, name) => name
+      ? '<div class="sched-fighter ' + cls + '">' + esc(name) + '</div>'
+      : '';
     return '<div class="schedule-row">' +
       '<div class="sched-round">L' + f.tier + ' · R' + f.round_num + '.' + f.slot_num + '</div>' +
       '<div class="sched-team">' + teamCell(homeCls, homeId, f.home_name) + '</div>' +
@@ -2292,6 +3696,8 @@ async function loadSchedule() {
       '<div class="sched-team away">' + teamCell(awayCls, awayId, f.away_name) + '</div>' +
       '<div class="sched-score ' + scoreCls + '">' + score + '</div>' +
       '<div class="sched-status ' + statusCls + '">' + esc(statusLabel) + '</div>' +
+      fighterCell('home', f.home_fighter) +
+      fighterCell('away', f.away_fighter) +
     '</div>';
   };
   host.innerHTML =
@@ -2378,6 +3784,13 @@ function renderTeam() {
   if (stamChk) stamChk.checked = t.rotate_on_stamina == null ? true : !!t.rotate_on_stamina;
   if (lossChk) lossChk.checked = !!t.rotate_on_losses;
   if (streakIn) streakIn.value = t.rotation_loss_streak || 3;
+  // Mode picker. 'fixed' (legacy) maps to 'stamina' for radio purposes —
+  // it just means conditional with no conditions, which is equivalent.
+  const mode = t.rotation_mode === 'sequential_active' || t.rotation_mode === 'sequential_full'
+    ? t.rotation_mode : 'stamina';
+  const modeRadio = document.querySelector('input[name="rotation-mode"][value="' + mode + '"]');
+  if (modeRadio) modeRadio.checked = true;
+  applyModeUI(mode);
   const cfg = document.getElementById('rotate-config');
   if (cfg) cfg.classList.toggle('disabled', !t.auto_rotate);
   const active = t.fighters.filter(f => f.slot === 'active').sort((a,b) => a.priority - b.priority || a.id - b.id);
@@ -2390,6 +3803,30 @@ function renderTeam() {
     renderSection('forsale-slots', forSale);
   }
 }
+function applyModeUI(mode) {
+  const isSeq = mode === 'sequential_active' || mode === 'sequential_full';
+  const stamRow = document.getElementById('cond-row-stamina');
+  const lossRow = document.getElementById('cond-row-losses');
+  const stamChk = document.getElementById('rotate-on-stamina');
+  const lossChk = document.getElementById('rotate-on-losses');
+  if (stamRow) stamRow.style.opacity = isSeq ? '0.4' : '1';
+  if (lossRow) lossRow.style.opacity = isSeq ? '0.4' : '1';
+  if (stamChk) stamChk.disabled = isSeq;
+  if (lossChk) lossChk.disabled = isSeq;
+  const tips = isSeq ? 'Sequential rotation overrides stamina/loss-streak.' : '';
+  if (stamRow) stamRow.title = tips;
+  if (lossRow) lossRow.title = tips;
+  const hint = document.getElementById('rotate-hint');
+  if (hint) {
+    if (mode === 'sequential_active') {
+      hint.innerHTML = 'Sequential mode: cycles through your <b>5 active</b> fighters one fixture at a time, in priority order. Stamina &amp; loss-streak rules ignored.';
+    } else if (mode === 'sequential_full') {
+      hint.innerHTML = 'Sequential mode: cycles through your <b>active + bench</b> (up to 10) one fixture at a time. When a benched fighter\\'s turn comes up, they swap into active, demoting the lowest-priority active. Stamina &amp; loss-streak rules ignored.';
+    } else {
+      hint.innerHTML = 'Rotation is between fixtures only. The fielded fighter loses <b>0.20</b> stamina after their match; every other roster fighter on your team gains <b>0.25</b> while resting (capped at 1.00).';
+    }
+  }
+}
 
 function updateThresholdLabel() {
   const slider = document.getElementById('rotate-threshold');
@@ -2399,6 +3836,9 @@ function updateThresholdLabel() {
 
 async function saveRotation() {
   const on = document.getElementById('auto-rotate').checked;
+  const modeEl = document.querySelector('input[name="rotation-mode"]:checked');
+  const mode = modeEl ? modeEl.value : 'stamina';
+  applyModeUI(mode);
   const stam = document.getElementById('rotate-on-stamina').checked;
   const loss = document.getElementById('rotate-on-losses').checked;
   const threshold = Number(document.getElementById('rotate-threshold').value);
@@ -2419,6 +3859,7 @@ async function saveRotation() {
       auto_rotate: on,
       rotate_on_stamina: stam, rotate_on_losses: loss,
       rotation_threshold: threshold, rotation_loss_streak: streak,
+      rotation_mode: mode,
     }),
   });
   if (r.ok) {
@@ -2427,11 +3868,18 @@ async function saveRotation() {
     currentTeam.rotate_on_losses = loss ? 1 : 0;
     currentTeam.rotation_threshold = threshold;
     currentTeam.rotation_loss_streak = streak;
+    currentTeam.rotation_mode = mode;
     msg.className = 'msg ok';
-    const rules = [];
-    if (stam) rules.push('stamina<' + threshold.toFixed(2));
-    if (loss) rules.push(streak + 'L streak');
-    msg.textContent = on ? (rules.length ? 'saved · ' + rules.join(' or ') : 'saved') : 'auto-rotate off';
+    let summary;
+    if (mode === 'sequential_active') summary = 'sequential · active 5';
+    else if (mode === 'sequential_full') summary = 'sequential · active + bench';
+    else {
+      const rules = [];
+      if (stam) rules.push('stamina<' + threshold.toFixed(2));
+      if (loss) rules.push(streak + 'L streak');
+      summary = rules.length ? rules.join(' or ') : 'no rules';
+    }
+    msg.textContent = on ? 'saved · ' + summary : 'auto-rotate off';
   } else {
     const body = await r.json().catch(() => ({}));
     msg.className = 'msg err'; msg.textContent = body.error || 'error';
@@ -2818,9 +4266,13 @@ const LEAGUES_HTML = `<!doctype html>
   .worker .tier { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
   .worker .matchup { font-size: 14px; margin: 2px 0 6px; color: #c9d1d9; }
   .worker .matchup .score { color: #f0ae3c; font-variant-numeric: tabular-nums; font-weight: 600; margin: 0 8px; }
+  .worker .matchup a { color: inherit; text-decoration: none; }
+  .worker .matchup a:hover { color: #58a6ff; text-decoration: underline; }
   .worker .meta { color: #8b949e; font-size: 11px; display: flex; gap: 12px; flex-wrap: wrap; }
   .worker .fighters { font-size: 12px; color: #c9d1d9; margin: 4px 0 6px; }
   .worker .fighters .vs { color: #6e7681; margin: 0 6px; }
+  .worker .fighters .name-link { cursor: pointer; }
+  .worker .fighters .name-link:hover { color: #58a6ff; text-decoration: underline; }
   .worker .wid { color: #6e7681; font-size: 10px; text-transform: uppercase; }
   .empty-state { text-align: center; padding: 40px 20px; color: #6e7681; background: #161b22; border: 1px dashed #30363d; border-radius: 10px; }
 </style></head>
@@ -2835,11 +4287,111 @@ ${AUTH_BAR_HTML}
   <a href="/market">Market</a>
   <a href="/exhibition">Exhibition</a>
   <a href="/trades">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div id="workers"></div>
+
+<div class="modal-bg" id="modal-bg" onclick="if(event.target.id==='modal-bg')closeModal()">
+  <div class="modal modal-shell">
+    <div class="close" onclick="closeModal()">×</div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
 <script>
-function esc(s){return String(s==null?'':s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}
+function esc(s){return String(s==null?'':s).replace(/[<>&'"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&#39;','"':'&quot;'}[c]))}
+let followedMastersCache = null;
+async function loadFollowedMasters() {
+  if (followedMastersCache) return followedMastersCache;
+  try {
+    const r = await fetch('/api/follow');
+    if (!r.ok) { followedMastersCache = new Set(); return followedMastersCache; }
+    const j = await r.json();
+    followedMastersCache = new Set(j.masters || []);
+  } catch { followedMastersCache = new Set(); }
+  return followedMastersCache;
+}
+async function toggleFollowMaster(masterId, btn) {
+  const set = await loadFollowedMasters();
+  const isOn = set.has(masterId);
+  if (isOn) {
+    await fetch('/api/follow/master/' + masterId, { method: 'DELETE' });
+    set.delete(masterId);
+    btn.textContent = '☆'; btn.title = 'Follow'; btn.style.color = '#8b949e';
+  } else {
+    const r = await fetch('/api/follow', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ kind: 'master', id: masterId }) });
+    if (r.status === 401) { alert('Sign in to follow fighters.'); return; }
+    set.add(masterId);
+    btn.textContent = '★'; btn.title = 'Unfollow'; btn.style.color = '#f0ae3c';
+  }
+}
+async function openProfile(fileName) {
+  const r = await fetch('/api/fighter/' + encodeURIComponent(fileName));
+  if (!r.ok) return;
+  const f = await r.json();
+  const followed = await loadFollowedMasters();
+  const isFollowed = followed.has(f.id);
+  const starGlyph = isFollowed ? '★' : '☆';
+  const starColor = isFollowed ? '#f0ae3c' : '#8b949e';
+  const starTip = isFollowed ? 'Unfollow' : 'Follow';
+  const recent = (f.recent || []).map((m) => {
+    const winLose = m.victor === f.display_name || m.victor_file === f.file_name ? 'W' : (m.victor ? 'L' : 'D');
+    const isF1 = (m.f1 === (f.display_name || f.file_name)) || (m.f1_file === f.file_name);
+    const opp = isF1 ? m.f2 : m.f1;
+    const oppFile = isF1 ? m.f2_file : m.f1_file;
+    const oppCell = oppFile
+      ? 'vs <span style="cursor:pointer;color:#58a6ff;text-decoration:underline" onclick=\\'openProfile(' + JSON.stringify(oppFile) + ')\\'>' + esc(opp || '?') + '</span>'
+      : 'vs ' + esc(opp || '?');
+    return '<tr><td>' + winLose + '</td><td>' + oppCell + '</td><td style="color:#8b949e">' + esc(m.stage || '') + '</td></tr>';
+  }).join('');
+  const reasonLabel = (r) => {
+    if (!r) return '';
+    if (r === 'created') return 'starter roster';
+    if (r === 'bought_from_market') return 'bought from pool';
+    if (r === 'bought_from_user') return 'bought from owner';
+    if (r === 'auto_replenish') return 'auto-replenished';
+    if (r === 'replaced_extra_kfm') return 'replaced training dummy';
+    if (r === 'boot_sweep') return 'boot recovery';
+    if (r.startsWith('kfm_replacement:repeated_crash')) return 'system-replaced (crash)';
+    if (r.startsWith('kfm_replacement:')) return 'system-replaced';
+    return r;
+  };
+  const stateLabel = (s) => {
+    if (s === 'current') return '<span style="color:#3fb950">current</span>';
+    if (s === 'released') return '<span style="color:#d29922">released</span>';
+    if (s === 'sold') return '<span style="color:#58a6ff">sold</span>';
+    return '<span style="color:#6e7681">' + s + '</span>';
+  };
+  const ownersHtml = (f.owners && f.owners.length)
+    ? '<h2 style="margin-top:16px;font-size:12px;text-transform:uppercase;color:#8b949e">Owner history</h2><table>' +
+      f.owners.map(o => {
+        const bot = o.owner_is_bot ? ' <span style="color:#8b949e;font-size:10px;background:#21262d;border-radius:3px;padding:1px 4px">BOT</span>' : '';
+        return '<tr><td style="white-space:nowrap"><a href="/team/' + o.team_id + '">' + esc(o.team_name) + '</a> <span style="color:#8b949e">@' + esc(o.owner_username) + '</span>' + bot + '</td><td style="color:#8b949e;font-size:11px">' + esc(o.joined_at || '') + '</td><td>' + stateLabel(o.state) + '</td><td style="color:#6e7681;font-size:11px">' + esc(reasonLabel(o.reason)) + '</td></tr>';
+      }).join('') + '</table>'
+    : '';
+  document.getElementById('modal-body').innerHTML =
+    '<div class="head">' +
+      '<img class="portrait" src="/portrait/' + encodeURIComponent(f.file_name) + '.png" onerror="this.style.visibility=\\'hidden\\'">' +
+      '<div style="flex:1"><h3 style="display:flex;align-items:center;gap:10px;margin:0">' +
+      '<span>' + esc(f.display_name || f.file_name) + '</span>' +
+      '<button id="modal-star" title="' + starTip + '" style="background:none;border:0;font-size:22px;cursor:pointer;color:' + starColor + ';padding:0;line-height:1">' + starGlyph + '</button>' +
+      '</h3>' +
+      '<div class="sub">' + esc(f.author || 'unknown author') + '</div></div></div>' +
+    '<div class="stats">' +
+      '<div class="stat"><div class="v">' + f.matches_won + '</div><div class="l">Wins</div></div>' +
+      '<div class="stat"><div class="v">' + f.matches_lost + '</div><div class="l">Losses</div></div>' +
+      '<div class="stat"><div class="v">' + f.matches_drawn + '</div><div class="l">Draws</div></div>' +
+      '<div class="stat"><div class="v">' + f.win_rate + '%</div><div class="l">Win rate</div></div></div>' +
+    '<div class="field"><b>File name:</b> ' + esc(f.file_name) + '</div>' +
+    (f.author ? '<div class="field"><b>Author:</b> ' + esc(f.author) + '</div>' : '') +
+    (recent ? '<h2 style="margin-top:16px;font-size:12px;text-transform:uppercase;color:#8b949e">Recent fights</h2><table>' + recent + '</table>' : '') + tourneyWinsHtml + ownersHtml;
+  const sb = document.getElementById('modal-star');
+  if (sb) sb.onclick = () => toggleFollowMaster(f.id, sb);
+  document.getElementById('modal-bg').classList.add('open');
+}
+function closeModal() { document.getElementById('modal-bg').classList.remove('open'); }
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 function overlayHtml(w) {
   const ctx = w.context;
   if (!ctx || !ctx.fixture) {
@@ -2849,8 +4401,26 @@ function overlayHtml(w) {
     return '<div class="meta">' + esc(msg) + '</div>';
   }
   const f = ctx.fixture;
+  // Build clickable spans for fighter names (open profile modal) and team
+  // names (link to /team/<id>). Fall back to plain text when the underlying
+  // file_name / team_id isn't available.
+  const fighterTag = (display, file) => {
+    if (!display) return '';
+    if (!file) return esc(display);
+    // Single-quoted onclick + JSON.stringify (which uses double quotes
+    // internally) so apostrophes/backslashes in file names survive both
+    // HTML attribute parsing and JS evaluation.
+    return '<span class="name-link" onclick=\\'openProfile(' + JSON.stringify(file) + ')\\'>' + esc(display) + '</span>';
+  };
+  const teamTag = (name, id) => id
+    ? '<a href="/team/' + id + '">' + esc(name) + '</a>'
+    : esc(name);
   const fighterLine = (f.home_fighter && f.away_fighter)
-    ? '<div class="fighters">' + esc(f.home_fighter) + ' <span class="vs">vs</span> ' + esc(f.away_fighter) + '</div>'
+    ? '<div class="fighters">' +
+        fighterTag(f.home_fighter, f.home_master) +
+        ' <span class="vs">vs</span> ' +
+        fighterTag(f.away_fighter, f.away_master) +
+      '</div>'
     : '';
   return (
     '<div class="hdr">' +
@@ -2858,9 +4428,9 @@ function overlayHtml(w) {
       '<span class="tier">League ' + f.division.tier + '</span>' +
     '</div>' +
     '<div class="matchup">' +
-      esc(f.home_team) +
+      teamTag(f.home_team, f.home_team_id) +
       '<span class="score">' + f.home_rounds + ' – ' + f.away_rounds + '</span>' +
-      esc(f.away_team) +
+      teamTag(f.away_team, f.away_team_id) +
     '</div>' +
     fighterLine +
     '<div class="meta">' +
@@ -3001,6 +4571,7 @@ ${AUTH_BAR_HTML}
   <a href="/market">Market</a>
   <a href="/exhibition">Exhibition</a>
   <a href="/trades">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 <div class="grid">
@@ -3396,6 +4967,7 @@ ${AUTH_BAR_HTML}
   <a href="/market">Market</a>
   <a href="/exhibition">Exhibition</a>
   <a href="/trades">Trades</a>
+  <a href="/tournaments">Tournaments</a>
   <a href="/leaderboard">Leaderboard</a>
 </nav>
 
@@ -3852,8 +5424,33 @@ const server = createServer((req, res) => {
       const row = db.prepare('SELECT id FROM team WHERE user_id = ?').get(me.id);
       viewerTeamId = row?.id ?? null;
     }
+    // Queue to get in: orphan teams ordered the same way autoCreateSeason
+    // picks them (never-played first, newest user_id first within each
+    // group). Real-user signups always go ahead of bots — they get D3 slots
+    // before bots fill the rest. Limited to the next 25 because the rest
+    // probably won't surface for several seasons.
+    const queueRows = db.prepare(`
+      SELECT t.id AS team_id, t.name AS team_name,
+        u.id AS user_id, u.username, u.is_bot
+      FROM team t
+      JOIN user_account u ON u.id = t.user_id
+      WHERE t.current_league_id IS NULL
+        AND (SELECT COUNT(*) FROM owned_fighter o
+             WHERE o.team_id = t.id AND o.is_retired = 0 AND o.slot = 'active') >= 5
+      ORDER BY
+        u.is_bot ASC,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM fixture f WHERE f.home_team_id = t.id OR f.away_team_id = t.id
+        ) THEN 1 ELSE 0 END,
+        u.id DESC
+      LIMIT 25
+    `).all();
+    // How many slots open up at the bottom of the bracket per season →
+    // 1 promotion per relegating tier, so D3 frees `promotePerTier` spots.
+    const slotsOpening = parseInt(process.env.STREAM_AUTO_PROMOTE_PER_TIER || '3', 10);
+    const queue = queueRows.map((q, i) => ({ ...q, will_seat_next_season: i < slotsOpening }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ...data, viewer_team_id: viewerTeamId }));
+    res.end(JSON.stringify({ ...data, viewer_team_id: viewerTeamId, queue, slots_opening: slotsOpening }));
     return;
   }
   if (req.url === '/api/workers') {
@@ -3925,6 +5522,11 @@ const server = createServer((req, res) => {
     res.end(EXHIBITION_HTML);
     return;
   }
+  if (req.url === '/tournaments' || req.url === '/tournaments/') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(TOURNAMENTS_HTML);
+    return;
+  }
   if (req.url === '/trades' || req.url === '/trades/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(TRADES_HTML);
@@ -3938,18 +5540,21 @@ const server = createServer((req, res) => {
     // movement). Each buy_master entry produces one row; each listing-buy
     // produces TWO ledger entries (debit on buyer, credit on seller) — we
     // dedupe to one trade event per ref_id by collapsing on (kind, ref_id).
+    // We also pull each actor's team_id so the UI can link @username → /team/<id>.
     const rows = db.prepare(`
       SELECT w.id, w.user_id, w.delta_cents, w.reason, w.ref_id, w.created_at,
         u.username AS actor_username, u.is_bot AS actor_is_bot,
+        actor_team.id AS actor_team_id,
         of.id AS owned_id, of.team_id AS owned_team_id, of.display_name AS owned_display,
         f.id AS master_id, f.file_name AS master_file_name,
         f.display_name AS master_display, f.author AS master_author
       FROM wallet_ledger w
       JOIN user_account u ON u.id = w.user_id
+      LEFT JOIN team actor_team ON actor_team.user_id = u.id
       LEFT JOIN owned_fighter of ON of.id = w.ref_id
       LEFT JOIN fighter f ON f.id = of.master_fighter_id
       WHERE w.reason LIKE 'buy_master%' OR w.reason = 'buy_listing'
-         OR w.reason = 'sell_listing' OR w.reason = 'release'
+         OR w.reason = 'sell_listing' OR w.reason = 'release' OR w.reason = 'list'
       ORDER BY w.id DESC
       LIMIT ?
     `).all(limit * 2);
@@ -3968,26 +5573,37 @@ const server = createServer((req, res) => {
       seen.add(key);
       let buyer = null, seller = null;
       if (cat === 'buy_master') {
-        buyer = { user_id: r.user_id, username: r.actor_username, is_bot: r.actor_is_bot };
+        buyer = { user_id: r.user_id, username: r.actor_username, is_bot: r.actor_is_bot, team_id: r.actor_team_id };
       } else if (cat === 'release') {
         // Release: the actor used to own the fighter; surface them as 'seller'
         // so the UI can render "@user released X" similarly.
-        seller = { user_id: r.user_id, username: r.actor_username, is_bot: r.actor_is_bot };
+        seller = { user_id: r.user_id, username: r.actor_username, is_bot: r.actor_is_bot, team_id: r.actor_team_id };
+      } else if (cat === 'list') {
+        // List: the actor put a fighter up for sale. Surface them as 'seller'.
+        seller = { user_id: r.user_id, username: r.actor_username, is_bot: r.actor_is_bot, team_id: r.actor_team_id };
       } else {
         // listing trade: find both halves in `rows`
         const halves = rows.filter((x) => x.ref_id === r.ref_id && x.created_at === r.created_at);
         const buyHalf = halves.find((h) => h.delta_cents < 0);
         const sellHalf = halves.find((h) => h.delta_cents > 0);
-        buyer = buyHalf && { user_id: buyHalf.user_id, username: buyHalf.actor_username, is_bot: buyHalf.actor_is_bot };
-        seller = sellHalf && { user_id: sellHalf.user_id, username: sellHalf.actor_username, is_bot: sellHalf.actor_is_bot };
+        buyer = buyHalf && { user_id: buyHalf.user_id, username: buyHalf.actor_username, is_bot: buyHalf.actor_is_bot, team_id: buyHalf.actor_team_id };
+        seller = sellHalf && { user_id: sellHalf.user_id, username: sellHalf.actor_username, is_bot: sellHalf.actor_is_bot, team_id: sellHalf.actor_team_id };
       }
       const kind = cat === 'buy_master' ? 'buy_unclaimed'
                  : cat === 'release' ? 'release'
+                 : cat === 'list' ? 'list'
                  : 'buy_listing';
+      // For 'list' events the asking price isn't in delta_cents (which is 0
+      // because no money moved). Look it up from owned_fighter via ref_id.
+      let priceCents = Math.abs(r.delta_cents);
+      if (cat === 'list' && r.ref_id) {
+        const lp = db.prepare('SELECT listing_price_cents FROM owned_fighter WHERE id = ?').get(r.ref_id);
+        priceCents = lp?.listing_price_cents ?? 0;
+      }
       trades.push({
         id: r.id,
         kind,
-        price_cents: Math.abs(r.delta_cents),
+        price_cents: priceCents,
         created_at: r.created_at,
         buyer,
         seller,
@@ -4103,8 +5719,12 @@ const server = createServer((req, res) => {
     const u = currentUser(db, req);
     const data = listExhibitionFighters(db, u?.id || null);
     const recent = u ? listExhibitionsForUser(db, u.id, 10) : [];
+    const activeTournament = u ? getActiveTournamentForUser(db, u.id) : null;
+    const stages = db.prepare(
+      `SELECT id, display_name, file_name FROM stage WHERE active = 1 ORDER BY display_name`
+    ).all();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ...data, recent, signed_in: !!u }));
+    res.end(JSON.stringify({ ...data, recent, signed_in: !!u, active_tournament: activeTournament, stages }));
     return;
   }
   if (req.url === '/api/exhibition' && req.method === 'POST') {
@@ -4121,6 +5741,74 @@ const server = createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ id: r.id }));
     }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  if (req.url === '/api/tournaments' && req.method === 'GET') {
+    const db = getDb();
+    const list = listLiveTournaments(db);
+    // Annotate each running tournament with the worker currently streaming
+    // its match (if any) so the public page can embed live MJPEGs.
+    const annotated = list.map((t) => {
+      let streamWorkerId = null;
+      let runningMatchId = null;
+      const runningMatch = t.matches.find((m) => m.status === 'running');
+      if (runningMatch) {
+        runningMatchId = runningMatch.id;
+        const w = Array.from(workers.values()).find((ww) => ww.tournamentMatchId === runningMatch.id);
+        streamWorkerId = w ? w.workerId : null;
+      }
+      return { ...t, stream_worker_id: streamWorkerId, running_match_id: runningMatchId };
+    });
+    const recent = listRecentTournaments(db, 5);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ tournaments: annotated, recent, max_concurrent: MAX_CONCURRENT_TOURNAMENTS }));
+    return;
+  }
+  if (req.url === '/api/exhibition/tournament' && req.method === 'POST') {
+    readJsonBody(req).then((body) => {
+      const db = getDb();
+      const u = currentUser(db, req);
+      if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+      const size = Number(body?.size);
+      const roundsPerFight = Number(body?.rounds_per_fight);
+      const slotIds = Array.isArray(body?.slot_ids) ? body.slot_ids.map(Number) : null;
+      const stageId = body?.stage_id != null && body.stage_id !== '' ? Number(body.stage_id) : null;
+      if (!size || !roundsPerFight || !slotIds) { res.writeHead(400); res.end('{"error":"size, rounds_per_fight, slot_ids required"}'); return; }
+      const r = createExhibitionTournament(db, { requesterId: u.id, size, roundsPerFight, slotIds, stageId });
+      if (r.error) { res.writeHead(400); res.end(JSON.stringify(r)); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: r.id }));
+    }).catch(() => { res.writeHead(400); res.end(); });
+    return;
+  }
+  const exhibitionTournamentMatch = req.url && req.url.match(/^\/api\/exhibition\/tournament\/(\d+)$/);
+  if (exhibitionTournamentMatch && req.method === 'GET') {
+    const db = getDb();
+    const t = getExhibitionTournament(db, Number(exhibitionTournamentMatch[1]));
+    if (!t) { res.writeHead(404); res.end('{"error":"not_found"}'); return; }
+    // Surface the worker that's currently running a match for this
+    // tournament so the page can embed its MJPEG stream.
+    let streamWorkerId = null;
+    let runningMatchId = null;
+    const runningMatch = t.matches.find((m) => m.status === 'running');
+    if (runningMatch) {
+      runningMatchId = runningMatch.id;
+      const w = Array.from(workers.values()).find((ww) => ww.tournamentMatchId === runningMatch.id);
+      streamWorkerId = w ? w.workerId : null;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ...t, stream_worker_id: streamWorkerId, running_match_id: runningMatchId }));
+    return;
+  }
+  const exhibitionTournamentCancel = req.url && req.url.match(/^\/api\/exhibition\/tournament\/(\d+)\/cancel$/);
+  if (exhibitionTournamentCancel && req.method === 'POST') {
+    const db = getDb();
+    const u = currentUser(db, req);
+    if (!u) { res.writeHead(401); res.end('{"error":"Not signed in"}'); return; }
+    const r = cancelExhibitionTournament(db, { id: Number(exhibitionTournamentCancel[1]), userId: u.id });
+    if (r.error) { res.writeHead(400); res.end(JSON.stringify(r)); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
   const exhibitionByIdMatch = req.url && req.url.match(/^\/api\/exhibition\/(\d+)$/);

@@ -15,7 +15,7 @@ import {
   readEffectiveStamina,
   LOW_STAMINA_ROTATION_THRESHOLD,
 } from './stamina.js';
-import { drawStarterMasters, listUnclaimedOldest, getKfmId } from './market.js';
+import { drawStarterMasters, listUnclaimedOldest, getKfmId, maxBenchSizeForUser } from './market.js';
 
 const FULL_ACTIVE_ROSTER = 5;
 
@@ -98,6 +98,11 @@ export function setLineup(db, teamId, body) {
   const autoRotate     = body.auto_rotate        === undefined ? null : (body.auto_rotate ? 1 : 0);
   const rotateOnStamina = body.rotate_on_stamina === undefined ? null : (body.rotate_on_stamina ? 1 : 0);
   const rotateOnLosses  = body.rotate_on_losses  === undefined ? null : (body.rotate_on_losses ? 1 : 0);
+  const VALID_MODES = ['fixed', 'stamina', 'losses', 'sequential_active', 'sequential_full'];
+  let rotationMode = body.rotation_mode === undefined ? null : String(body.rotation_mode);
+  if (rotationMode != null && !VALID_MODES.includes(rotationMode)) {
+    return { status: 400, body: { error: 'rotation_mode must be one of: ' + VALID_MODES.join(', ') } };
+  }
   let rotationThreshold = body.rotation_threshold;
   if (rotationThreshold != null) {
     rotationThreshold = Number(rotationThreshold);
@@ -116,8 +121,10 @@ export function setLineup(db, teamId, body) {
   if (active.length !== 5) {
     return { status: 400, body: { error: 'Lineup must have exactly 5 active fighters' } };
   }
-  if (bench.length > 5) {
-    return { status: 400, body: { error: 'At most 5 bench fighters allowed' } };
+  const team = db.prepare('SELECT user_id FROM team WHERE id = ?').get(teamId);
+  const benchCap = team ? maxBenchSizeForUser(db, team.user_id) : 5;
+  if (bench.length > benchCap) {
+    return { status: 400, body: { error: 'At most ' + benchCap + ' bench fighters allowed' } };
   }
   if (new Set([...active, ...bench]).size !== active.length + bench.length) {
     return { status: 400, body: { error: 'Duplicate IDs across active/bench' } };
@@ -145,6 +152,7 @@ export function setLineup(db, teamId, body) {
     if (rotateOnLosses != null)    { cols.push('rotate_on_losses = ?');    args.push(rotateOnLosses); }
     if (rotationThreshold != null) { cols.push('rotation_threshold = ?');  args.push(rotationThreshold); }
     if (rotationLossStreak != null){ cols.push('rotation_loss_streak = ?');args.push(rotationLossStreak); }
+    if (rotationMode != null)      { cols.push('rotation_mode = ?');       args.push(rotationMode); }
     if (cols.length) {
       args.push(teamId);
       db.prepare(`UPDATE team SET ${cols.join(', ')} WHERE id = ?`).run(...args);
@@ -186,7 +194,7 @@ export function setLineup(db, teamId, body) {
 export function pickActiveFighter(db, teamId) {
   const team = db.prepare(
     `SELECT t.auto_rotate, t.rotate_on_stamina, t.rotate_on_losses,
-            t.rotation_threshold, t.rotation_loss_streak, u.is_bot
+            t.rotation_threshold, t.rotation_loss_streak, t.rotation_mode, u.is_bot
        FROM team t JOIN user_account u ON u.id = t.user_id
       WHERE t.id = ?`
   ).get(teamId);
@@ -196,15 +204,53 @@ export function pickActiveFighter(db, teamId) {
     .all(teamId);
   if (actives.length === 0) return null;
 
-  // Bots: strict sequential rotation through the active roster. Every fighter
-  // gets equal screen time regardless of stamina or loss streak. Index is the
-  // total count of completed fixtures this team has played, mod roster size,
-  // so the cycle is deterministic and resumes correctly across restarts.
+  // Helper: sequential rotation index = count of completed fixtures the team
+  // has played. Deterministic; resumes correctly across server restarts.
+  const rotationIndex = () => db.prepare(
+    "SELECT COUNT(*) AS n FROM fixture WHERE (home_team_id = ? OR away_team_id = ?) AND status = 'complete'"
+  ).get(teamId, teamId).n;
+
+  // 'sequential_active' mode: cycle through 5 actives in priority order,
+  // ignoring stamina + loss-streak rules. Same logic bots use.
+  if (team.rotation_mode === 'sequential_active') {
+    return actives[rotationIndex() % actives.length];
+  }
+
+  // 'sequential_full' mode: cycle through active + bench (up to 10) in
+  // (slot, priority, id) order. When the rotation lands on a benched
+  // fighter, promote them to active and demote the highest-priority
+  // active fighter to bench in the same transaction — so the team always
+  // has exactly 5 active and the lineup view stays consistent.
+  if (team.rotation_mode === 'sequential_full') {
+    const all = db.prepare(
+      `SELECT * FROM owned_fighter
+       WHERE team_id = ? AND is_retired = 0 AND slot IN ('active', 'bench')
+       ORDER BY (CASE slot WHEN 'active' THEN 0 ELSE 1 END), priority, id`
+    ).all(teamId);
+    if (all.length === 0) return actives[0];
+    const picked = all[rotationIndex() % all.length];
+    if (picked.slot === 'bench') {
+      // Demote the bottom-priority active (the one that's been up longest;
+      // first in the rotation order, which gets cycled the most). The
+      // benched fighter inherits its priority slot and is fielded now.
+      const demote = actives[actives.length - 1];
+      const swap = db.transaction(() => {
+        db.prepare("UPDATE owned_fighter SET slot = 'active', priority = ? WHERE id = ?")
+          .run(demote.priority, picked.id);
+        db.prepare("UPDATE owned_fighter SET slot = 'bench', priority = ? WHERE id = ?")
+          .run(picked.priority, demote.id);
+      });
+      swap();
+      picked.slot = 'active';
+      picked.priority = demote.priority;
+    }
+    return picked;
+  }
+
+  // Bots: same as 'sequential_active' — strict sequential rotation. Every
+  // fighter gets equal screen time regardless of stamina or loss streak.
   if (team.is_bot) {
-    const played = db.prepare(
-      "SELECT COUNT(*) AS n FROM fixture WHERE (home_team_id = ? OR away_team_id = ?) AND status = 'complete'"
-    ).get(teamId, teamId).n;
-    return actives[played % actives.length];
+    return actives[rotationIndex() % actives.length];
   }
 
   const autoOn = !!team.auto_rotate;
@@ -263,6 +309,18 @@ export function topUpRoster(db, teamId, target = FULL_ACTIVE_ROSTER) {
   const insertFighter = db.prepare(
     "INSERT INTO owned_fighter (team_id, master_fighter_id, display_name, slot, priority) VALUES (?, ?, ?, 'active', ?)"
   );
+  const resurrectFighter = db.prepare(
+    "UPDATE owned_fighter SET team_id = ?, slot = 'active', priority = ?, is_retired = 0, listing_price_cents = NULL, display_name = ? WHERE id = ?"
+  );
+  // Only resurrect for unique masters. Non-unique (KFM training dummies,
+  // future bulk-spawn types) always get fresh INSERTs so duplicates are
+  // possible and each instance has its own per-team stats.
+  const findRetiredClone = db.prepare(
+    `SELECT o.id FROM owned_fighter o
+     JOIN fighter f ON f.id = o.master_fighter_id
+     WHERE o.master_fighter_id = ? AND o.is_retired = 1 AND f.is_unique = 1
+     ORDER BY o.id DESC LIMIT 1`
+  );
   const insertHistory = db.prepare(
     "INSERT INTO owned_fighter_team_history (owned_fighter_id, team_id, reason) VALUES (?, ?, ?)"
   );
@@ -279,7 +337,18 @@ export function topUpRoster(db, teamId, target = FULL_ACTIVE_ROSTER) {
     for (const m of masters) {
       const isKfm = m.id === kfmId;
       const name = isKfm ? 'Training Dummy' : (m.display_name || m.file_name);
-      const fId = insertFighter.run(teamId, m.id, name, prio++).lastInsertRowid;
+      // Resurrect a retired clone if one exists for this master — preserves
+      // per-team W/L/D record across release-and-rebuy cycles. KFM is
+      // non-unique training-dummy padding; never resurrect, always insert.
+      let fId;
+      const retired = isKfm ? null : findRetiredClone.get(m.id);
+      if (retired) {
+        resurrectFighter.run(teamId, prio, name, retired.id);
+        fId = retired.id;
+      } else {
+        fId = insertFighter.run(teamId, m.id, name, prio).lastInsertRowid;
+      }
+      prio++;
       insertHistory.run(fId, teamId, 'auto_replenish');
       added.push({
         owned_fighter_id: fId,

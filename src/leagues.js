@@ -377,6 +377,16 @@ export async function runFixture(db, fixtureId, ctx) {
     : null;
 
   const finalize = db.transaction(() => {
+    // Reset the crash-suspect counter on a clean match — "3 in a row" semantic
+    // instead of "3 total lifetime". A char that hangs once but otherwise plays
+    // fine should never be auto-banned. Real result = at least one fighter
+    // scored a round, OR an explicit non-draw winner. Pure 0-0 outcomes stay
+    // on the catch branch and continue to bump the counter.
+    if (homeRounds > 0 || awayRounds > 0 || winner !== 'draw') {
+      const reset = db.prepare('UPDATE fighter SET crash_suspect_count = 0 WHERE id = ? AND crash_suspect_count > 0');
+      reset.run(home.master_fighter_id);
+      reset.run(away.master_fighter_id);
+    }
     db.prepare(`
       UPDATE fixture_match SET home_rounds = ?, away_rounds = ?, winner = ?
       WHERE fixture_id = ? AND slot = 1
@@ -502,17 +512,12 @@ function maybeCompleteLeague(db, divisionId) {
     db.prepare("UPDATE league SET status = 'complete', finished_at = datetime('now') WHERE id = ?").run(league_id);
     // Release all teams so they're eligible for the next season.
     db.prepare('UPDATE team SET current_league_id = NULL WHERE current_league_id = ?').run(league_id);
-    // Retire every bot roster in this league — unique masters flow back to
-    // the unclaimed pool so new signups / next-season bots can draw fresh.
-    db.prepare(`
-      UPDATE owned_fighter SET is_retired = 1
-      WHERE is_retired = 0
-        AND team_id IN (
-          SELECT t.id FROM team t
-          JOIN user_account u ON t.user_id = u.id
-          WHERE u.is_bot = 1
-        )
-    `).run();
+    // NOTE: bot rosters are preserved across seasons — same as user rosters.
+    // Earlier this function retired every bot fighter at season end so the
+    // unclaimed pool stayed full, but with the bot transfer market, curated
+    // themed bots, auto-replenish, and the seating queue all in place,
+    // persistent bot rosters are the right model. Bots now accumulate
+    // characters, transfer-market strategy, and W/L history across seasons.
   }
 }
 
@@ -660,7 +665,9 @@ export function getLiveLeagueContext(db, leagueId, divisionId = null) {
       round: fixture.round_num,
       slot_num: fixture.slot_num,
       home_team: fixture.home_name,
+      home_team_id: fixture.home_team_id,
       away_team: fixture.away_name,
+      away_team_id: fixture.away_team_id,
       division: { tier: fixture.tier, name: fixture.division_name },
       stage: fixture.stage_display || fixture.stage_file,
       home_rounds: matchRow?.home_rounds ?? 0,
@@ -903,12 +910,19 @@ export function teamSchedule(db, teamId) {
       f.winner_team_id, f.home_team_id, f.away_team_id,
       h.name AS home_name, a.name AS away_name,
       d.tier, d.name AS division_name,
-      s.display_name AS stage
+      s.display_name AS stage,
+      oh.display_name AS home_fighter, oa.display_name AS away_fighter,
+      mh.file_name AS home_master_file, ma.file_name AS away_master_file
     FROM fixture f
     JOIN division d ON f.division_id = d.id
     JOIN team h ON f.home_team_id = h.id
     JOIN team a ON f.away_team_id = a.id
     LEFT JOIN stage s ON f.stage_id = s.id
+    LEFT JOIN fixture_match fm ON fm.fixture_id = f.id AND fm.slot = 1
+    LEFT JOIN owned_fighter oh ON oh.id = fm.home_owned_fighter_id
+    LEFT JOIN owned_fighter oa ON oa.id = fm.away_owned_fighter_id
+    LEFT JOIN fighter mh ON mh.id = oh.master_fighter_id
+    LEFT JOIN fighter ma ON ma.id = oa.master_fighter_id
   `;
   const upcoming = db.prepare(
     `${select} WHERE d.league_id = ? AND (f.home_team_id = ? OR f.away_team_id = ?) AND f.status != 'complete' ORDER BY f.round_num, f.slot_num, f.id`
